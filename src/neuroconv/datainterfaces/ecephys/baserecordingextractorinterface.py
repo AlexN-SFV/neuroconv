@@ -504,4 +504,3 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
             sub_interfaces.append(sub_interface)
 
         return sub_interfaces
-
