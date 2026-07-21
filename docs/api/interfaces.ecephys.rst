@@ -21,6 +21,10 @@ Axona Recording
 ---------------
 .. automodule:: neuroconv.datainterfaces.ecephys.axona.axonadatainterface
 
+BioSemi Data Format (BDF) Recording
+-----------------------------------
+.. automodule:: neuroconv.datainterfaces.ecephys.bdf.bdfdatainterface
+
 Biocam Recording
 -------------------
 .. automodule:: neuroconv.datainterfaces.ecephys.biocam.biocamdatainterface

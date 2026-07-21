@@ -18,6 +18,7 @@ Recording
     AlphaOmega <recording/alphaomega>
     Axon <recording/axon>
     Axona <recording/axona>
+    BioSemi Data Format (BDF) <recording/bdf>
     Biocam <recording/biocam>
     Blackrock <recording/blackrock>
     European Data Format (EDF) <recording/edf>

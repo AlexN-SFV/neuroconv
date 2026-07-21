@@ -33,6 +33,7 @@ from .ecephys.cellexplorer.cellexplorerdatainterface import (
     CellExplorerRecordingInterface,
     CellExplorerSortingInterface,
 )
+from .ecephys.bdf.bdfdatainterface import BDFRecordingInterface
 from .ecephys.edf.edfdatainterface import EDFRecordingInterface
 from .ecephys.edf.edfanaloginterface import EDFAnalogInterface
 from .ecephys.eeglab.eeglabdatainterface import EEGLABRecordingInterface
@@ -156,6 +157,7 @@ interface_list = [
     AxonaPositionDataInterface,
     AxonaLFPDataInterface,
     AxonaUnitRecordingInterface,
+    BDFRecordingInterface,
     EDFRecordingInterface,
     EDFAnalogInterface,
     EEGLABRecordingInterface,

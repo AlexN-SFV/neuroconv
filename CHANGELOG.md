@@ -1,6 +1,7 @@
 # v0.9.4 (Upcoming)
 
 ## Features
+* Added `BDFRecordingInterface` for converting BioSemi Data Format (BDF) data to NWB. BDF is EDF with 24-bit samples; because neo's EDF reader truncates those to 16-bit, the interface reads the file with `pyedflib` directly (which handles 24-bit correctly) and wraps it in a recording. Non-neural channels (e.g. the BioSemi `Status` trigger) can be dropped with `channels_to_skip`. Install via `pip install "neuroconv[bdf]"`.
 * Added `BaseRecordingExtractorInterface.split_by_offset`, which partitions a recording's channels by their offset value (using only the offsets present in the recording, independent of any external metadata) and returns one sub-interface per distinct offset, each with a distinct `es_key`. A single NWB `ElectricalSeries` can only carry one scalar `offset`, so recordings with heterogeneous offsets cannot be written to one series; the returned sub-interfaces can be combined in a `ConverterPipe` to write one `ElectricalSeries` per offset into a single NWB file (or converted individually). Recordings with a single offset return the interface unchanged. [PR #1752](https://github.com/catalystneuro/neuroconv/pull/1752)
 * Added `DoricFiberPhotometryInterface` for converting fiber photometry data from Doric Neuroscience Studio `.doric` HDF5 files. [PR #1727](https://github.com/catalystneuro/neuroconv/pull/1727)
 
