@@ -176,6 +176,10 @@ cellexplorer = [
     "pymatreader>=0.0.32",
     "neuroconv[ecephys_minimal]",
 ]
+bdf = [
+    "pyedflib>=0.1.36",
+    "neuroconv[ecephys_minimal]",
+]
 edf = [
     "pyedflib>=0.1.36",
     "neuroconv[ecephys_minimal]",
@@ -255,6 +259,7 @@ ecephys = [  # Note that these are the requirements of the extractors as they ar
     "neuroconv[axon]",
     "neuroconv[axona]",
     "neuroconv[biocam]",
+    "neuroconv[bdf]",
     "neuroconv[blackrock]",
     "neuroconv[cellexplorer]",
     "neuroconv[edf]",
