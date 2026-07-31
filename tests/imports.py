@@ -20,6 +20,7 @@ def _strip_magic_module_attributes(ls: list) -> list:
         "__file__",
         "__cached__",
         "__builtins__",
+        "__version__",
     ]
     return list(filter(lambda key: key not in exclude_keys, ls))
 

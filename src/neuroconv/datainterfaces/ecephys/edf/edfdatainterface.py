@@ -158,6 +158,11 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
     Uses the :py:func:`~spikeinterface.extractors.read_edf` reader from SpikeInterface.
 
+    Signals carrying floating-point or long-integer data through the EDF+ logarithmic transformation
+    (physical dimension ``Filtered``) are decoded on top of that reader, which has no notion of the
+    transformation and would otherwise apply the header's linear gain to what are logarithms. See
+    https://www.edfplus.info/specs/edffloat.html.
+
     Not supported on M1 macs.
     """
 
@@ -215,8 +220,48 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         self.extractor_kwargs["all_annotations"] = True
         self.extractor_kwargs["use_names_as_ids"] = True
 
+        from ._edf_log_transform import (
+            decode_log_transformed_signals,
+            filtered_accounts_for_the_whole_unit_mix,
+            read_log_transforms,
+            read_signal_fields,
+        )
+
+        # Read the transforms first, so the reader below can be told to expect them. A file with none —
+        # the overwhelmingly common case — takes exactly the path it always did.
+        channels_to_skip = interface_kwargs.get("channels_to_skip")
+        transforms = read_log_transforms(file_path=interface_kwargs["file_path"], channels_to_skip=channels_to_skip)
+
+        # SpikeInterface sees the "Filtered" dimension as a non-voltage unit and warns about a mix. That
+        # warning is unactionable for a transformed signal and, once decoded, untrue — but it is also the
+        # only thing telling a user about a genuinely non-voltage channel, so suppress it only when
+        # "Filtered" accounts for the whole mix.
+        suppress_unit_mix_warning = False
+        if transforms:
+            _, dimensions, _ = read_signal_fields(file_path=interface_kwargs["file_path"])
+            suppress_unit_mix_warning = filtered_accounts_for_the_whole_unit_mix(dimensions=dimensions)
+
         extractor_class = self.get_extractor_class()
-        extractor_instance = extractor_class(**self.extractor_kwargs)
+        if suppress_unit_mix_warning:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Found a mix of voltage and non-voltage units.*",
+                    category=UserWarning,
+                )
+                extractor_instance = extractor_class(**self.extractor_kwargs)
+        else:
+            # catch_warnings is not entered at all here: doing so resets filter state, which can make an
+            # unrelated once-only warning print a second time.
+            extractor_instance = extractor_class(**self.extractor_kwargs)
+
+        # Captured before wrapping: the decoding recording does not forward neo_reader, and this is the
+        # only place the unwrapped reader is in hand.
+        self._edf_header = extractor_instance.neo_reader.edf_header
+
+        extractor_instance, self._log_transforms = decode_log_transformed_signals(
+            recording=extractor_instance, transforms=transforms
+        )
         return extractor_instance
 
     def __init__(
@@ -280,7 +325,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         )
 
         super().__init__(file_path=file_path, verbose=verbose, es_key=es_key, channels_to_skip=channels_to_skip)
-        self.edf_header = self.recording_extractor.neo_reader.edf_header
+        self.edf_header = self._edf_header
 
         # We remove the channels that are not neural
         if channels_to_skip:
@@ -311,6 +356,16 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         subject_metadata = {property: value for property, value in subject_metadata.items() if value}
 
         return subject_metadata
+
+    @property
+    def log_transformed_channels(self) -> dict:
+        """
+        Channel label to logarithmic transform, for every signal carrying transformed data.
+
+        Empty for an ordinary file. Such a signal stores logarithms rather than measurements, so its
+        samples are decoded while reading and the recording holds physical values as floats.
+        """
+        return dict(self._log_transforms)
 
     def get_metadata(self) -> DeepDict:
         metadata = super().get_metadata()
