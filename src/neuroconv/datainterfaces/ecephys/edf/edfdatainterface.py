@@ -13,6 +13,11 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
     Uses the :py:func:`~spikeinterface.extractors.read_edf` reader from SpikeInterface.
 
+    Signals carrying floating-point or long-integer data through the EDF+ logarithmic transformation
+    (physical dimension ``Filtered``) are decoded on top of that reader, which has no notion of the
+    transformation and would otherwise apply the header's linear gain to what are logarithms. See
+    https://www.edfplus.info/specs/edffloat.html.
+
     Not supported on M1 macs.
     """
 
@@ -72,6 +77,20 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
         extractor_class = self.get_extractor_class()
         extractor_instance = extractor_class(**self.extractor_kwargs)
+
+        # Captured before wrapping: the decoding recording does not forward neo_reader, and this is the
+        # only place the unwrapped reader is in hand.
+        self._edf_header = extractor_instance.neo_reader.edf_header
+
+        # Decode any logarithmically transformed signal. Returns the recording untouched when the file has
+        # none, which is the overwhelmingly common case, so the ordinary path is unaffected.
+        from ._edf_log_transform import decode_log_transformed_signals
+
+        extractor_instance, self._log_transforms = decode_log_transformed_signals(
+            recording=extractor_instance,
+            file_path=interface_kwargs["file_path"],
+            channels_to_skip=interface_kwargs.get("channels_to_skip"),
+        )
         return extractor_instance
 
     def __init__(
@@ -135,7 +154,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         )
 
         super().__init__(file_path=file_path, verbose=verbose, es_key=es_key, channels_to_skip=channels_to_skip)
-        self.edf_header = self.recording_extractor.neo_reader.edf_header
+        self.edf_header = self._edf_header
 
         # We remove the channels that are not neural
         if channels_to_skip:
@@ -162,6 +181,16 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         subject_metadata = {property: value for property, value in subject_metadata.items() if value}
 
         return subject_metadata
+
+    @property
+    def log_transformed_channels(self) -> dict:
+        """
+        Channel label to logarithmic transform, for every signal carrying transformed data.
+
+        Empty for an ordinary file. Such a signal stores logarithms rather than measurements, so its
+        samples are decoded while reading and the recording holds physical values as floats.
+        """
+        return dict(self._log_transforms)
 
     def get_metadata(self) -> DeepDict:
         metadata = super().get_metadata()

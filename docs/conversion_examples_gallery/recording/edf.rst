@@ -48,6 +48,44 @@ Other auxiliary signal channels should be excluded using the ``channels_to_skip`
     nwbfile_path = f"{path_to_save_nwbfile}"
     interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
 
+Floating-Point and Long-Integer Data (EDF+ "Filtered" Signals)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+EDF stores every sample as a 2-byte integer, which cannot hold the dynamic range of floating-point or
+long-integer data. EDF+ addresses that with a logarithmic transformation rather than a wider sample: the
+samples stay 2-byte integers, the signal is marked by the physical dimension ``Filtered``, and its
+original unit together with the two transformation parameters go in the prefiltering field — for example
+``sign*LN[sign*(uV      )/(0.01    )]/(0.002   )``. See
+`the specification <https://www.edfplus.info/specs/edffloat.html>`_.
+
+``EDFRecordingInterface`` detects such signals from the header and decodes them, giving back physical
+values in the signal's original unit. Nothing about how the file is opened changes; the decoding happens
+on top of the usual reader, which has no notion of the transformation and would otherwise apply the
+header's *linear* gain and offset to what are logarithms — returning values wrong by many orders of
+magnitude with no error and no warning.
+
+.. code-block:: python
+
+    interface = EDFRecordingInterface(file_path=file_path)
+    interface.log_transformed_channels  # {} for an ordinary file
+
+Two consequences worth knowing:
+
+* The recording's dtype becomes ``float64`` rather than ``int16``, since decoded values are physical and
+  the specification's own accuracy table reaches 1.4e68 — beyond what ``float32`` holds. A recording
+  carries one dtype, so a single transformed signal beside many linear ones promotes them all, and the
+  dataset is four times the size it would be as ``int16``. Compression recovers much of that; if the
+  transformed signal is not needed, ``channels_to_skip`` keeps the recording integer.
+* Accuracy is inherently about ``a/2`` in relative terms, ``a`` being the logarithmic step. That is the
+  trade the transformation makes, not a loss introduced by the conversion.
+
+A signal marked ``Filtered`` whose prefiltering field does not carry readable parameters is refused
+rather than guessed at, because its samples are logarithms and cannot be interpreted without them. Drop
+it with ``channels_to_skip`` if you do not need it. If its original unit is not a voltage, it is decoded
+and read as microvolts with a warning, since an ``ElectricalSeries`` holds voltages — convert such a
+channel with
+:py:class:`~neuroconv.datainterfaces.ecephys.edf.edfanaloginterface.EDFAnalogInterface` instead.
+
 Converting Auxiliary EDF Channels as TimeSeries
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
