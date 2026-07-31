@@ -53,16 +53,25 @@ def write_edf(
     dimension="Filtered",
     transformed_unit_channel="logch",
     include_linear_channel=True,
+    linear_dimension="uV",
+    extra_channel=None,
 ):
     """Write a continuous EDF+ file with one transformed signal, optionally beside a linear one."""
     counts = encode(list(values))
     samples_per_record = len(counts)
     annotation_samples = 32
     labels = [transformed_unit_channel] + (["linch"] if include_linear_channel else [])
-    dimensions = [dimension] + (["uV"] if include_linear_channel else [])
+    dimensions = [dimension] + ([linear_dimension] if include_linear_channel else [])
     physical_min = [-32767.0] + ([-1000.0] if include_linear_channel else [])
     physical_max = [32767.0] + ([1000.0] if include_linear_channel else [])
     prefilters = [prefilter] + ([""] if include_linear_channel else [])
+    if extra_channel is not None:
+        # (label, dimension), for composing a file that genuinely mixes voltage and non-voltage units.
+        labels.append(extra_channel[0])
+        dimensions.append(extra_channel[1])
+        physical_min.append(-1000.0)
+        physical_max.append(1000.0)
+        prefilters.append("")
     # EDF+ requires an annotations signal, and pyedflib refuses a file without one.
     labels.append("EDF Annotations")
     dimensions.append("")
@@ -104,7 +113,12 @@ def write_edf(
     linear = np.arange(samples_per_record, dtype="int16")
     # The mandatory time-keeping TAL for the single data record.
     annotation_block = b"+0.000000\x14\x14\x00".ljust(annotation_samples * 2, b"\x00")
-    body = counts.tobytes() + (linear.tobytes() if include_linear_channel else b"") + annotation_block
+    body = counts.tobytes()
+    if include_linear_channel:
+        body += linear.tobytes()
+    if extra_channel is not None:
+        body += linear.tobytes()
+    body += annotation_block
     path = str(path)
     with open(path, "wb") as file:
         file.write(bytes(header) + body)
@@ -299,6 +313,39 @@ class TestEDFRecordingInterfaceDecoding:
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
             EDFRecordingInterface(file_path=path)
+        assert [record for record in records if "mix of voltage" in str(record.message)] == []
+
+    def test_a_genuinely_non_voltage_channel_keeps_its_warning(self, tmp_path):
+        """
+        The suppression must not swallow the warning about a real non-voltage channel.
+
+        SpikeInterface warns about a *mix*, so this needs all three: the transformed signal, a voltage
+        channel, and a non-voltage one. That warning is the only thing telling a user the '%' channel is
+        being written into an ElectricalSeries with neo's per-LSB gain — nothing else on this path covers
+        it, since _unit_to_microvolts is consulted only for transformed signals.
+        """
+        import warnings
+
+        path, _, _ = write_edf(tmp_path / "log_uv_percent.edf", extra_channel=("SpO2", "%"))
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            EDFRecordingInterface(file_path=path)
+        assert [record for record in records if "mix of voltage" in str(record.message)] != []
+
+    def test_no_mix_means_nothing_to_suppress(self, tmp_path):
+        """
+        With the transform beside only non-voltage channels there is no mix, so no warning to begin with.
+
+        Worth pinning: it looks like the suppression working, and it is not.
+        """
+        import warnings
+
+        from spikeinterface.extractors import read_edf
+
+        path, _, _ = write_edf(tmp_path / "log_percent.edf", linear_dimension="%")
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            read_edf(file_path=path, all_annotations=True, use_names_as_ids=True)
         assert [record for record in records if "mix of voltage" in str(record.message)] == []
 
     def test_conversion_writes_decoded_values(self, tmp_path):

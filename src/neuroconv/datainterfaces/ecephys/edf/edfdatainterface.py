@@ -77,7 +77,9 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
         from ._edf_log_transform import (
             decode_log_transformed_signals,
+            filtered_accounts_for_the_whole_unit_mix,
             read_log_transforms,
+            read_signal_fields,
         )
 
         # Read the transforms first, so the reader below can be told to expect them. A file with none —
@@ -85,17 +87,27 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         channels_to_skip = interface_kwargs.get("channels_to_skip")
         transforms = read_log_transforms(file_path=interface_kwargs["file_path"], channels_to_skip=channels_to_skip)
 
+        # SpikeInterface sees the "Filtered" dimension as a non-voltage unit and warns about a mix. That
+        # warning is unactionable for a transformed signal and, once decoded, untrue — but it is also the
+        # only thing telling a user about a genuinely non-voltage channel, so suppress it only when
+        # "Filtered" accounts for the whole mix.
+        suppress_unit_mix_warning = False
+        if transforms:
+            _, dimensions, _ = read_signal_fields(file_path=interface_kwargs["file_path"])
+            suppress_unit_mix_warning = filtered_accounts_for_the_whole_unit_mix(dimensions=dimensions)
+
         extractor_class = self.get_extractor_class()
-        with warnings.catch_warnings():
-            if transforms:
-                # SpikeInterface sees the "Filtered" dimension as a non-voltage unit and warns about a
-                # mix. The user cannot act on it, and once the signal is decoded it is not even true —
-                # this interface knows what that dimension means, which the warning does not.
+        if suppress_unit_mix_warning:
+            with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",
                     message="Found a mix of voltage and non-voltage units.*",
                     category=UserWarning,
                 )
+                extractor_instance = extractor_class(**self.extractor_kwargs)
+        else:
+            # catch_warnings is not entered at all here: doing so resets filter state, which can make an
+            # unrelated once-only warning print a second time.
             extractor_instance = extractor_class(**self.extractor_kwargs)
 
         # Captured before wrapping: the decoding recording does not forward neo_reader, and this is the

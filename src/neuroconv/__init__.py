@@ -15,3 +15,6 @@ try:
     __version__ = version("neuroconv")
 except PackageNotFoundError:  # pragma: no cover - only when running from a source tree with no metadata
     __version__ = "0.0.0"
+# Deleted so the package's public surface is unchanged: tests/imports.py pins the exact contents of
+# neuroconv.__dict__, and leaving these bound would add two names to it.
+del version, PackageNotFoundError

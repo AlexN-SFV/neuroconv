@@ -140,6 +140,35 @@ def read_signal_fields(file_path: FilePath) -> tuple[list[str], list[str], list[
     return labels, dimensions, prefilters
 
 
+def filtered_accounts_for_the_whole_unit_mix(dimensions: list) -> bool:
+    """
+    Whether ``Filtered`` is the only reason a file looks like it mixes voltage and non-voltage units.
+
+    SpikeInterface warns about such a mix, and for a transformed signal that warning is unactionable and,
+    once decoded, untrue. But a file can carry both a transformed signal *and* a genuinely non-voltage
+    channel, and that warning is the only thing telling the user about the latter — so it may only be
+    suppressed when nothing else accounts for the mix.
+
+    Parameters
+    ----------
+    dimensions : list of str
+        Every signal's physical dimension, including the annotations signal's empty one.
+
+    Returns
+    -------
+    bool
+    """
+    for dimension in dimensions:
+        normalized = str(dimension or "").strip()
+        if not normalized:  # the annotations signal carries no unit
+            continue
+        if normalized.upper() == _LOG_TRANSFORM_DIMENSION:
+            continue
+        if _unit_to_microvolts(unit=normalized) is None:
+            return False
+    return True
+
+
 def _parse_log_transform(dimension: str, prefilter: str) -> LogTransform | None:
     """
     Return the logarithmic transform for a signal, or None if it is an ordinary linear one.
