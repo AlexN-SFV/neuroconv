@@ -260,8 +260,8 @@ def _warn_assumed_microvolts(unit_to_channel_names: dict) -> None:
         if len(channel_names) > 5:
             shown += f", ... ({len(channel_names)} channels)"
         warnings.warn(
-            f"The transformed EDF channels {shown} declare the unit {unit!r}, which is not a voltage. Their "
-            "decoded values are being written to an NWB ElectricalSeries as though they were microvolts, so "
+            f"The EDF channels {shown} declare the unit {unit!r}, which is not a voltage. Their "
+            "values are being written to an NWB ElectricalSeries as though they were microvolts, so "
             "they will be wrong by whatever factor separates that unit from microvolts. Drop them with "
             "channels_to_skip and convert them with EDFAnalogInterface if they are not neural data.",
             UserWarning,

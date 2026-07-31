@@ -88,6 +88,72 @@ original interface.
     nwbfile_path = f"{path_to_save_nwbfile}"
     converter.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
 
+Discontinuous EDF+ (EDF+D) Files
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+EDF+ files declare in their header whether the recording is continuous (``EDF+C``) or discontinuous
+(``EDF+D``). In an ``EDF+D`` file the data records need not be contiguous in time, so a record's start
+time cannot be derived from its position: the format instead stores it in the mandatory
+``EDF Annotations`` signal, whose first annotation in each record is a "time-keeping" annotation giving
+that record's offset from the start of the file.
+
+Neither SpikeInterface's reader nor the ``pyedflib`` library beneath it can open these files — ``pyedflib``
+refuses them with *"the file is discontinuous and cannot be read"*. ``EDFRecordingInterface`` therefore
+detects ``EDF+D`` from the header and reads such files with neuroconv's own reader, which needs only
+NumPy. No change to your code is required:
+
+.. code-block:: python
+
+    from zoneinfo import ZoneInfo
+    from neuroconv.datainterfaces import EDFRecordingInterface
+
+    # Any .edf path; EDF+D is detected from the file's own header.
+    interface = EDFRecordingInterface(file_path=file_path)
+
+    interface.is_discontinuous  # True for an EDF+D file
+    interface.number_of_runs    # number of contiguous runs of data records found
+
+    metadata = interface.get_metadata()
+    session_start_time = metadata["NWBFile"]["session_start_time"].replace(tzinfo=ZoneInfo("US/Pacific"))
+    metadata["NWBFile"].update(session_start_time=session_start_time)
+    metadata["Subject"] = dict(subject_id="subject1", species="Homo sapiens", sex="U", age="P30Y")
+
+    interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
+
+Each contiguous run of records becomes one ``ElectricalSeries``, placed at its true start time on the
+session timeline (via ``starting_time`` and ``rate``) and sharing a single electrodes table with the
+others. The series are named with the run index appended — ``ElectricalSeries0``, ``ElectricalSeries1``,
+and so on. Two ``TimeIntervals`` tables are written alongside them, both on the same timeline: ``runs``
+gives each run's boundaries with a ``run_index`` column, and ``annotations`` holds the annotations
+carried in the ``EDF Annotations`` signals. Both follow the recording if it is moved with
+``set_aligned_starting_time``.
+
+.. note::
+
+    Many exporters label continuous recordings ``EDF+D`` as a matter of course. When the records turn out
+    to be contiguous — which is common — ``number_of_runs`` is 1 and the file is written as a single
+    ``ElectricalSeries`` with no ``runs`` table, just as a plain EDF would be. An ``annotations`` table is
+    still written if the file carries any annotations.
+
+Set ``write_annotations=False`` or ``write_runs=False`` to suppress either table:
+
+.. code-block:: python
+
+    interface.run_conversion(
+        nwbfile_path=nwbfile_path,
+        metadata=metadata,
+        overwrite=True,
+        write_annotations=False,
+    )
+
+.. note::
+
+    These two blocks are illustrative rather than doctested, because there is no ``EDF+D`` file in the
+    gin test data yet. The tests build them byte by byte instead; see
+    ``tests/test_modalities/test_ecephys/test_edfd_interface.py``.
+
+Plain EDF and ``EDF+C`` files are unaffected by any of this and continue to be read by SpikeInterface.
+
 Floating-Point and Long-Integer Data (EDF+ "Filtered" Signals)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -99,10 +165,11 @@ original unit together with the two transformation parameters go in the prefilte
 `the specification <https://www.edfplus.info/specs/edffloat.html>`_.
 
 ``EDFRecordingInterface`` detects such signals from the header and decodes them, giving back physical
-values in the signal's original unit. Nothing about how the file is opened changes; the decoding happens
-on top of the usual reader, which has no notion of the transformation and would otherwise apply the
-header's *linear* gain and offset to what are logarithms — returning values wrong by many orders of
-magnitude with no error and no warning.
+values in the signal's original unit. On a continuous file the decoding happens on top of the usual
+reader, which has no notion of the transformation and would otherwise apply the header's *linear* gain
+and offset to what are logarithms — returning values wrong by many orders of magnitude with no error and
+no warning. A discontinuous file is read by neuroconv's own reader, which decodes natively. Both use one
+shared implementation, so a transformed signal means the same thing either way.
 
 .. code-block:: python
 

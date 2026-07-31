@@ -1,8 +1,10 @@
 import re
 import warnings
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import FilePath
+from pynwb import NWBFile
 
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....tools import get_package
@@ -156,14 +158,24 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
     """
     Data interface class for converting European Data Format (EDF) data.
 
-    Uses the :py:func:`~spikeinterface.extractors.read_edf` reader from SpikeInterface.
+    Plain EDF and continuous EDF+ (``EDF+C``) files are read with the
+    :py:func:`~spikeinterface.extractors.read_edf` reader from SpikeInterface.
+
+    Discontinuous EDF+ (``EDF+D``) files are detected from the header and read with neuroconv's own
+    reader instead, because neither SpikeInterface's reader nor the ``pyedflib`` library beneath it can
+    open them at all. Each contiguous run of data records becomes one segment positioned at its true
+    start time on the session timeline, so a file whose records are in fact contiguous — common, since
+    exporters label continuous recordings ``EDF+D`` as a matter of course — is written as a single
+    ``ElectricalSeries`` exactly like a plain EDF.
 
     Signals carrying floating-point or long-integer data through the EDF+ logarithmic transformation
-    (physical dimension ``Filtered``) are decoded on top of that reader, which has no notion of the
-    transformation and would otherwise apply the header's linear gain to what are logarithms. See
-    https://www.edfplus.info/specs/edffloat.html.
+    (physical dimension ``Filtered``) are decoded either way, through one shared implementation: on the
+    SpikeInterface path by wrapping its reader, which has no notion of the transformation and would
+    otherwise apply the header's linear gain to what are logarithms, and natively in neuroconv's own
+    reader. See https://www.edfplus.info/specs/edffloat.html.
 
-    Not supported on M1 macs.
+    The EDF/EDF+C path is not supported on M1 macs, because ``pyedflib`` is not available there. The
+    EDF+D path has no such restriction — it needs only NumPy.
     """
 
     display_name = "EDF Recording"
@@ -192,6 +204,17 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         list
             List of all channel names in the EDF file
         """
+        from ._edfd_reader import is_discontinuous_edf, read_edf_header
+
+        if is_discontinuous_edf(file_path=file_path):
+            # SpikeInterface cannot open EDF+D at all; read the labels out of the header directly. The
+            # annotations signals are left out, as on the SpikeInterface path — they are never data
+            # channels, so listing them would only invite a pointless channels_to_skip entry.
+            with open(file_path, "rb") as file:
+                header = read_edf_header(file)
+            annotations_indices = set(header.annotations_signal_indices)
+            return [label for index, label in enumerate(header.labels) if index not in annotations_indices]
+
         from spikeinterface.extractors import read_edf
 
         # Load the recording to inspect channels
@@ -211,8 +234,53 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
         return EDFRecordingExtractor
 
+    @classmethod
+    def get_discontinuous_extractor_class(cls):
+        """Return neuroconv's own extractor, used for discontinuous EDF+ (``EDF+D``) files."""
+        from ._edfd_extractor import EDFDRecordingExtractor
+
+        return EDFDRecordingExtractor
+
     def _initialize_extractor(self, interface_kwargs: dict):
-        """Override to add use_names_as_ids and pop channels_to_skip."""
+        """Route discontinuous EDF+ to neuroconv's reader; otherwise read with SpikeInterface."""
+        from ._edfd_reader import is_discontinuous_edf
+
+        # Discontinuity is the one property SpikeInterface's reader cannot represent at all — it refuses
+        # such files, and models every file as a single contiguous segment. A logarithmically transformed
+        # signal, by contrast, only needs decoding on top of that reader, which is what the continuous
+        # path below does; so only EDF+D is routed away.
+        self._is_discontinuous = is_discontinuous_edf(file_path=interface_kwargs["file_path"])
+        if self._is_discontinuous:
+            # channels_to_skip is applied while reading here rather than afterwards, so a channel at a
+            # differing sampling rate — or a transformed signal whose parameters are unreadable — can be
+            # dropped before it stops the conversion.
+            self.extractor_kwargs = dict(
+                file_path=interface_kwargs["file_path"],
+                channels_to_skip=interface_kwargs.get("channels_to_skip"),
+            )
+            recording = self.get_discontinuous_extractor_class()(**self.extractor_kwargs)
+
+            from ._edfd_reader import edf_plus_header_fields
+
+            # Presented in the shape pyedflib returns, so the metadata extraction is identical either way.
+            self._edf_header = edf_plus_header_fields(recording.edf_header)
+            self._log_transforms = dict(recording.log_transforms)
+            self._edf_annotations = recording.annotations_from_file
+            self._edf_runs = recording.runs
+            self._edf_record_duration = recording.edf_header.record_duration
+            return recording
+
+        self._is_discontinuous = False
+        self._edf_annotations = []
+        self._edf_runs = []
+
+        # Only the SpikeInterface path needs pyedflib; the EDF+D reader is pure Python and NumPy, so
+        # discontinuous files also convert where pyedflib is unavailable (e.g. M1 macs).
+        get_package(
+            package_name="pyedflib",
+            excluded_platforms_and_python_versions=dict(darwin=dict(arm=["3.9"])),
+        )
+
         self.extractor_kwargs = interface_kwargs.copy()
         self.extractor_kwargs.pop("verbose", None)
         self.extractor_kwargs.pop("es_key", None)
@@ -319,16 +387,11 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             es_key = positional_values.get("es_key", es_key)
             channels_to_skip = positional_values.get("channels_to_skip", channels_to_skip)
 
-        get_package(
-            package_name="pyedflib",
-            excluded_platforms_and_python_versions=dict(darwin=dict(arm=["3.9"])),
-        )
-
         super().__init__(file_path=file_path, verbose=verbose, es_key=es_key, channels_to_skip=channels_to_skip)
         self.edf_header = self._edf_header
 
-        # We remove the channels that are not neural
-        if channels_to_skip:
+        # On the EDF+D path channels_to_skip was already honored while reading.
+        if channels_to_skip and not self._is_discontinuous:
             self.recording_extractor = self.recording_extractor.remove_channels(remove_channel_ids=channels_to_skip)
 
     def extract_nwb_file_metadata(self) -> dict:
@@ -356,6 +419,204 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         subject_metadata = {property: value for property, value in subject_metadata.items() if value}
 
         return subject_metadata
+
+    @property
+    def is_discontinuous(self) -> bool:
+        """Whether the source file is marked as a discontinuous EDF+ (``EDF+D``) file."""
+        return self._is_discontinuous
+
+    @property
+    def number_of_runs(self) -> int:
+        """
+        Number of contiguous runs of data records in the file.
+
+        Always 1 for plain EDF and ``EDF+C``. For ``EDF+D`` this is the number of gap-separated runs
+        actually found, which is frequently also 1 — exporters commonly label continuous recordings
+        ``EDF+D``.
+        """
+        return self._number_of_segments
+
+    @property
+    def _time_shifts(self) -> list[float]:
+        """
+        Per-run seconds between the file's own timeline and the timeline being written.
+
+        The record onsets and annotation timestamps parsed out of the file are relative to the start of
+        the file, and alignment moves the recording without touching those parsed values, so anything
+        derived from them has to be shifted or it points at the wrong moment in the NWB file.
+
+        One shift per run rather than one for the whole file, because
+        ``set_aligned_segment_starting_times`` moves each segment independently — and that is the natural
+        API here, runs sitting at different times being the entire premise of ``EDF+D``. A single delta
+        taken from segment 0 leaves every later run early by however much its own segment moved.
+        """
+        runs = getattr(self, "_edf_runs", None)
+        if not runs:
+            return []
+        return [
+            float(self.recording_extractor.get_start_time(segment_index=index)) - float(run.start_time)
+            for index, run in enumerate(runs)
+        ]
+
+    def _shift_for_time(self, onset: float) -> float:
+        """
+        The shift applying to an annotation at ``onset`` on the file's timeline.
+
+        An annotation belongs to the run whose span contains it. One falling in a gap has no run of its
+        own, so it takes the preceding run's shift — with per-segment alignment a gap has no defined
+        mapping, and staying with the run the annotation follows keeps it in order.
+        """
+        runs = getattr(self, "_edf_runs", None)
+        shifts = self._time_shifts
+        if not runs:
+            return 0.0
+
+        shift = shifts[0]
+        for index, run in enumerate(runs):
+            if onset < run.start_time:
+                break
+            shift = shifts[index]
+            if onset < run.start_time + run.number_of_records * self._edf_record_duration:
+                break
+        return shift
+
+    def add_to_nwbfile(
+        self,
+        nwbfile: NWBFile,
+        metadata: dict | None = None,
+        *,
+        stub_test: bool = False,
+        write_as: Literal["raw", "lfp", "processed"] | None = None,
+        parent_container: Literal["acquisition", "processing/LFP", "processing/FilteredEphys"] = "acquisition",
+        write_electrical_series: bool = True,
+        iterator_type: str | None = "v2",
+        iterator_options: dict | None = None,
+        always_write_timestamps: bool = False,
+        write_annotations: bool = True,
+        write_runs: bool = True,
+    ):
+        """
+        Add the EDF data to an NWBFile.
+
+        Plain EDF, ``EDF+C``, and ``EDF+D`` files whose records turn out to be contiguous are written as
+        a single ``ElectricalSeries``. A genuinely discontinuous ``EDF+D`` file is written as one
+        ``ElectricalSeries`` per contiguous run, each placed at its true start time on the session
+        timeline and sharing a single electrodes table.
+
+        Parameters
+        ----------
+        nwbfile : NWBFile
+            The NWBFile to add the data to.
+        metadata : dict, optional
+            Metadata dictionary for constructing the NWBFile.
+        stub_test : bool, default: False
+            If True, truncate the data to run the conversion faster and take up less memory.
+        write_as : {'raw', 'processed', 'lfp'}, optional
+            Deprecated alias for ``parent_container``.
+        parent_container : {'acquisition', 'processing/LFP', 'processing/FilteredEphys'}
+            The NWB container the electrical series is written to.
+        write_electrical_series : bool, default: True
+            If False, only device, electrode groups and electrodes are written.
+        iterator_type : {'v2', None}, default: 'v2'
+            The type of iterator used for chunked data writing.
+        iterator_options : dict, optional
+            Options controlling the iterative write.
+        always_write_timestamps : bool, default: False
+            If True, always write an explicit timestamps array rather than a starting time and rate.
+        write_annotations : bool, default: True
+            If True and the file is ``EDF+D``, the annotations carried in the ``EDF Annotations`` signals
+            are written to a ``TimeIntervals`` table named ``"annotations"``. Has no effect on plain EDF
+            or ``EDF+C`` files, whose handling is unchanged.
+        write_runs : bool, default: True
+            If True and the file is discontinuous with more than one contiguous run, the run boundaries
+            are written to a ``TimeIntervals`` table named ``"runs"``.
+        """
+        # The full signature is redeclared rather than taking **conversion_options, because
+        # get_conversion_options_schema is built from it: a catch-all erases every inherited option from
+        # the schema and flips additionalProperties to True, so typos would validate.
+        conversion_options = dict(
+            stub_test=stub_test,
+            parent_container=parent_container,
+            write_electrical_series=write_electrical_series,
+            iterator_type=iterator_type,
+            iterator_options=iterator_options,
+            always_write_timestamps=always_write_timestamps,
+        )
+        if write_as is not None:
+            conversion_options["write_as"] = write_as
+            conversion_options.pop("parent_container")
+        super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
+
+        # Both tables come from neuroconv's own reader, which is used only for discontinuous files.
+        # Files on the SpikeInterface path are untouched.
+        if not self._is_discontinuous:
+            return
+
+        if write_annotations and getattr(self, "_edf_annotations", None):
+            self._add_annotations_to_nwbfile(nwbfile=nwbfile)
+        # A single run is indistinguishable from a continuous recording, so there is nothing to record.
+        if write_runs and len(getattr(self, "_edf_runs", [])) > 1:
+            self._add_runs_to_nwbfile(nwbfile=nwbfile)
+
+    def _add_annotations_to_nwbfile(self, nwbfile: NWBFile):
+        """Write the EDF+ annotations to a TimeIntervals table, on the session timeline."""
+        from pynwb.epoch import TimeIntervals
+
+        # split_by_offset produces several interfaces backed by the same file, each carrying the same
+        # annotations, and they are written into one NWBFile — so only the first one writes the table.
+        if nwbfile.intervals is not None and "annotations" in nwbfile.intervals:
+            return
+
+        annotations_table = TimeIntervals(
+            name="annotations",
+            description="Annotations imported from the EDF+ 'EDF Annotations' signal.",
+        )
+        annotations_table.add_column(name="label", description="The EDF+ annotation text.")
+        for annotation in self._edf_annotations:
+            duration = annotation["duration"] or 0.0
+            onset = float(annotation["onset"])
+            start_time = onset + self._shift_for_time(onset)
+            annotations_table.add_row(
+                start_time=start_time,
+                stop_time=start_time + float(duration),
+                label=annotation["text"],
+            )
+        nwbfile.add_time_intervals(annotations_table)
+
+    def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
+        """
+        Write the boundaries of each contiguous run of data records to a TimeIntervals table.
+
+        A dedicated table is used rather than ``nwbfile.epochs``, for two reasons: ``epochs`` is a
+        shared singleton that another interface in the same ``ConverterPipe`` — or the caller of a
+        pre-built ``NWBFile`` — may already have populated, and ``add_epoch_column`` cannot extend a
+        table that has rows, so reaching into it raises
+        ``ValueError: column must have the same number of rows as 'id'``. This also keeps the runs
+        consistent with how the annotations are written.
+        """
+        from pynwb.epoch import TimeIntervals
+
+        # As with the annotations table, sub-interfaces from split_by_offset share these runs.
+        if nwbfile.intervals is not None and "runs" in nwbfile.intervals:
+            return
+
+        time_shifts = self._time_shifts
+        runs_table = TimeIntervals(
+            name="runs",
+            description=(
+                "Contiguous runs of data records in a discontinuous EDF+ (EDF+D) file. Each run is "
+                "written as its own ElectricalSeries, positioned at the run's start time."
+            ),
+        )
+        runs_table.add_column(name="run_index", description="0-based index of the contiguous run of EDF data records.")
+        for run_index, run in enumerate(self._edf_runs):
+            start_time = float(run.start_time) + time_shifts[run_index]
+            runs_table.add_row(
+                start_time=start_time,
+                stop_time=start_time + run.number_of_records * self._edf_record_duration,
+                run_index=run_index,
+            )
+        nwbfile.add_time_intervals(runs_table)
 
     @property
     def log_transformed_channels(self) -> dict:
