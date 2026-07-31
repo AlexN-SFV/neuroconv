@@ -75,21 +75,35 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         self.extractor_kwargs["all_annotations"] = True
         self.extractor_kwargs["use_names_as_ids"] = True
 
+        from ._edf_log_transform import (
+            decode_log_transformed_signals,
+            read_log_transforms,
+        )
+
+        # Read the transforms first, so the reader below can be told to expect them. A file with none —
+        # the overwhelmingly common case — takes exactly the path it always did.
+        channels_to_skip = interface_kwargs.get("channels_to_skip")
+        transforms = read_log_transforms(file_path=interface_kwargs["file_path"], channels_to_skip=channels_to_skip)
+
         extractor_class = self.get_extractor_class()
-        extractor_instance = extractor_class(**self.extractor_kwargs)
+        with warnings.catch_warnings():
+            if transforms:
+                # SpikeInterface sees the "Filtered" dimension as a non-voltage unit and warns about a
+                # mix. The user cannot act on it, and once the signal is decoded it is not even true —
+                # this interface knows what that dimension means, which the warning does not.
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Found a mix of voltage and non-voltage units.*",
+                    category=UserWarning,
+                )
+            extractor_instance = extractor_class(**self.extractor_kwargs)
 
         # Captured before wrapping: the decoding recording does not forward neo_reader, and this is the
         # only place the unwrapped reader is in hand.
         self._edf_header = extractor_instance.neo_reader.edf_header
 
-        # Decode any logarithmically transformed signal. Returns the recording untouched when the file has
-        # none, which is the overwhelmingly common case, so the ordinary path is unaffected.
-        from ._edf_log_transform import decode_log_transformed_signals
-
         extractor_instance, self._log_transforms = decode_log_transformed_signals(
-            recording=extractor_instance,
-            file_path=interface_kwargs["file_path"],
-            channels_to_skip=interface_kwargs.get("channels_to_skip"),
+            recording=extractor_instance, transforms=transforms
         )
         return extractor_instance
 

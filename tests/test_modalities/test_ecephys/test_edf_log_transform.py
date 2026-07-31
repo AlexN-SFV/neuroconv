@@ -237,6 +237,70 @@ class TestEDFRecordingInterfaceDecoding:
         metadata = EDFRecordingInterface(file_path=path).get_metadata()
         assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 9, 16, 12, 35, 13)
 
+    def test_recording_is_picklable_and_reloads(self, tmp_path):
+        """
+        Needed for recording.save() and any n_jobs > 1 path.
+
+        Both require the class to live at module scope, since SpikeInterface records it by import path;
+        reloading additionally needs ``neuroconv.__version__``, which it stamps and re-reads.
+        """
+        import importlib
+        import pickle
+
+        from spikeinterface.core import load
+
+        path, _, _ = write_edf(tmp_path / "log.edf")
+        recording = EDFRecordingInterface(file_path=path).recording_extractor
+
+        unpickled = pickle.loads(pickle.dumps(recording))
+        np.testing.assert_array_equal(unpickled.get_traces(), recording.get_traces())
+
+        class_path = recording.to_dict()["class"]
+        module_name, class_name = class_path.rsplit(".", 1)
+        assert getattr(importlib.import_module(module_name), class_name) is type(recording)
+
+        reloaded = load(recording.to_dict())
+        np.testing.assert_array_equal(reloaded.get_traces(), recording.get_traces())
+
+    def test_two_recordings_share_one_class(self, tmp_path):
+        """A class built inside a factory would give each construction its own, breaking isinstance."""
+        path, _, _ = write_edf(tmp_path / "log.edf")
+        first = EDFRecordingInterface(file_path=path).recording_extractor
+        second = EDFRecordingInterface(file_path=path).recording_extractor
+        assert type(first) is type(second)
+
+    def test_provenance_survives_a_json_round_trip(self, tmp_path):
+        """
+        A NamedTuple flattens to a list through JSON, so a reload would hand __init__ plain lists.
+
+        Storing the transforms as dicts keeps them recognizable, and the constructor accepts every shape.
+        """
+        from spikeinterface.core.core_tools import check_json
+
+        path, _, _ = write_edf(tmp_path / "log.edf")
+        recording = EDFRecordingInterface(file_path=path).recording_extractor
+
+        stored = check_json(recording.to_dict())["kwargs"]["transforms"]
+        assert stored == {"logch": {"unit": "uV", "minimum": YMIN, "coefficient": A}}
+
+        rebuilt = type(recording)(recording=recording._kwargs["recording"], transforms=stored)
+        np.testing.assert_array_equal(rebuilt.get_traces(), recording.get_traces())
+
+    def test_upstream_mixed_units_warning_is_suppressed(self, tmp_path):
+        """
+        SpikeInterface warns about a voltage/non-voltage mix because it reads "Filtered" as a unit.
+
+        The user cannot act on it and, once decoded, it is not true — this interface knows what that
+        dimension means.
+        """
+        import warnings
+
+        path, _, _ = write_edf(tmp_path / "log.edf")
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            EDFRecordingInterface(file_path=path)
+        assert [record for record in records if "mix of voltage" in str(record.message)] == []
+
     def test_conversion_writes_decoded_values(self, tmp_path):
         from pynwb import NWBHDF5IO
 
