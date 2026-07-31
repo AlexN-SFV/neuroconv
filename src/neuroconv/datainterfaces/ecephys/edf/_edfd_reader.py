@@ -335,36 +335,128 @@ def is_discontinuous_edf(file_path: FilePath) -> bool:
         return _decode_field(file.read(44)).upper().startswith("EDF+D")
 
 
+def _is_onset_field(field: bytes) -> bool:
+    """
+    True if ``field`` is an EDF+ onset — a decimal number carrying a mandatory explicit sign.
+
+    The sign is what makes this usable to find TAL boundaries: an annotation text such as ``601`` is
+    not a candidate, while ``+1.000000`` is. See :func:`_split_into_tals`.
+    """
+    if field[:1] not in (b"+", b"-"):
+        return False
+    try:
+        float(field.partition(_TAL_ONSET_DURATION_SEPARATOR)[0].decode("ascii", errors="replace"))
+    except ValueError:
+        return False
+    return True
+
+
+def _split_into_tals(chunk: bytes) -> list[list[bytes]]:
+    """
+    Split one NUL-delimited chunk into TALs, each returned as ``[timestamp, *annotation_fields]``.
+
+    A conformant writer ends every TAL with a NUL byte, so a chunk holds exactly one TAL and this
+    returns it unchanged. Some writers only NUL-pad the tail of the block and never terminate a TAL,
+    packing a record's time-keeping annotation and its real annotations into one NUL-free run of
+    bytes; Nihon Kohden's ``EDF+D`` export does this. Splitting those apart here is what keeps the
+    time-keeping onset — and therefore the whole file — readable.
+
+    Two structural facts make the split unambiguous for the shapes seen in practice. The time-keeping
+    annotation carries exactly one annotation text and that text is empty, so any field following
+    that empty one begins a new TAL. And an EDF+ onset always carries an explicit sign, so a signed
+    number appearing where an annotation text is expected begins one too.
+    """
+    fields = chunk.split(_TAL_TEXT_SEPARATOR)
+    tals = []
+    current = [fields[0]]
+    for field in fields[1:]:
+        # `len(current) > 1` means the TAL already has its timestamp and at least one text, so a
+        # signed number here cannot be this TAL's onset and must start the next one.
+        starts_new_tal = len(current) > 1 and _is_onset_field(field)
+        # The time-keeping annotation is `onset[20][20]` and owns nothing beyond that empty text.
+        completes_time_keeping = len(current) == 2 and not current[1] and field
+        if starts_new_tal or completes_time_keeping:
+            tals.append(current)
+            current = [field]
+        else:
+            current.append(field)
+    tals.append(current)
+    return tals
+
+
 def _parse_tals(raw: bytes) -> list[tuple[float, float | None, list[str]]]:
     """
     Parse the TALs in one record's ``EDF Annotations`` block.
 
-    Each TAL is ``Onset[21]Duration[20]Text[20]...[0]``, where ``[21]`` and the duration are optional.
-    Returns ``(onset, duration, texts)`` per TAL, skipping anything unparsable — trailing NUL padding
-    is normal and must not be treated as an error.
+    Each TAL is ``Onset[21]Duration[20]Text[20]...[0]``, where ``[21]`` and the duration are optional,
+    and the terminating ``[0]`` is omitted by some writers (see :func:`_split_into_tals`). Returns
+    ``(onset, duration, texts)`` per TAL, skipping anything unparsable — trailing NUL padding is
+    normal and must not be treated as an error.
     """
     tals = []
     for chunk in raw.split(_TAL_TERMINATOR):
         if not chunk.strip():
             continue
-        pieces = chunk.split(_TAL_TEXT_SEPARATOR)
-        timestamp = pieces[0]
-        texts = [piece.decode("utf-8", errors="replace").strip() for piece in pieces[1:]]
-
-        onset_field, _, duration_field = timestamp.partition(_TAL_ONSET_DURATION_SEPARATOR)
-        try:
-            onset = float(onset_field.decode("ascii", errors="replace"))
-        except ValueError:
-            continue
-        duration = None
-        if duration_field.strip():
+        for fields in _split_into_tals(chunk):
+            onset_field, _, duration_field = fields[0].partition(_TAL_ONSET_DURATION_SEPARATOR)
             try:
-                duration = float(duration_field.decode("ascii", errors="replace"))
+                onset = float(onset_field.decode("ascii", errors="replace"))
             except ValueError:
-                duration = None
+                continue
+            duration = None
+            if duration_field.strip():
+                try:
+                    duration = float(duration_field.decode("ascii", errors="replace"))
+                except ValueError:
+                    duration = None
 
-        tals.append((onset, duration, [text for text in texts if text]))
+            texts = [field.decode("utf-8", errors="replace").strip() for field in fields[1:]]
+            tals.append((onset, duration, [text for text in texts if text]))
     return tals
+
+
+def _consecutive_blocks(indices: list[int]) -> list[list[int]]:
+    """Group an ascending list of record indices into maximal runs of consecutive values."""
+    blocks = []
+    for index in indices:
+        if blocks and index == blocks[-1][-1] + 1:
+            blocks[-1].append(index)
+        else:
+            blocks.append([index])
+    return blocks
+
+
+def _place_records_between_known_onsets(
+    *, onsets: np.ndarray, missing: list[int], record_duration: float, number_of_records: int
+) -> list[int]:
+    """
+    Recover the onsets of records whose time-keeping annotation was unreadable, wherever the records
+    on either side prove that nothing is missing between them.
+
+    The position is *derived*, not assumed. If the known onsets bracketing a block of unreadable ones
+    span exactly the number of records in between, then no gap can be hiding inside that block and
+    every onset in it follows by arithmetic. A block that fails this test, or that runs to either end
+    of the file where there is no anchor on one side, is left alone and reported to the caller —
+    ``EDF+D`` exists precisely to say that contiguity cannot be taken for granted, so a record whose
+    neighbours do not vouch for it stays unplaced.
+
+    Onsets are written in place. Returns the record indices still unplaced, in ascending order.
+    """
+    still_missing = []
+    for block in _consecutive_blocks(missing):
+        before, after = block[0] - 1, block[-1] + 1
+        if before < 0 or after >= number_of_records:
+            still_missing.extend(block)
+            continue
+        # Half a record duration is far tighter than any gap a writer would bother to record, and
+        # loose enough to absorb the rounding in onsets printed as fixed-width decimals.
+        expected_span = (len(block) + 1) * record_duration
+        if abs((onsets[after] - onsets[before]) - expected_span) > 0.5 * record_duration:
+            still_missing.extend(block)
+            continue
+        for position, record_index in enumerate(block, start=1):
+            onsets[record_index] = onsets[before] + position * record_duration
+    return still_missing
 
 
 def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndarray, list[dict]]:
@@ -390,12 +482,17 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
         ``(onsets, annotations)``. ``onsets`` has one float per data record; ``annotations`` is a list
         of ``dict(onset=..., duration=..., text=...)``.
 
+    Where a record's time-keeping onset cannot be read, the records either side of it are given the
+    chance to prove that no gap hides there, in which case its onset follows from theirs and only a
+    warning is issued. See :func:`_place_records_between_known_onsets`.
+
     Raises
     ------
     ValueError
-        If the file is ``EDF+D`` and any record's time-keeping onset cannot be recovered — the record's
-        position on the timeline is then genuinely unknown, and assuming contiguity would silently
-        misplace data, which is the one thing ``EDF+D`` exists to express.
+        If the file is ``EDF+D`` and any record's time-keeping onset can neither be read nor derived
+        from its neighbours — the record's position on the timeline is then genuinely unknown, and
+        assuming contiguity would silently misplace data, which is the one thing ``EDF+D`` exists to
+        express.
     """
     annotations_indices = header.annotations_signal_indices
     if not annotations_indices:
@@ -438,15 +535,41 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
                     annotations.append(dict(onset=onset, duration=duration, text=text))
 
     if records_missing_onset and header.is_discontinuous:
-        shown = records_missing_onset[:5]
-        raise ValueError(
-            f"{len(records_missing_onset)} of {header.number_of_records} data records in this "
-            f"discontinuous EDF+ (EDF+D) file carry no readable time-keeping annotation "
-            f"(records {shown}{' ...' if len(records_missing_onset) > len(shown) else ''}). "
-            "Their position on the recording timeline cannot be recovered, and assuming the records are "
-            "contiguous would silently misplace every sample after the first gap. Check whether the "
-            "writer emitted malformed TAL onsets, for example using a comma as the decimal separator."
+        unplaced = _place_records_between_known_onsets(
+            onsets=onsets,
+            missing=records_missing_onset,
+            record_duration=header.record_duration,
+            number_of_records=header.number_of_records,
         )
+        recovered = len(records_missing_onset) - len(unplaced)
+        if recovered:
+            warnings.warn(
+                f"{recovered} of {header.number_of_records} data records in this discontinuous EDF+ "
+                "(EDF+D) file carry no readable time-keeping annotation, so the file does not conform "
+                "to EDF+. The records on either side of each of them span exactly the intervening "
+                "number of records, which rules out a gap there, so their start times follow from "
+                "their neighbours and the recording timeline is unaffected.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if unplaced:
+            shown = unplaced[:5]
+            byte_offset, block_size = layouts[time_keeping_index]
+            file.seek(header.header_size_bytes + unplaced[0] * header.record_size_bytes + byte_offset)
+            sample = file.read(block_size).rstrip(_TAL_TERMINATOR)
+            raise ValueError(
+                f"{len(unplaced)} of {header.number_of_records} data records in this discontinuous "
+                f"EDF+ (EDF+D) file carry no readable time-keeping annotation, and their neighbours do "
+                f"not rule out a gap across them, so their position on the recording timeline cannot be "
+                f"recovered (records {shown}{' ...' if len(unplaced) > len(shown) else ''}). Assuming "
+                "the records are contiguous would silently misplace every sample after the first gap, "
+                "which is the one thing EDF+D exists to rule out.\n"
+                f"For reference, the 'EDF Annotations' block of record {unplaced[0]} reads "
+                f"{sample!r}. A conformant block opens with a signed onset, then byte 20, then an "
+                "empty annotation text, then byte 20 — for example b'+1.234\\x14\\x14'. Departures "
+                "seen in practice are a comma as the decimal separator, a missing sign, and a real "
+                "annotation placed ahead of the time-keeping one."
+            )
 
     return onsets, annotations
 

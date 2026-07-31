@@ -15,6 +15,8 @@ from pynwb import NWBHDF5IO
 from neuroconv.datainterfaces import EDFRecordingInterface
 from neuroconv.datainterfaces.ecephys.edf._edfd_extractor import EDFDRecordingExtractor
 from neuroconv.datainterfaces.ecephys.edf._edfd_reader import (
+    _parse_tals,
+    _split_into_tals,
     edf_plus_header_fields,
     group_records_into_runs,
     is_discontinuous_edf,
@@ -70,6 +72,7 @@ def write_edf(
     recording_field="Startdate 16-SEP-2021 X X test",
     patient_field="X X X X",
     nul_pad_record_count=False,
+    terminate_tals=True,
 ):
     """
     Write a minimal but spec-conforming EDF/EDF+ file.
@@ -81,6 +84,9 @@ def write_edf(
     ``samples_per_record`` may be a list, one entry per data channel, to build a file whose signals do
     not share a sampling rate. ``extra_annotations_signals`` appends further ``EDF Annotations`` signals
     after the first one, which the spec permits.
+
+    ``terminate_tals=False`` omits the NUL byte that ends each TAL, leaving only the NUL padding at
+    the tail of the block, which is what Nihon Kohden's ``EDF+D`` export does.
     """
     channel_names = list(channel_names)
     number_of_channels = len(channel_names)
@@ -154,14 +160,15 @@ def write_edf(
         if not include_annotations_signal:
             continue
         # The mandatory time-keeping TAL, then any real annotations belonging to this record.
-        block = f"+{record_onsets[record_index]:.6f}".encode("ascii") + b"\x14\x14\x00"
+        terminator = b"\x00" if terminate_tals else b""
+        block = f"+{record_onsets[record_index]:.6f}".encode("ascii") + b"\x14\x14" + terminator
         for onset, duration, text in annotations:
             if record_index != _record_index_of(onset, record_onsets, record_duration):
                 continue
             stamp = f"+{onset:.6f}".encode("ascii")
             if duration is not None:
                 stamp += b"\x15" + f"{duration:g}".encode("ascii")
-            block += stamp + b"\x14" + text.encode("utf-8") + b"\x14\x00"
+            block += stamp + b"\x14" + text.encode("utf-8") + b"\x14" + terminator
         assert len(block) <= annotation_samples * 2, "annotation block overflow in fixture"
         body += block.ljust(annotation_samples * 2, b"\x00")
         # Additional annotations signals carry no time-keeping TAL of their own, but the spec lets them
@@ -540,6 +547,107 @@ class TestEDFDReader:
         assert raw.count(b"+0.000000\x14\x14\x00") == 1
         Path(path).write_bytes(raw.replace(b"+0.000000\x14\x14\x00", b"+0.000000\x14seizure\x14\x00", 1))
         with pytest.raises(ValueError, match="no readable time-keeping annotation"):
+            EDFDRecordingExtractor(file_path=path)
+
+    def test_unterminated_tals_are_split_apart(self, tmp_path, digital_data):
+        """
+        Some writers never NUL-terminate a TAL and only NUL-pad the tail of the annotations block, so a
+        record's time-keeping TAL and its real annotations arrive as one NUL-free run of bytes.
+
+        Nihon Kohden's EDF+D export does this. Reading the run as a single TAL makes the time-keeping
+        annotation look texted, which used to make every annotated record's onset unrecoverable and so
+        rejected an otherwise perfectly readable file.
+        """
+        annotations = [(2.5, None, "Segment: REC START"), (10.25, 1.5, "seizure onset")]
+        path = write_edf(
+            tmp_path / "d.edf",
+            record_onsets=GAPPED_ONSETS,
+            data=digital_data,
+            annotations=annotations,
+            terminate_tals=False,
+        )
+        assert b"\x14\x14\x00" not in Path(path).read_bytes()[36352:], "fixture still terminates its TALs"
+
+        recording = EDFDRecordingExtractor(file_path=path)
+        assert recording.runs == EXPECTED_RUNS
+        assert recording.annotations_from_file == [
+            dict(onset=2.5, duration=None, text="Segment: REC START"),
+            dict(onset=10.25, duration=1.5, text="seizure onset"),
+        ]
+
+    def test_unterminated_tals_give_the_same_result_as_terminated_ones(self, tmp_path, digital_data):
+        """The NUL terminator is the writer's business; neither spelling may change what is read."""
+        annotations = [(2.5, None, "Marker: 601")]
+        paths = {
+            terminated: write_edf(
+                tmp_path / f"{terminated}.edf",
+                record_onsets=GAPPED_ONSETS,
+                data=digital_data,
+                annotations=annotations,
+                terminate_tals=terminated,
+            )
+            for terminated in (True, False)
+        }
+        recordings = {key: EDFDRecordingExtractor(file_path=path) for key, path in paths.items()}
+        assert recordings[True].runs == recordings[False].runs
+        assert recordings[True].annotations_from_file == recordings[False].annotations_from_file
+        np.testing.assert_array_equal(
+            recordings[True].get_traces(segment_index=1), recordings[False].get_traces(segment_index=1)
+        )
+
+    def test_numeric_annotation_text_does_not_start_a_new_tal(self):
+        """
+        An EDF+ onset always carries an explicit sign, which is what lets an unterminated TAL be split.
+
+        A bare number such as a stimulus code is an annotation text, not the next TAL's onset — the
+        real recording that motivated this uses ``601`` as an event label.
+        """
+        assert _split_into_tals(b"+0.868000\x14\x14+1.000000\x14601\x14") == [
+            [b"+0.868000", b""],
+            [b"+1.000000", b"601", b""],
+        ]
+        assert _parse_tals(b"+0.868000\x14\x14+1.000000\x14601\x14") == [
+            (0.868, None, []),
+            (1.0, None, ["601"]),
+        ]
+
+    def test_multiple_annotations_in_one_tal_stay_in_one_tal(self):
+        """The spec lets a single TAL carry several texts; splitting must not break that shape."""
+        assert _parse_tals(b"+180\x14Lights off\x14Close door\x14\x00") == [(180.0, None, ["Lights off", "Close door"])]
+
+    def test_junk_after_the_time_keeping_tal_does_not_cost_the_onset(self):
+        """
+        The record's position is worth more than an unreadable annotation.
+
+        Splitting at the time-keeping annotation's empty text means unparsable trailing bytes lose only
+        themselves, where previously they took the whole file down with them.
+        """
+        assert _parse_tals(b"+3.000000\x14\x14not-a-tal\x14") == [(3.0, None, [])]
+
+    def test_onset_between_readable_neighbours_is_recovered_with_a_warning(self, tmp_path, digital_data):
+        """
+        A record bracketed by onsets that span exactly the records in between cannot be hiding a gap, so
+        its start time follows from its neighbours and the file need not be rejected.
+        """
+        path = write_edf(tmp_path / "d.edf", record_onsets=GAPPED_ONSETS, data=digital_data)
+        # Record 2 sits inside the first run, so records 1 and 3 bracket it one record duration apart.
+        raw = Path(path).read_bytes()
+        assert raw.count(b"+2.000000") == 1
+        Path(path).write_bytes(raw.replace(b"+2.000000", b"+2,000000", 1))
+
+        with pytest.warns(UserWarning, match="follow from their neighbours"):
+            recording = EDFDRecordingExtractor(file_path=path)
+        assert recording.runs == EXPECTED_RUNS
+
+    def test_unrecoverable_onset_error_shows_the_offending_bytes(self, tmp_path, digital_data):
+        """
+        The old message could only guess at the cause, which sent this exact investigation down the
+        wrong path. Printing the block lets a reader see what the writer actually emitted.
+        """
+        path = write_edf(tmp_path / "d.edf", record_onsets=GAPPED_ONSETS, data=digital_data)
+        raw = Path(path).read_bytes()
+        Path(path).write_bytes(raw.replace(b"+9.000000", b"+9,000000", 1))
+        with pytest.raises(ValueError, match=r"block of record 4 reads b'\+9,000000"):
             EDFDRecordingExtractor(file_path=path)
 
     def test_truncated_final_record_is_dropped_not_read(self, tmp_path, digital_data):
