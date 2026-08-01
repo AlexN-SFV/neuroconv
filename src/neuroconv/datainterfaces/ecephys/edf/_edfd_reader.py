@@ -846,6 +846,12 @@ def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> d
 
     return dict(
         channel_names=channel_names,
+        # The physical dimension exactly as the header spells it, ``Filtered`` included. Reported so a
+        # caller can see what the file claimed and, where an external source such as a BIDS
+        # channels.tsv disagrees, correct the gains themselves — some exporters drop the micro sign
+        # and leave a bare ``V`` behind. The SpikeInterface path exposes this property too, so the
+        # same code works whichever reader opened the file.
+        physical_units=[header.dimensions[index] for index in data_signal_indices],
         log_transforms=log_transforms,
         # float64 rather than float32: the transform's whole purpose is dynamic range, and the spec's own
         # accuracy table reaches 1.4e68, well past what float32 can hold.

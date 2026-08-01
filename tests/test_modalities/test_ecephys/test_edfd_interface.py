@@ -511,6 +511,53 @@ class TestEDFDReader:
         expected_gains = [6400.0 / 65536, 6400.0 / 65536, 20000.0 / 65536]
         np.testing.assert_allclose(recording.get_channel_gains(), expected_gains)
 
+    def test_physical_unit_is_reported_like_the_spikeinterface_path(self, tmp_path, digital_data):
+        """
+        The header's declared unit has to be readable off the recording, on both readers.
+
+        It is what a caller needs to notice that an external source — a BIDS ``channels.tsv``, say —
+        disagrees with the file, which happens when an exporter drops the micro sign from ``µV`` and
+        leaves a bare ``V``. SpikeInterface's reader sets this property, so ours must too or the same
+        correction code would work on continuous files only.
+        """
+        path = write_edf(
+            tmp_path / "units.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            dimensions=["uV", "V", "mV"],
+        )
+        recording = EDFDRecordingExtractor(file_path=path)
+        assert list(recording.get_property("physical_unit")) == ["uV", "V", "mV"]
+
+        # SpikeInterface reserves this property for the ElectricalSeries, so it must not also become
+        # an electrodes column.
+        interface = EDFRecordingInterface(file_path=path)
+        nwbfile_path = tmp_path / "units.nwb"
+        interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(interface), overwrite=True)
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            assert "physical_unit" not in io.read().electrodes.colnames
+
+    def test_channel_properties_reach_the_electrodes_table(self, tmp_path, digital_data):
+        """
+        The documented route for external channel metadata: set it on the recording, and it becomes a
+        column. Pinned here because the EDF gallery page now tells people to do exactly this.
+        """
+        path = write_edf(tmp_path / "props.edf", record_onsets=CONTIGUOUS_ONSETS, data=digital_data)
+        interface = EDFRecordingInterface(file_path=path)
+        interface.recording_extractor.set_property("bids_type", np.array(["ECOG", "ECOG", "SEEG"]))
+        interface.recording_extractor.set_property("brain_area", np.array(["hippocampus"] * 3))
+
+        nwbfile_path = tmp_path / "props.nwb"
+        metadata = _metadata(interface)
+        metadata["Ecephys"]["Electrodes"] = [dict(name="bids_type", description="type from channels.tsv")]
+        interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=metadata, overwrite=True)
+
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            electrodes = io.read().electrodes
+            assert list(electrodes["bids_type"][:]) == ["ECOG", "ECOG", "SEEG"]
+            # 'brain_area' is the property neuroconv maps onto the standard 'location' column.
+            assert list(electrodes["location"][:]) == ["hippocampus"] * 3
+
     def test_every_annotations_signal_is_excluded_from_data(self, tmp_path, digital_data):
         """The spec permits additional 'EDF Annotations' signals; none may become a data channel."""
         path = write_edf(

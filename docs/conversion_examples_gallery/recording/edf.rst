@@ -193,6 +193,73 @@ and read as microvolts with a warning, since an ``ElectricalSeries`` holds volta
 channel with
 :py:class:`~neuroconv.datainterfaces.ecephys.edf.edfanaloginterface.EDFAnalogInterface` instead.
 
+Adding Channel Metadata From BIDS Sidecars
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+An EDF header carries little beyond a label and a unit per signal, so recordings distributed as BIDS
+come with ``*_channels.tsv`` and ``*_electrodes.tsv`` alongside them. NeuroConv does not read those
+files, but it does not need a BIDS-specific pathway to use them: **anything set as a channel property
+on the recording extractor becomes a column of the NWB electrodes table.**
+
+.. code-block:: python
+
+    import csv
+    import numpy as np
+    from neuroconv.datainterfaces import EDFRecordingInterface
+
+    interface = EDFRecordingInterface(file_path=file_path)
+    recording = interface.recording_extractor
+
+    channels = {row["name"]: row for row in csv.DictReader(open(channels_tsv, encoding="utf-8"), delimiter="\t")}
+    channel_ids = [str(channel_id) for channel_id in recording.channel_ids]
+
+    def column(field):
+        # Match the sidecar's names to the EDF labels however your files require; EDF labels are often
+        # prefixed ("POL A3" for the sidecar's "A3"), and the mapping is not always mechanical.
+        return np.array([channels.get(name, {}).get(field, "n/a") for name in channel_ids])
+
+    recording.set_property("bids_type", column("type"))
+    recording.set_property("status", column("status"))
+    recording.set_property("brain_area", column("group"))  # -> the standard 'location' column
+
+    # metadata['Ecephys']['Electrodes'] supplies *descriptions* for those columns, not their values.
+    metadata = interface.get_metadata()
+    metadata["Ecephys"]["Electrodes"] = [
+        dict(name="bids_type", description="channel type from the BIDS channels.tsv"),
+    ]
+
+A few property names are treated specially: ``brain_area`` becomes the standard ``location`` column, a
+two-dimensional ``location`` property becomes ``rel_x``/``rel_y``/``rel_z``, and ``channel_name`` and
+``group_name`` are handled by the writer. ``physical_unit``, ``gain_to_uV`` and ``offset_to_uV``
+describe the ``ElectricalSeries`` and are deliberately not written as electrode columns.
+
+.. note::
+
+    **When the sidecar's unit disagrees with the header.** Some exporters write the physical dimension
+    through an ASCII encoding that silently drops the micro sign, so a channel recorded in ``µV`` is
+    labelled ``V`` — and is then read one million times too large. BESA exports do this: their
+    ``channels.tsv`` says ``µV`` for channels whose EDF header says ``V``, and the affected channels'
+    physical ranges give it away, being no larger than those of the channels correctly labelled ``uV``
+    in the same file.
+
+    A unit is not metadata — correcting it means correcting the scaling, so it cannot be done with
+    ``set_property``:
+
+    .. code-block:: python
+
+        # What the header declared, available on continuous and discontinuous files alike.
+        header_units = recording.get_property("physical_unit")
+
+        mislabelled = np.array(
+            [sidecar == "µV" and header.strip() == "V" for sidecar, header in zip(column("units"), header_units)]
+        )
+        gains = recording.get_channel_gains().copy()
+        gains[mislabelled] /= 1e6
+        recording.set_channel_gains(gains)
+
+    NeuroConv does not do this for you, because inferring a unit the file does not state would be a
+    silent change to the data. Check ``physical_unit`` against your sidecar before converting.
+
 Converting Auxiliary EDF Channels as TimeSeries
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
