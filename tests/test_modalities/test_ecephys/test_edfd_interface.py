@@ -16,6 +16,7 @@ from pynwb import NWBHDF5IO
 from neuroconv.datainterfaces import EDFRecordingInterface
 from neuroconv.datainterfaces.ecephys.edf._edfd_extractor import EDFDRecordingExtractor
 from neuroconv.datainterfaces.ecephys.edf._edfd_reader import (
+    _has_interior_nul,
     _parse_tals,
     _split_into_tals,
     edf_plus_header_fields,
@@ -579,6 +580,48 @@ class TestEDFDReader:
             dict(onset=10.25, duration=1.5, text="seizure onset"),
         ]
 
+    def test_a_terminating_writer_never_meets_the_heuristics(self, tmp_path, digital_data):
+        """
+        The guarantee the gate buys: a file whose writer terminates any TAL is parsed by the spec
+        alone, so no heuristic can cost it an annotation.
+
+        The annotation here is the one shape the heuristics still get wrong — a signed number between
+        two texts. An unreadable onset elsewhere in the file is what would otherwise send the reader
+        back for a second, heuristic pass; the interior NUL in the annotated record's block is what
+        stops it, and that is read from the file rather than assumed.
+        """
+        path = write_edf(
+            tmp_path / "conformant.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            annotations=[(2.5, None, "label")],
+        )
+        raw = Path(path).read_bytes()
+
+        # Give record 2's annotation the three-text shape, padding to keep every later record in place.
+        original = b"+2.500000\x14label\x14\x00"
+        assert raw.count(original) == 1
+        raw = raw.replace(original, b"+2.5\x14L\x14-3\x14M\x14\x00".ljust(len(original), b"\x00"), 1)
+        # ...and make one onset unreadable, so a heuristic re-read is on the table at all.
+        assert raw.count(b"+5.000000") == 1
+        raw = raw.replace(b"+5.000000", b"+5,000000", 1)
+        Path(path).write_bytes(raw)
+
+        with open(path, "rb") as file:
+            header = read_edf_header(file)
+            byte_offset = header.sample_offset_in_record(header.annotations_signal_indices[0]) * 2
+            file.seek(header.header_size_bytes + 2 * header.record_size_bytes + byte_offset)
+            assert _has_interior_nul(file.read(header.samples_per_record[-1] * 2)), "fixture has no interior NUL"
+
+        with pytest.warns(UserWarning, match="follow from their neighbours"):
+            recording = EDFDRecordingExtractor(file_path=path)
+        # All three texts survive: '-3' was never promoted to an onset.
+        assert recording.annotations_from_file == [
+            dict(onset=2.5, duration=None, text="L"),
+            dict(onset=2.5, duration=None, text="-3"),
+            dict(onset=2.5, duration=None, text="M"),
+        ]
+
     def test_unterminated_tals_give_the_same_result_as_terminated_ones(self, tmp_path, digital_data):
         """The NUL terminator is the writer's business; neither spelling may change what is read."""
         annotations = [(2.5, None, "Marker: 601")]
@@ -610,14 +653,16 @@ class TestEDFDReader:
             [b"+0.868000", b""],
             [b"+1.000000", b"601", b""],
         ]
-        assert _parse_tals(b"+0.868000\x14\x14+1.000000\x14601\x14") == [
+        assert _parse_tals(b"+0.868000\x14\x14+1.000000\x14601\x14", split_unterminated=True) == [
             (0.868, None, []),
             (1.0, None, ["601"]),
         ]
 
     def test_multiple_annotations_in_one_tal_stay_in_one_tal(self):
         """The spec lets a single TAL carry several texts; splitting must not break that shape."""
-        assert _parse_tals(b"+180\x14Lights off\x14Close door\x14\x00") == [(180.0, None, ["Lights off", "Close door"])]
+        assert _parse_tals(b"+180\x14Lights off\x14Close door\x14\x00", split_unterminated=True) == [
+            (180.0, None, ["Lights off", "Close door"])
+        ]
 
     def test_conformant_tal_with_an_empty_leading_text_keeps_its_annotation(self):
         """
@@ -628,8 +673,10 @@ class TestEDFDReader:
         is discarded — so it is read as one TAL and the text survives. That leaves the record's leading
         TAL texted, which is what makes its onset unrecoverable, and refusing beats losing data.
         """
-        assert _parse_tals(b"+5.0\x14\x14real annotation\x14") == [(5.0, None, ["real annotation"])]
-        assert _parse_tals(b"+3.000000\x14\x14not-a-tal\x14") == [(3.0, None, ["not-a-tal"])]
+        assert _parse_tals(b"+5.0\x14\x14real annotation\x14", split_unterminated=True) == [
+            (5.0, None, ["real annotation"])
+        ]
+        assert _parse_tals(b"+3.000000\x14\x14not-a-tal\x14", split_unterminated=True) == [(3.0, None, ["not-a-tal"])]
 
     def test_a_trailing_signed_number_stays_an_annotation_text(self):
         """
@@ -637,16 +684,52 @@ class TestEDFDReader:
         texts; promoting one to an onset would silently drop it.
 
         A TAL being opened must therefore have a non-empty field still to come, which a trailing text
-        does not. This shape occurs in conformant files too, so getting it wrong is not confined to
-        the writers this splitting exists for.
+        does not.
         """
-        assert _parse_tals(b"+5.0\x14label\x14-3\x14") == [(5.0, None, ["label", "-3"])]
-        assert _parse_tals(b"+5.0\x14label\x14+2.5\x14") == [(5.0, None, ["label", "+2.5"])]
+        assert _parse_tals(b"+5.0\x14label\x14-3\x14", split_unterminated=True) == [(5.0, None, ["label", "-3"])]
+        assert _parse_tals(b"+5.0\x14label\x14+2.5\x14", split_unterminated=True) == [(5.0, None, ["label", "+2.5"])]
         # ...while a signed onset that does introduce a further text still opens a TAL.
-        assert _parse_tals(b"+5.0\x14label\x14+2.5\x14later\x14") == [
+        assert _parse_tals(b"+5.0\x14label\x14+2.5\x14later\x14", split_unterminated=True) == [
             (5.0, None, ["label"]),
             (2.5, None, ["later"]),
         ]
+
+    def test_a_signed_number_between_two_texts_is_still_promoted(self):
+        """
+        The surviving hole in the heuristics, recorded so it is a known cost rather than a surprise.
+
+        A signed number in the *middle* of a multi-text TAL satisfies every condition — the TAL has a
+        text already, and another follows — so it opens a TAL and stops being an annotation. It takes
+        three texts with a signed one in the middle; the same number last is safe.
+
+        This is why the heuristics are gated on the file (see the interior-NUL tests below) rather than
+        relied on to be right in isolation: any conformant file able to produce this shape terminates
+        its TALs, so it never reaches them.
+        """
+        assert _parse_tals(b"+5.0\x14label\x14-3\x14more text\x14", split_unterminated=True) == [
+            (5.0, None, ["label"]),
+            (-3.0, None, ["more text"]),
+        ]
+        assert _parse_tals(b"+5.0\x14label\x14more text\x14-3\x14", split_unterminated=True) == [
+            (5.0, None, ["label", "more text", "-3"])
+        ]
+        # Off — the default, and what a conformant file gets — it is one TAL either way.
+        assert _parse_tals(b"+5.0\x14label\x14-3\x14more text\x14") == [(5.0, None, ["label", "-3", "more text"])]
+
+    @pytest.mark.parametrize(
+        "block, terminates",
+        [
+            (b"+0.217000\x14\x14\x00\x00\x00", False),  # conformant, but only padding follows
+            (b"+0.000000\x14\x14+1.0\x14a\x14\x00\x00", False),  # packed, no terminator at all
+            (b"+0.000000\x14\x14\x00+1.0\x14a\x14\x00", True),  # a NUL with content after it
+        ],
+    )
+    def test_interior_nul_identifies_a_writer_that_terminates_tals(self, block, terminates):
+        """
+        A NUL followed by further content can only be a TAL terminator, since a block's own padding
+        runs to its end. That is what tells the reader which kind of writer produced the file.
+        """
+        assert _has_interior_nul(block) is terminates
 
     def test_onset_between_readable_neighbours_is_recovered_with_a_warning(self, tmp_path, digital_data):
         """
