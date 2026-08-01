@@ -181,10 +181,14 @@ class EDFDRecordingExtractor(BaseRecording):
         self.set_channel_gains(gains=layout["gains_to_microvolts"])
         self.set_channel_offsets(offsets=layout["offsets_to_microvolts"])
         self.set_property(key="channel_name", values=np.asarray(layout["channel_names"]))
-        # SpikeInterface treats this as a reserved property — it describes the ElectricalSeries rather
-        # than becoming an electrodes column — and the neo-backed path sets it, so the two readers
-        # would otherwise disagree about whether a caller can ask what unit the header declared.
+        # SpikeInterface treats these as reserved properties — they describe the series rather than
+        # becoming electrodes columns — and the neo-backed path sets them, so the two readers would
+        # otherwise disagree about whether a caller can ask what unit the header declared. The
+        # TimeSeries writer needs all three together, or it falls back to a unit of "n.a."; note that
+        # the gain and offset are in the header's own unit, not the microvolts the writer scales to.
         self.set_property(key="physical_unit", values=np.asarray(layout["physical_units"]))
+        self.set_property(key="gain_to_physical_unit", values=layout["gains_to_physical_unit"])
+        self.set_property(key="offset_to_physical_unit", values=layout["offsets_to_physical_unit"])
 
         self.edf_header = header
         self.annotations_from_file = annotations

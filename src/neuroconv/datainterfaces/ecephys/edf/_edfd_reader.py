@@ -806,6 +806,11 @@ def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> d
 
     gains_to_microvolts = np.empty(len(data_signal_indices), dtype="float64")
     offsets_to_microvolts = np.empty(len(data_signal_indices), dtype="float64")
+    # The same scaling expressed in the header's *own* unit rather than microvolts. SpikeInterface's
+    # TimeSeries writer needs all three of these — unit, gain, offset — to record real units on an
+    # auxiliary channel, and falls back to "n.a." if any is missing.
+    gains_to_physical_unit = np.empty(len(data_signal_indices), dtype="float64")
+    offsets_to_physical_unit = np.empty(len(data_signal_indices), dtype="float64")
     assumed_microvolts: dict[str, list[str]] = {}
     for position, index in enumerate(data_signal_indices):
         if position in log_transforms:
@@ -816,6 +821,10 @@ def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> d
                 factor = 1.0
             gains_to_microvolts[position] = factor
             offsets_to_microvolts[position] = 0.0
+            # get_traces already returns decoded physical values for these channels, so no further
+            # scaling takes them to the signal's own unit.
+            gains_to_physical_unit[position] = 1.0
+            offsets_to_physical_unit[position] = 0.0
             continue
         physical_range = header.physical_max[index] - header.physical_min[index]
         # NOTE: the digital span is deliberately the *number of codes* (max - min + 1) rather than the
@@ -841,6 +850,8 @@ def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> d
             to_microvolts = 1.0
         gains_to_microvolts[position] = gain * to_microvolts
         offsets_to_microvolts[position] = offset * to_microvolts
+        gains_to_physical_unit[position] = gain
+        offsets_to_physical_unit[position] = offset
 
     _warn_assumed_microvolts(unit_to_channel_names=assumed_microvolts)
 
@@ -863,4 +874,6 @@ def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> d
         ),
         gains_to_microvolts=gains_to_microvolts,
         offsets_to_microvolts=offsets_to_microvolts,
+        gains_to_physical_unit=gains_to_physical_unit,
+        offsets_to_physical_unit=offsets_to_physical_unit,
     )

@@ -20,6 +20,7 @@ and synchronize data across multiple sources.
 
   datainterfaces
   nwbconverter
+  electrode_metadata
   adding_trials
   temporal_alignment
   csvs

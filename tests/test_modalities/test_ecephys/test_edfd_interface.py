@@ -529,13 +529,53 @@ class TestEDFDReader:
         recording = EDFDRecordingExtractor(file_path=path)
         assert list(recording.get_property("physical_unit")) == ["uV", "V", "mV"]
 
-        # SpikeInterface reserves this property for the ElectricalSeries, so it must not also become
-        # an electrodes column.
+        # The gain and offset are in the header's own unit, not the microvolts the writer scales to.
+        np.testing.assert_allclose(
+            recording.get_property("gain_to_uV"),
+            recording.get_property("gain_to_physical_unit") * np.array([1.0, 1e6, 1e3]),
+        )
+
+        # SpikeInterface reserves all three for the series itself, so none may become an electrodes
+        # column.
         interface = EDFRecordingInterface(file_path=path)
         nwbfile_path = tmp_path / "units.nwb"
         interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(interface), overwrite=True)
         with NWBHDF5IO(str(nwbfile_path), "r") as io:
-            assert "physical_unit" not in io.read().electrodes.colnames
+            columns = io.read().electrodes.colnames
+            assert not {"physical_unit", "gain_to_physical_unit", "offset_to_physical_unit"} & set(columns)
+
+    def test_auxiliary_channels_reach_a_time_series_with_real_units(self, tmp_path, digital_data):
+        """
+        The TimeSeries writer needs unit, gain *and* offset together, or it writes ``n.a.`` and warns.
+
+        Auxiliary signals — SpO2, triggers — belong in a TimeSeries rather than an ElectricalSeries,
+        and reporting only the unit would not have been enough to give them one.
+        """
+        from pynwb.testing.mock.file import mock_NWBFile
+
+        from neuroconv.tools.spikeinterface import (
+            add_recording_as_time_series_to_nwbfile,
+        )
+
+        path = write_edf(
+            tmp_path / "aux.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            channel_names=["SpO2a", "SpO2b", "SpO2c"],
+            dimensions=["%", "%", "%"],
+            physical_min=0.0,
+            physical_max=100.0,
+        )
+        recording = EDFDRecordingExtractor(file_path=path)
+        nwbfile = mock_NWBFile()
+        with warnings.catch_warnings():
+            # The channels are not voltages, which the reader already warns about on its own.
+            warnings.simplefilter("ignore", UserWarning)
+            add_recording_as_time_series_to_nwbfile(recording=recording, nwbfile=nwbfile)
+
+        time_series = nwbfile.acquisition["TimeSeries"]
+        assert time_series.unit == "%"
+        assert time_series.conversion == pytest.approx(100.0 / 65536)
 
     def test_channel_properties_reach_the_electrodes_table(self, tmp_path, digital_data):
         """
