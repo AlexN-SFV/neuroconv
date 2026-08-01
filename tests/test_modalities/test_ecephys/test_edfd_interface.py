@@ -716,6 +716,34 @@ class TestEDFDReader:
         # Off — the default, and what a conformant file gets — it is one TAL either way.
         assert _parse_tals(b"+5.0\x14label\x14-3\x14more text\x14") == [(5.0, None, ["label", "-3", "more text"])]
 
+    def test_a_doubled_sign_on_a_negative_onset_is_read(self):
+        """
+        BESA writes EDF+'s mandatory sign in front of an already-signed value, so a negative onset
+        reads ``+-0.001000``.
+
+        Only a record with a negative onset shows it, which in practice means the first one — and a
+        single unreadable record start refuses the whole file, so a 361 MB recording turned on this.
+        A leading ``-`` before a further sign has no such unambiguous reading and is left alone.
+        """
+        assert _parse_tals(b"+-0.001000\x14\x14") == [(-0.001, None, [])]
+        assert _parse_tals(b"++5.000000\x14\x14") == [(5.0, None, [])]
+        assert _parse_tals(b"-+5.000000\x14\x14") == []
+        # The same leniency applies where onsets are used to find TAL boundaries.
+        assert _parse_tals(b"+0.000000\x14\x14+-0.001000\x14pre-trigger\x14", split_unterminated=True) == [
+            (0.0, None, []),
+            (-0.001, None, ["pre-trigger"]),
+        ]
+
+    def test_negative_first_onset_places_the_recording_before_the_header_time(self, tmp_path, digital_data):
+        """A doubled sign must survive the whole read, not just the parser."""
+        onsets = [-0.001 + index * RECORD_DURATION for index in range(12)]
+        path = write_edf(tmp_path / "besa.edf", record_onsets=onsets, data=digital_data)
+        assert b"+-0.001000" in Path(path).read_bytes(), "fixture does not reproduce the doubled sign"
+
+        recording = EDFDRecordingExtractor(file_path=path)
+        assert recording.runs == [(0, 12, -0.001)]
+        assert recording.get_start_time(segment_index=0) == pytest.approx(-0.001)
+
     @pytest.mark.parametrize(
         "block, terminates",
         [

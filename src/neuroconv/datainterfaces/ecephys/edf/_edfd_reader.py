@@ -338,6 +338,20 @@ def is_discontinuous_edf(file_path: FilePath) -> bool:
         return _decode_field(file.read(44)).upper().startswith("EDF+D")
 
 
+def _onset_text(field: bytes) -> str:
+    """
+    Decode a timestamp field's onset, dropping a redundant leading ``+`` before the value's own sign.
+
+    EDF+ makes the sign mandatory, and BESA's export writes it in front of an already-signed value, so
+    a negative onset reads ``+-0.001000``. There is only one sensible reading of that, and the field is
+    a data record's start time — refusing it costs the whole file, as it did for a 361 MB recording
+    whose very first record was the only one with a negative onset. A leading ``-`` before a further
+    sign is left alone, having no such unambiguous reading.
+    """
+    text = field.partition(_TAL_ONSET_DURATION_SEPARATOR)[0].decode("ascii", errors="replace")
+    return text[1:] if text[:1] == "+" and text[1:2] in ("+", "-") else text
+
+
 def _is_onset_field(field: bytes) -> bool:
     """
     True if ``field`` is an EDF+ onset — a decimal number carrying a mandatory explicit sign.
@@ -348,7 +362,7 @@ def _is_onset_field(field: bytes) -> bool:
     if field[:1] not in (b"+", b"-"):
         return False
     try:
-        float(field.partition(_TAL_ONSET_DURATION_SEPARATOR)[0].decode("ascii", errors="replace"))
+        float(_onset_text(field))
     except ValueError:
         return False
     return True
@@ -427,9 +441,9 @@ def _parse_tals(raw: bytes, *, split_unterminated: bool = False) -> list[tuple[f
         if not chunk.strip():
             continue
         for fields in _split_into_tals(chunk) if split_unterminated else [chunk.split(_TAL_TEXT_SEPARATOR)]:
-            onset_field, _, duration_field = fields[0].partition(_TAL_ONSET_DURATION_SEPARATOR)
+            _, _, duration_field = fields[0].partition(_TAL_ONSET_DURATION_SEPARATOR)
             try:
-                onset = float(onset_field.decode("ascii", errors="replace"))
+                onset = float(_onset_text(fields[0]))
             except ValueError:
                 continue
             duration = None
