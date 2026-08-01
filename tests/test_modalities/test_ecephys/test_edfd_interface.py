@@ -5,6 +5,7 @@ These build small synthetic EDF files byte by byte — including the ``EDF Annot
 per-record time-keeping TALs — so they run without external data, network access, or ``pyedflib``.
 """
 
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -566,7 +567,10 @@ class TestEDFDReader:
             annotations=annotations,
             terminate_tals=False,
         )
-        assert b"\x14\x14\x00" not in Path(path).read_bytes()[36352:], "fixture still terminates its TALs"
+        # Positive check on the shape under test: the time-keeping TAL runs straight into the
+        # following annotation with no NUL between them. A negative check cannot work here, because
+        # the block's own tail padding puts a NUL after the last byte-20 either way.
+        assert b"\x14\x14+2.500000\x14" in Path(path).read_bytes(), "fixture still terminates its TALs"
 
         recording = EDFDRecordingExtractor(file_path=path)
         assert recording.runs == EXPECTED_RUNS
@@ -615,14 +619,34 @@ class TestEDFDReader:
         """The spec lets a single TAL carry several texts; splitting must not break that shape."""
         assert _parse_tals(b"+180\x14Lights off\x14Close door\x14\x00") == [(180.0, None, ["Lights off", "Close door"])]
 
-    def test_junk_after_the_time_keeping_tal_does_not_cost_the_onset(self):
+    def test_conformant_tal_with_an_empty_leading_text_keeps_its_annotation(self):
         """
-        The record's position is worth more than an unreadable annotation.
+        ``+onset[20][20]text[20]`` is genuinely ambiguous: a conformant TAL whose first annotation text
+        happens to be empty, or an unterminated block whose second TAL lost its onset.
 
-        Splitting at the time-keeping annotation's empty text means unparsable trailing bytes lose only
-        themselves, where previously they took the whole file down with them.
+        Reading it as the latter costs the annotation outright — the fragment has no parsable onset and
+        is discarded — so it is read as one TAL and the text survives. That leaves the record's leading
+        TAL texted, which is what makes its onset unrecoverable, and refusing beats losing data.
         """
-        assert _parse_tals(b"+3.000000\x14\x14not-a-tal\x14") == [(3.0, None, [])]
+        assert _parse_tals(b"+5.0\x14\x14real annotation\x14") == [(5.0, None, ["real annotation"])]
+        assert _parse_tals(b"+3.000000\x14\x14not-a-tal\x14") == [(3.0, None, ["not-a-tal"])]
+
+    def test_a_trailing_signed_number_stays_an_annotation_text(self):
+        """
+        The sign requirement alone does not save ``-3`` or ``+2.5``, which are plausible annotation
+        texts; promoting one to an onset would silently drop it.
+
+        A TAL being opened must therefore have a non-empty field still to come, which a trailing text
+        does not. This shape occurs in conformant files too, so getting it wrong is not confined to
+        the writers this splitting exists for.
+        """
+        assert _parse_tals(b"+5.0\x14label\x14-3\x14") == [(5.0, None, ["label", "-3"])]
+        assert _parse_tals(b"+5.0\x14label\x14+2.5\x14") == [(5.0, None, ["label", "+2.5"])]
+        # ...while a signed onset that does introduce a further text still opens a TAL.
+        assert _parse_tals(b"+5.0\x14label\x14+2.5\x14later\x14") == [
+            (5.0, None, ["label"]),
+            (2.5, None, ["later"]),
+        ]
 
     def test_onset_between_readable_neighbours_is_recovered_with_a_warning(self, tmp_path, digital_data):
         """
@@ -649,6 +673,41 @@ class TestEDFDReader:
         Path(path).write_bytes(raw.replace(b"+9.000000", b"+9,000000", 1))
         with pytest.raises(ValueError, match=r"block of record 4 reads b'\+9,000000"):
             EDFDRecordingExtractor(file_path=path)
+
+    def test_a_wide_annotations_block_is_truncated_in_the_error(self, tmp_path, digital_data):
+        """An annotations signal can be arbitrarily wide; an exception must not carry kilobytes of it."""
+        annotations = [(index / 10, None, f"annotation number {index} with some length to it") for index in range(8)]
+        path = write_edf(
+            tmp_path / "wide.edf",
+            record_onsets=GAPPED_ONSETS,
+            data=digital_data,
+            annotations=annotations,
+            annotation_samples=256,
+        )
+        raw = Path(path).read_bytes()
+        Path(path).write_bytes(raw.replace(b"+0.000000\x14\x14", b"+0,000000\x14\x14", 1))
+        with pytest.raises(ValueError) as error:
+            EDFDRecordingExtractor(file_path=path)
+        assert "truncated," in str(error.value)
+        # The quoted bytes stay bounded even though the block itself is far longer.
+        assert len(str(error.value)) < 1200
+
+    def test_no_recovery_warning_when_the_file_is_refused_anyway(self, tmp_path, digital_data):
+        """
+        Reporting that "start times follow from their neighbours" alongside a refusal reads as though
+        the timeline survived, when the conversion is about to fail.
+        """
+        path = write_edf(tmp_path / "d.edf", record_onsets=GAPPED_ONSETS, data=digital_data)
+        raw = Path(path).read_bytes()
+        # Record 2 is recoverable from its neighbours; record 4 sits on a gap boundary and is not.
+        raw = raw.replace(b"+2.000000", b"+2,000000", 1).replace(b"+9.000000", b"+9,000000", 1)
+        Path(path).write_bytes(raw)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="cannot be recovered"):
+                EDFDRecordingExtractor(file_path=path)
+        assert [w for w in caught if "follow from their neighbours" in str(w.message)] == []
 
     def test_truncated_final_record_is_dropped_not_read(self, tmp_path, digital_data):
         """An interrupted acquisition must not defer an opaque reshape error to read time."""

@@ -47,6 +47,9 @@ _TAL_ONSET_DURATION_SEPARATOR = b"\x15"  # byte 21, between onset and duration
 _TAL_TEXT_SEPARATOR = b"\x14"  # byte 20, after the timestamp and between annotation texts
 _TAL_TERMINATOR = b"\x00"  # byte 0, ends a TAL
 
+# Cap on how much of an annotations block is quoted back in an error message.
+_MAX_DIAGNOSTIC_BYTES = 200
+
 # Fixed sizes, in bytes, of the static part of the EDF header and of each per-signal field.
 _STATIC_HEADER_SIZE = 256
 _SAMPLE_SIZE = 2  # EDF stores 2-byte little-endian two's-complement integers
@@ -361,21 +364,26 @@ def _split_into_tals(chunk: bytes) -> list[list[bytes]]:
     bytes; Nihon Kohden's ``EDF+D`` export does this. Splitting those apart here is what keeps the
     time-keeping onset — and therefore the whole file — readable.
 
-    Two structural facts make the split unambiguous for the shapes seen in practice. The time-keeping
-    annotation carries exactly one annotation text and that text is empty, so any field following
-    that empty one begins a new TAL. And an EDF+ onset always carries an explicit sign, so a signed
-    number appearing where an annotation text is expected begins one too.
+    A boundary is only recognized where a field cannot be an annotation text of the TAL in progress:
+
+    * it parses as an EDF+ onset, which always carries an explicit sign — so an event label such as
+      ``601`` is never mistaken for one;
+    * the TAL in progress already has a text, so this field cannot be its own onset;
+    * and a non-empty field follows, so the TAL being opened would actually have an annotation text.
+
+    That last condition is what keeps a *trailing* signed number — ``-3`` or ``+2.5``, both plausible
+    annotation texts — from being read as an onset and lost. The cost of being wrong here is silent:
+    a field promoted to an onset in error stops being an annotation, so the rules stay deliberately
+    narrow and anything they do not clearly resolve is left as text.
     """
     fields = chunk.split(_TAL_TEXT_SEPARATOR)
     tals = []
     current = [fields[0]]
-    for field in fields[1:]:
-        # `len(current) > 1` means the TAL already has its timestamp and at least one text, so a
-        # signed number here cannot be this TAL's onset and must start the next one.
-        starts_new_tal = len(current) > 1 and _is_onset_field(field)
-        # The time-keeping annotation is `onset[20][20]` and owns nothing beyond that empty text.
-        completes_time_keeping = len(current) == 2 and not current[1] and field
-        if starts_new_tal or completes_time_keeping:
+    for index, field in enumerate(fields[1:], start=1):
+        starts_new_tal = (
+            len(current) > 1 and _is_onset_field(field) and any(following for following in fields[index + 1 :])
+        )
+        if starts_new_tal:
             tals.append(current)
             current = [field]
         else:
@@ -542,13 +550,16 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
             number_of_records=header.number_of_records,
         )
         recovered = len(records_missing_onset) - len(unplaced)
-        if recovered:
+        # Nothing to say about a timeline that is about to be refused, so this is reported only when
+        # every unreadable onset was in fact recovered.
+        if recovered and not unplaced:
             warnings.warn(
                 f"{recovered} of {header.number_of_records} data records in this discontinuous EDF+ "
                 "(EDF+D) file carry no readable time-keeping annotation, so the file does not conform "
                 "to EDF+. The records on either side of each of them span exactly the intervening "
-                "number of records, which rules out a gap there, so their start times follow from "
-                "their neighbours and the recording timeline is unaffected.",
+                "number of records, which rules out any gap longer than half a data record, so their "
+                "start times follow from their neighbours. Any real discontinuity is still detected, "
+                "because it shows up in the neighbouring onsets, which are read directly.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -557,6 +568,11 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
             byte_offset, block_size = layouts[time_keeping_index]
             file.seek(header.header_size_bytes + unplaced[0] * header.record_size_bytes + byte_offset)
             sample = file.read(block_size).rstrip(_TAL_TERMINATOR)
+            # An annotations signal can be arbitrarily wide; an exception message should not carry
+            # kilobytes of it just to show what went wrong.
+            shown_sample = repr(sample[:_MAX_DIAGNOSTIC_BYTES])
+            if len(sample) > _MAX_DIAGNOSTIC_BYTES:
+                shown_sample += f" (truncated, {len(sample)} bytes in total)"
             raise ValueError(
                 f"{len(unplaced)} of {header.number_of_records} data records in this discontinuous "
                 f"EDF+ (EDF+D) file carry no readable time-keeping annotation, and their neighbours do "
@@ -565,7 +581,7 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
                 "the records are contiguous would silently misplace every sample after the first gap, "
                 "which is the one thing EDF+D exists to rule out.\n"
                 f"For reference, the 'EDF Annotations' block of record {unplaced[0]} reads "
-                f"{sample!r}. A conformant block opens with a signed onset, then byte 20, then an "
+                f"{shown_sample}. A conformant block opens with a signed onset, then byte 20, then an "
                 "empty annotation text, then byte 20 — for example b'+1.234\\x14\\x14'. Departures "
                 "seen in practice are a comma as the decimal separator, a missing sign, and a real "
                 "annotation placed ahead of the time-keeping one."
