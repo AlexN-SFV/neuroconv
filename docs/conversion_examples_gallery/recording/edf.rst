@@ -223,8 +223,9 @@ Check it against your sidecar before converting:
     recording.set_channel_gains(gains)
 
 For carrying the rest of a BIDS sidecar — channel type, status, anatomical location, coordinates — into
-the NWB electrodes table, see :doc:`/user_guide/electrode_metadata`. That route is not EDF-specific:
-any channel property set on the recording becomes an electrodes column.
+the NWB electrodes table, see
+:doc:`channel metadata and the electrodes table </user_guide/electrode_metadata>`. That route is not
+EDF-specific: any channel property set on the recording becomes an electrodes column.
 
 Converting Auxiliary EDF Channels as TimeSeries
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
