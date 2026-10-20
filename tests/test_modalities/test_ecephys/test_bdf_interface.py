@@ -31,7 +31,10 @@ def bdf_path(tmp_path):
     number_of_samples = int(SAMPLING_FREQUENCY * DURATION_SECONDS)
     rng = np.random.default_rng(seed=0)
     # Physical values in microvolts, kept within the physical range.
-    signals = [(rng.standard_normal(number_of_samples) * 100.0).clip(PHYSICAL_MIN, PHYSICAL_MAX) for _ in range(number_of_channels)]
+    signals = [
+        (rng.standard_normal(number_of_samples) * 100.0).clip(PHYSICAL_MIN, PHYSICAL_MAX)
+        for _ in range(number_of_channels)
+    ]
 
     writer = pyedflib.EdfWriter(str(path), number_of_channels, file_type=pyedflib.FILETYPE_BDFPLUS)
     writer.setSignalHeaders(
@@ -56,6 +59,31 @@ def bdf_path(tmp_path):
     writer.writeSamples([signal.astype(np.float64) for signal in signals])
     writer.close()
     return path, signals
+
+
+def _write_bdf_with_dimension(path, dimension):
+    """Write a one-channel BDF whose physical range of ±1000 is declared in ``dimension``."""
+    pyedflib = pytest.importorskip("pyedflib")
+    writer = pyedflib.EdfWriter(str(path), 1, file_type=pyedflib.FILETYPE_BDFPLUS)
+    writer.setSignalHeaders(
+        [
+            dict(
+                label="Fz",
+                dimension=dimension,
+                sample_frequency=SAMPLING_FREQUENCY,
+                physical_min=PHYSICAL_MIN,
+                physical_max=PHYSICAL_MAX,
+                digital_min=BDF_DIGITAL_MIN,
+                digital_max=BDF_DIGITAL_MAX,
+                transducer="",
+                prefilter="",
+            )
+        ]
+    )
+    writer.setStartdatetime(datetime(2023, 5, 1, 9, 30, 0))
+    writer.writeSamples([np.zeros(int(SAMPLING_FREQUENCY * DURATION_SECONDS))])
+    writer.close()
+    return path
 
 
 class TestBDFRecordingInterface:
@@ -108,3 +136,17 @@ class TestBDFRecordingInterface:
     def test_get_available_channel_ids(self, bdf_path):
         path, _ = bdf_path
         assert BDFRecordingInterface.get_available_channel_ids(path) == CHANNEL_LABELS
+
+    # EDF and BDF headers are ASCII, so the micro sign cannot appear in one; its readings are tested on the
+    # shared map through the BrainVision tests.
+    @pytest.mark.parametrize(
+        "dimension, to_microvolts",
+        [("uV", 1.0), ("nV", 1e-3), ("mV", 1e3), ("mvolt", 1e3), ("V", 1e6), ("degC", 1.0)],
+    )
+    def test_physical_dimension_scales_the_gain_to_microvolts(self, tmp_path, dimension, to_microvolts):
+        path = _write_bdf_with_dimension(tmp_path / "recording.bdf", dimension)
+        gain = BDFRecordingInterface(file_path=path).recording_extractor.get_channel_gains()[0]
+
+        # The gain in the declared unit is the physical range over the digital range.
+        gain_in_dimension = (PHYSICAL_MAX - PHYSICAL_MIN) / (BDF_DIGITAL_MAX - BDF_DIGITAL_MIN)
+        assert gain == pytest.approx(gain_in_dimension * to_microvolts)

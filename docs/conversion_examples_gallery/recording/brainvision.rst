@@ -17,25 +17,25 @@ conversion commonly leaves them, they are found by the header's own base name in
 
 .. code-block:: python
 
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    from neuroconv.datainterfaces import BrainVisionRecordingInterface
-
-    file_path = f"{ECEPHY_DATA_PATH}/brainvision/File_brainvision_1.vhdr"
-    interface = BrainVisionRecordingInterface(file_path=file_path)
-
-    # Extract what metadata we can from the source files
-    metadata = interface.get_metadata()
-    # The recording time comes from the marker file's "New Segment" marker, when it carries a date.
-    # Anonymised recordings often do not, so set it if it is missing.
-    if "session_start_time" not in metadata["NWBFile"]:
-        metadata["NWBFile"].update(session_start_time=datetime(2020, 1, 1, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo")))
-    # Add subject information (required for DANDI upload)
-    metadata["Subject"] = dict(subject_id="subject1", species="Homo sapiens", sex="M", age="P30Y")
-
-    # Choose a path for saving the nwb file and run the conversion
-    nwbfile_path = f"{path_to_save_nwbfile}"
-    interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
+    >>> from datetime import datetime
+    >>> from zoneinfo import ZoneInfo
+    >>> from neuroconv.datainterfaces import BrainVisionRecordingInterface
+    >>>
+    >>> file_path = f"{ECEPHY_DATA_PATH}/brainvision/File_brainvision_4_float32.vhdr"
+    >>> interface = BrainVisionRecordingInterface(file_path=file_path)
+    >>>
+    >>> # Extract what metadata we can from the source files
+    >>> metadata = interface.get_metadata()
+    >>> # The recording time comes from the marker file's "New Segment" marker, when it carries a date.
+    >>> # Anonymised recordings often do not, and this one has no markers at all, so set it if it is missing.
+    >>> if "session_start_time" not in metadata["NWBFile"]:
+    ...     metadata["NWBFile"].update(session_start_time=datetime(2020, 1, 1, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo")))
+    >>> # Add subject information (required for DANDI upload)
+    >>> metadata["Subject"] = dict(subject_id="subject1", species="Homo sapiens", sex="M", age="P30Y")
+    >>>
+    >>> # Choose a path for saving the nwb file and run the conversion
+    >>> nwbfile_path = f"{path_to_save_nwbfile}"
+    >>> interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
 
 Each channel's resolution and unit from the header become its gain, so ``INT_16``, ``INT_32`` and
 ``IEEE_FLOAT_32`` data are all written with their physical scale. Channels that are not neural data,
@@ -43,10 +43,12 @@ such as a force sensor recorded alongside the EEG, can be left out by name:
 
 .. code-block:: python
 
-    # The names come from the header alone, without reading any samples
-    channel_ids = BrainVisionRecordingInterface.get_available_channel_ids(file_path)
-    # Here the last channel stands in for an auxiliary one
-    interface = BrainVisionRecordingInterface(file_path=file_path, channels_to_skip=channel_ids[-1:])
+    >>> # The names come from the header alone, without reading any samples
+    >>> channel_ids = BrainVisionRecordingInterface.get_available_channel_ids(file_path)
+    >>> # Here the last channel stands in for an auxiliary one
+    >>> interface = BrainVisionRecordingInterface(file_path=file_path, channels_to_skip=channel_ids[-1:])
+    >>> len(interface.recording_extractor.get_channel_ids()) == len(channel_ids) - 1
+    True
 
 Markers and segments
 ^^^^^^^^^^^^^^^^^^^^
@@ -68,5 +70,15 @@ sample. A later segment's date places that segment relative to the dated segment
 segment has no date, later dates have nothing to be measured from, so those pauses cannot be recovered and
 a warning says so.
 
-Only binary, continuous (unsegmented) time-domain data is supported. ASCII data and data segmented
-by BrainVision Analyzer are refused with an error.
+Epoched exports
+^^^^^^^^^^^^^^^
+
+BrainVision Analyzer can export epochs cut around events (``SegmentationType=MARKERBASED`` in the header).
+Such a file holds equal-length epochs back to back, each opened by a ``New Segment`` marker dated with the
+epoch's time in the original recording. Each epoch is written as its own ``ElectricalSeries`` at that
+time, as for a paused recording, and the ``"segments"`` table marks them with ``is_epoch``. Epochs cut from
+overlapping windows overlap in time, which separate series can do. A file whose markers do not open
+exactly ``SegmentDataPoints``-long epochs is refused rather than split at the wrong places.
+
+Only binary time-domain data is supported. ASCII data, averages over epochs (``Averaged=YES``) and other
+Analyzer segmentation types are refused with an error.

@@ -4,9 +4,8 @@ Each test writes a small BrainVision recording with :func:`write_brainvision`, s
 Where a test reproduces a real exporter's quirk, the header text follows that exporter's output verbatim.
 """
 
-import tempfile
+import warnings
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -174,6 +173,15 @@ class TestReadingSamples:
             recording = BrainVisionRecordingExtractor(write_brainvision(tmp_path, int16_data, channels=channels))
         np.testing.assert_allclose(recording.get_channel_gains(), [1.0, 1.0, 1.0])
 
+    def test_blank_resolution_on_floating_point_data_is_silent(self, tmp_path, int16_data):
+        """Analyzer leaves the resolution blank on every float export, whose samples are already in the unit."""
+        channels = ["C1,,,µV", "C2,,,µV", "C3,,,µV"]
+        path = write_brainvision(tmp_path, int16_data, binary_format="IEEE_FLOAT_32", channels=channels)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            recording = BrainVisionRecordingExtractor(path)
+        np.testing.assert_allclose(recording.get_channel_gains(), [1.0, 1.0, 1.0])
+
     def test_non_voltage_unit_warns(self, tmp_path, int16_data):
         channels = ["C1,,1,µV", "C2,,1,µV", "Temp,,0.1,C"]
         with pytest.warns(UserWarning, match="not a voltage"):
@@ -256,7 +264,8 @@ class TestHeaderText:
         "extra_common, error, match",
         [
             ("DataType=FREQUENCYDOMAIN\n", NotImplementedError, "TIMEDOMAIN"),
-            ("SegmentationType=MARKERBASED\n", NotImplementedError, "segmented"),
+            ("SegmentationType=FIXTIME\n", NotImplementedError, "SegmentationType=FIXTIME"),
+            ("Averaged=YES\n", NotImplementedError, "average over epochs"),
         ],
     )
     def test_unsupported_layouts_are_refused(self, tmp_path, int16_data, extra_common, error, match):
@@ -414,6 +423,94 @@ class TestSegments:
         with pytest.warns(UserWarning, match="earlier than the end"):
             recording = BrainVisionRecordingExtractor(path)
         assert recording.get_start_time(segment_index=1) == pytest.approx(0.1)
+
+
+class TestEpochedExports:
+    """BrainVision Analyzer's SegmentationType=MARKERBASED exports, laid out as GIN's File_brainvision_2 and _3."""
+
+    EPOCHED = "SegmentationType=MARKERBASED\nSegmentDataPoints=100\n"
+
+    def test_epochs_are_placed_at_their_dates(self, tmp_path, int16_data):
+        markers = [
+            "New Segment,,1,1,0,20111027115127145000",
+            "Time 0,,41,1,0",
+            "New Segment,,101,1,0,20111027115139115000",  # 11.97 s after the first epoch began
+            "New Segment,,201,1,0,20111027115149970000",
+        ]
+        path = write_brainvision(tmp_path, int16_data, markers=markers, extra_common=self.EPOCHED)
+        header = read_brainvision_header(path)
+
+        assert header.is_epoched
+        assert header.recording_start == datetime(2011, 10, 27, 11, 51, 27, 145000)
+        assert [segment.number_of_samples for segment in header.segments] == [100, 100, 100]
+        assert [segment.start_time for segment in header.segments] == pytest.approx([0.0, 11.97, 22.825])
+
+    def test_overlapping_epochs_keep_their_dates(self, tmp_path, int16_data):
+        """Epochs cut from overlapping windows overlap in time; each is its own series, so that is kept."""
+        markers = [
+            "New Segment,,1,1,0,20200101120000000000",
+            "New Segment,,101,1,0,20200101120000050000",  # 50 ms after the first, which lasts 100 ms
+            "New Segment,,201,1,0,20200101120000100000",
+        ]
+        path = write_brainvision(tmp_path, int16_data, markers=markers, extra_common=self.EPOCHED)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            header = read_brainvision_header(path)
+        assert [segment.start_time for segment in header.segments] == pytest.approx([0.0, 0.05, 0.1])
+
+    def test_epoch_dated_before_the_first_is_placed_after_the_previous(self, tmp_path, int16_data):
+        markers = [
+            "New Segment,,1,1,0,20200101120000000000",
+            "New Segment,,101,1,0,20200101115959000000",
+            "New Segment,,201,1,0,20200101120001000000",
+        ]
+        path = write_brainvision(tmp_path, int16_data, markers=markers, extra_common=self.EPOCHED)
+        with pytest.warns(UserWarning, match="earlier than the first epoch"):
+            header = read_brainvision_header(path)
+        assert [segment.start_time for segment in header.segments] == pytest.approx([0.0, 0.1, 1.0])
+
+    @pytest.mark.parametrize(
+        "markers, extra_common, match",
+        [
+            (["New Segment,,1,1,0", "New Segment,,151,1,0"], EPOCHED, "do not open exactly those epochs"),
+            (["New Segment,,1,1,0", "New Segment,,101,1,0"], EPOCHED, "do not open exactly those epochs"),
+            (["New Segment,,1,1,0"], "SegmentationType=MARKERBASED\nSegmentDataPoints=120\n", "whole number"),
+        ],
+    )
+    def test_markers_that_do_not_match_the_segmentation_are_refused(
+        self, tmp_path, int16_data, markers, extra_common, match
+    ):
+        path = write_brainvision(tmp_path, int16_data, markers=markers, extra_common=extra_common)
+        with pytest.raises(NotImplementedError, match=match):
+            read_brainvision_header(path)
+
+    def test_missing_segment_length_names_the_field(self, tmp_path, int16_data):
+        path = write_brainvision(
+            tmp_path, int16_data, markers=["New Segment,,1,1,0"], extra_common="SegmentationType=MARKERBASED\n"
+        )
+        with pytest.raises(ValueError, match="SegmentDataPoints"):
+            read_brainvision_header(path)
+
+    def test_epochs_are_written_as_series_and_listed(self, tmp_path, int16_data):
+        markers = [
+            "New Segment,,1,1,0,20200101120000000000",
+            "Time 0,,21,1,0",
+            "New Segment,,101,1,0,20200101120010000000",
+            "Time 0,,121,1,0",
+            "New Segment,,201,1,0,20200101120020000000",
+            "Time 0,,221,1,0",
+        ]
+        path = write_brainvision(tmp_path, int16_data, markers=markers, extra_common=self.EPOCHED)
+        interface = BrainVisionRecordingInterface(file_path=path)
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+
+        series = sorted(nwbfile.acquisition.values(), key=lambda series: series.starting_time)
+        assert [series.starting_time for series in series] == [0.0, 10.0, 20.0]
+        assert [series.data.maxshape[0] for series in series] == [100, 100, 100]
+        segments = nwbfile.intervals["segments"]
+        assert list(segments["is_epoch"][:]) == [True, True, True]
+        np.testing.assert_allclose(nwbfile.intervals["markers"]["start_time"][:], [0.02, 10.02, 20.02])
 
 
 class TestBrainVisionRecordingInterface:
@@ -599,47 +696,44 @@ class TestBrainVisionRecordingInterface:
         assert "ElectricalSeries" in nwbfile.processing["ecephys"]["LFP"].electrical_series
 
 
-# The mixins take their source files as class attributes, so these are written once, at import.
-_MIXIN_FOLDER = Path(tempfile.mkdtemp())
-_MIXIN_DATA = np.random.default_rng(seed=1).integers(-2000, 2000, size=(NUMBER_OF_SAMPLES, 4)).astype("int16")
+class _SyntheticRecordingForMixin:
+    """
+    Writes the recording a mixin-based class converts, once per class, into pytest's managed temp directory.
+
+    The mixins read their source from ``interface_kwargs`` on the class, so the fixture sets it there.
+    """
+
+    markers: list[str]
+
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def _write_recording(cls, tmp_path_factory):
+        folder = tmp_path_factory.mktemp(cls.__name__)
+        data = np.random.default_rng(seed=1).integers(-2000, 2000, size=(NUMBER_OF_SAMPLES, 4)).astype("int16")
+        channels = [f"C{index + 1},,0.5,µV" for index in range(data.shape[1])]
+        path = write_brainvision(folder, data, channels=channels, markers=cls.markers)
+        cls.interface_kwargs = dict(file_path=str(path))
+        cls.save_directory = folder
 
 
-def _write_mixin_recording(stem, markers):
-    folder = _MIXIN_FOLDER / stem
-    folder.mkdir()
-    channels = [f"C{index + 1},,0.5,µV" for index in range(_MIXIN_DATA.shape[1])]
-    return write_brainvision(folder, _MIXIN_DATA, stem=stem, channels=channels, markers=markers)
-
-
-class TestBrainVisionRecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):
+class TestBrainVisionRecordingInterfaceContract(_SyntheticRecordingForMixin, RecordingExtractorInterfaceTestMixin):
     data_interface_cls = BrainVisionRecordingInterface
-    interface_kwargs = dict(
-        file_path=str(
-            _write_mixin_recording("continuous", ["New Segment,,1,1,0,20210602161337000000", "Stimulus,S  1,11,1,0"])
-        )
-    )
-    save_directory = _MIXIN_FOLDER
+    markers = ["New Segment,,1,1,0,20210602161337000000", "Stimulus,S  1,11,1,0"]
 
     def check_extracted_metadata(self, metadata: dict):
         assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 6, 2, 16, 13, 37)
         assert "brainvision_recording" in metadata["Ecephys"]["ElectricalSeries"]
 
 
-class TestPausedBrainVisionRecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):
+class TestPausedBrainVisionRecordingInterfaceContract(
+    _SyntheticRecordingForMixin, RecordingExtractorInterfaceTestMixin
+):
     data_interface_cls = BrainVisionRecordingInterface
-    interface_kwargs = dict(
-        file_path=str(
-            _write_mixin_recording(
-                "paused",
-                [
-                    "New Segment,,1,1,0,20210101120000000000",
-                    "Stimulus,S  1,151,1,0",
-                    "New Segment,,101,1,0,20210101120100000000",
-                ],
-            )
-        )
-    )
-    save_directory = _MIXIN_FOLDER
+    markers = [
+        "New Segment,,1,1,0,20210101120000000000",
+        "Stimulus,S  1,151,1,0",
+        "New Segment,,101,1,0,20210101120100000000",
+    ]
 
     def check_extracted_metadata(self, metadata: dict):
         assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 1, 1, 12, 0, 0)

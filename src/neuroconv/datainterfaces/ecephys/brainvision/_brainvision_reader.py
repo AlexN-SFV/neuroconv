@@ -78,6 +78,7 @@ class BrainVisionHeader:
     gains_to_microvolts: np.ndarray
     markers: list[BrainVisionMarker] = field(default_factory=list)
     segments: list[BrainVisionSegment] = field(default_factory=list)
+    is_epoched: bool = False
 
     @property
     def number_of_channels(self) -> int:
@@ -193,7 +194,9 @@ def _parse_number(value: str, kind: type, header_path: Path, field: str):
         ) from None
 
 
-def _parse_channels(channel_infos: dict[str, str], number_of_channels: int, header_path: Path):
+def _parse_channels(
+    channel_infos: dict[str, str], number_of_channels: int, header_path: Path, samples_are_floating_point: bool
+):
     names, references, resolutions, units = [], [], [], []
     blank_resolutions, zero_resolutions = [], []
     for index in range(1, number_of_channels + 1):
@@ -217,7 +220,10 @@ def _parse_channels(channel_infos: dict[str, str], number_of_channels: int, head
             zero_resolutions.append(f"Ch{index}={entry}")
         units.append(_parse_unit(unit))
 
-    if blank_resolutions:
+    # Analyzer leaves the resolution blank on every floating-point export, whose samples are already in the
+    # declared unit; its INT_16 export of the same data (GIN's File_brainvision_3) confirms it. Blank on
+    # integer samples is the unusual case.
+    if blank_resolutions and not samples_are_floating_point:
         warnings.warn(
             f"The BrainVision header '{header_path.name}' gives no resolution for {len(blank_resolutions)} "
             f"channel(s) ({', '.join(repr(name) for name in blank_resolutions[:5])}); their samples are taken "
@@ -353,7 +359,11 @@ def _read_markers(marker_path: Path) -> list[BrainVisionMarker]:
 
 
 def _build_segments(
-    markers: list[BrainVisionMarker], number_of_samples: int, sampling_frequency: float, marker_path: Path | None
+    markers: list[BrainVisionMarker],
+    number_of_samples: int,
+    sampling_frequency: float,
+    marker_path: Path | None,
+    is_epoched: bool = False,
 ) -> list[BrainVisionSegment]:
     """
     Split the samples at ``New Segment`` markers and place each run at its real time.
@@ -363,6 +373,11 @@ def _build_segments(
     placed at its date relative to the latest dated segment before it, and any other segment directly
     after the previous one. A date with no dated segment before it to measure from cannot be placed, so
     the pause before it is lost; that is warned about.
+
+    In an epoched export (``is_epoched``) each segment is an epoch cut from the original recording, and
+    epochs cut from overlapping windows legitimately overlap in time. Each is written as its own series,
+    so a dated epoch is placed at its date even when that is before the previous epoch ends; only a date
+    before the first epoch is refused.
     """
     boundaries = {0: None}
     for marker in markers:
@@ -387,13 +402,15 @@ def _build_segments(
                 unanchored.append(first_sample)
             elif date is not None:
                 dated = anchor.start_time + (date - anchor.date).total_seconds()
-                # A clock that steps backwards would make segments overlap on the timeline, which no
-                # consumer can index; such a segment is kept in file order instead.
-                if dated < contiguous - 0.5 / sampling_frequency:
+                # In a recording, a clock that steps backwards would make segments overlap on the timeline,
+                # which no consumer can index; such a segment is kept in file order instead. Epochs may
+                # overlap, but not start before the session does.
+                earliest = segments[0].start_time if is_epoched else contiguous - 0.5 / sampling_frequency
+                if dated < earliest:
+                    limit = "the first epoch" if is_epoched else "the end of the segment before it"
                     warnings.warn(
                         f"In '{marker_path.name}', the New Segment at sample {first_sample + 1} is dated {date}, "
-                        "earlier than the end of the segment before it. It is placed directly after that "
-                        "segment instead.",
+                        f"earlier than {limit}. It is placed directly after the segment before it instead.",
                         UserWarning,
                         stacklevel=3,
                     )
@@ -403,7 +420,10 @@ def _build_segments(
             first_sample=first_sample, number_of_samples=end - first_sample, start_time=start_time, date=date
         )
         segments.append(segment)
-        if date is not None:
+        # Epochs are dated on one clock, the original recording's, so all are measured from the first dated
+        # one, and an epoch whose date was refused does not move the rest. A recording's clock can be reset
+        # between pauses, so there each dated segment becomes the reference for the next.
+        if date is not None and (anchor is None or not is_epoched):
             anchor = segment
 
     if unanchored:
@@ -417,6 +437,30 @@ def _build_segments(
             stacklevel=3,
         )
     return segments
+
+
+def _check_epochs(common: dict[str, str], markers: list[BrainVisionMarker], number_of_samples: int, header_path: Path):
+    """
+    Check that an epoched (``SegmentationType=MARKERBASED``) export is laid out as the segment model reads it.
+
+    BrainVision Analyzer writes such an export as a flat binary of equal-length epochs, back to back, each
+    opened by a dated ``New Segment`` marker; that is the structure :func:`_build_segments` reads. A file
+    whose markers do not partition the samples that way is refused rather than split at the wrong places.
+    """
+    epoch_length = _parse_number(common.get("segmentdatapoints", ""), int, header_path, "SegmentDataPoints")
+    if epoch_length < 1 or number_of_samples % epoch_length:
+        raise NotImplementedError(
+            f"'{header_path.name}' is an epoched export of {number_of_samples} samples, which is not a whole number "
+            f"of epochs of SegmentDataPoints={epoch_length}."
+        )
+    expected = set(range(0, number_of_samples, epoch_length))
+    found = {marker.sample_index for marker in markers if marker.is_new_segment}
+    if found != expected:
+        raise NotImplementedError(
+            f"'{header_path.name}' is an epoched export of {len(expected)} epochs of {epoch_length} samples, but "
+            f"its New Segment markers do not open exactly those epochs ({len(found)} markers, "
+            f"{len(found - expected)} not at an epoch start, {len(expected - found)} epochs without one)."
+        )
 
 
 def read_brainvision_header(file_path) -> BrainVisionHeader:
@@ -454,10 +498,15 @@ def read_brainvision_header(file_path) -> BrainVisionHeader:
     if data_type != "TIMEDOMAIN":
         raise NotImplementedError(f"'{header_path.name}' holds {data_type} data; only TIMEDOMAIN is supported.")
     segmentation = common.get("segmentationtype", "NOTSEGMENTED").upper()
-    if segmentation != "NOTSEGMENTED":
+    if segmentation not in ("NOTSEGMENTED", "MARKERBASED"):
         raise NotImplementedError(
-            f"'{header_path.name}' holds data segmented by BrainVision Analyzer (SegmentationType={segmentation}); "
-            "only continuous recordings are supported."
+            f"'{header_path.name}' holds data segmented by BrainVision Analyzer with SegmentationType={segmentation}; "
+            "only continuous recordings and MARKERBASED epochs are supported."
+        )
+    if common.get("averaged", "NO").upper() == "YES":
+        raise NotImplementedError(
+            f"'{header_path.name}' holds an average over epochs (Averaged=YES), which has no time in the "
+            "recording; only continuous recordings and individual epochs are supported."
         )
 
     orientation = common.get("dataorientation", "MULTIPLEXED").upper()
@@ -518,7 +567,10 @@ def read_brainvision_header(file_path) -> BrainVisionHeader:
             )
 
     names, references, resolutions, units = _parse_channels(
-        sections.get("channel infos", {}), number_of_channels=number_of_channels, header_path=header_path
+        sections.get("channel infos", {}),
+        number_of_channels=number_of_channels,
+        header_path=header_path,
+        samples_are_floating_point=np.dtype(dtype).kind == "f",
     )
     gains = _gains_to_microvolts(resolutions=resolutions, units=units, names=names)
 
@@ -531,11 +583,15 @@ def read_brainvision_header(file_path) -> BrainVisionHeader:
             stacklevel=2,
         )
     markers = _read_markers(marker_path) if marker_path is not None else []
+    is_epoched = segmentation == "MARKERBASED"
+    if is_epoched:
+        _check_epochs(common=common, markers=markers, number_of_samples=number_of_samples, header_path=header_path)
     segments = _build_segments(
         markers=markers,
         number_of_samples=number_of_samples,
         sampling_frequency=sampling_frequency,
         marker_path=marker_path,
+        is_epoched=is_epoched,
     )
 
     return BrainVisionHeader(
@@ -553,6 +609,7 @@ def read_brainvision_header(file_path) -> BrainVisionHeader:
         gains_to_microvolts=gains,
         markers=markers,
         segments=segments,
+        is_epoched=is_epoched,
     )
 
 

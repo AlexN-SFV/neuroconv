@@ -16,7 +16,8 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
     whose resolution is not 1, cannot decode headers written in Latin-1, and places every marker one
     sample late. Samples are read lazily from the memory-mapped ``.eeg`` file.
 
-    A recording that was paused and resumed carries one ``New Segment`` marker per resumption. Each run
+    A recording that was paused and resumed carries one ``New Segment`` marker per resumption, and an
+    epoched export from BrainVision Analyzer (``SegmentationType=MARKERBASED``) one per epoch. Each run
     of samples between them is written as its own ``ElectricalSeries``, sharing one electrodes table, as
     discontinuous EDF+ is. A run is placed at the time its marker's date gives when an earlier dated run
     gives that date something to be measured from, and directly after the run before it otherwise. Markers are written to a ``TimeIntervals``
@@ -305,10 +306,15 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
             nwbfile=nwbfile,
             name="segments",
             description=(
-                "Uninterrupted runs of samples in BrainVision recordings, delimited by their 'New Segment' "
-                "markers. Each run is written as its own ElectricalSeries, positioned at the run's start time."
+                "Runs of samples in BrainVision recordings, each opened by a 'New Segment' marker: a resumption "
+                "after a pause in a continuous recording, or one epoch of an epoched (SegmentationType=MARKERBASED) "
+                "BrainVision Analyzer export. Each run is written as its own ElectricalSeries, positioned at the "
+                "run's start time; epochs cut from overlapping windows overlap in time."
             ),
-            columns={"segment_index": "0-based index of the run of samples within its recording."},
+            columns={
+                "segment_index": "0-based index of the run of samples within its recording.",
+                "is_epoch": "True for an epoch of an epoched export, False for a run of a continuous recording.",
+            },
         )
         if table is None:
             return
@@ -320,5 +326,6 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
                 start_time=start_time,
                 stop_time=start_time + segment.number_of_samples / header.sampling_frequency,
                 segment_index=segment_index,
+                is_epoch=header.is_epoched,
                 source_file=header.header_path.name,
             )
