@@ -132,7 +132,8 @@ others. The series are named with the run index appended — ``ElectricalSeries0
 and so on. Two ``TimeIntervals`` tables are written alongside them, both on the same timeline: ``runs``
 gives each run's boundaries with a ``run_index`` column, and ``annotations`` holds the annotations
 carried in the ``EDF Annotations`` signals. Both follow the recording if it is moved with
-``set_aligned_starting_time``.
+``set_aligned_starting_time``. Each row also has a ``source_file`` column naming the EDF file it came
+from, so several ``EDF+D`` files written into one NWB file through a ``ConverterPipe`` share the two tables.
 
 .. note::
 
