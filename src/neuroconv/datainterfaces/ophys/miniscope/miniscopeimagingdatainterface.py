@@ -1,4 +1,3 @@
-import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Literal
@@ -7,8 +6,12 @@ import numpy as np
 from pydantic import DirectoryPath, validate_call
 from pynwb import NWBFile
 
+from ._miniscope_readers import (
+    _config_to_miniscope_device_metadata,
+    _config_to_miniscope_device_model_metadata,
+)
 from ..baseimagingextractorinterface import BaseImagingExtractorInterface
-from ....utils import DeepDict, dict_deep_update
+from ....utils import DeepDict, dict_deep_update, to_snake_case
 
 
 class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
@@ -44,9 +47,7 @@ class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
         return MiniscopeMultiRecordingImagingExtractor
 
     @validate_call
-    def __init__(
-        self, folder_path: DirectoryPath, *args, verbose: bool = False
-    ):  # TODO: change to * (keyword only) on or after August 2026
+    def __init__(self, folder_path: DirectoryPath, *, verbose: bool = False):
         """
         Initialize reading the Miniscope imaging data.
 
@@ -58,30 +59,6 @@ class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
         verbose : bool, optional
             If True, enables verbose mode for detailed logging, by default False.
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "verbose",
-            ]
-            num_positional_args_before_args = 1  # folder_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to _MiniscopeMultiRecordingInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            verbose = positional_values.get("verbose", verbose)
 
         from ndx_miniscope.utils import get_recording_start_times, read_miniscope_config
 
@@ -106,7 +83,7 @@ class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
         """
         from ....tools.roiextractors import get_nwb_imaging_metadata
 
-        metadata = super().get_metadata()
+        metadata = super().get_metadata(use_new_metadata_format=False)
         default_metadata = get_nwb_imaging_metadata(self.imaging_extractor, photon_series_type=self.photon_series_type)
         metadata = dict_deep_update(metadata, default_metadata)
         metadata["Ophys"].pop("TwoPhotonSeries", None)
@@ -128,9 +105,9 @@ class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
 
         return metadata
 
-    def get_metadata_schema(self) -> dict:
+    def _get_metadata_schema_for_old_list_format(self) -> dict:
         """
-        Get the metadata schema for the Miniscope imaging data.
+        Get the old list-based metadata schema for the Miniscope imaging data.
 
         Returns
         -------
@@ -138,9 +115,16 @@ class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
             The schema dictionary containing metadata definitions and requirements
             for the Miniscope imaging interface.
         """
-        metadata_schema = super().get_metadata_schema()
+        metadata_schema = super()._get_metadata_schema_for_old_list_format()
         metadata_schema["properties"]["Ophys"]["definitions"]["Device"]["additionalProperties"] = True
         return metadata_schema
+
+    def _get_native_times(self) -> np.ndarray:
+        return self.get_original_timestamps()
+
+    def _get_native_start_time(self) -> float:
+        times = self._get_native_times()
+        return float(times[0]) if times.size else np.nan
 
     def get_original_timestamps(self) -> np.ndarray:
         from ndx_miniscope.utils import get_timestamps
@@ -181,14 +165,12 @@ class _MiniscopeMultiRecordingInterface(BaseImagingExtractorInterface):
             _add_photon_series_to_nwbfile_old_list_format,
         )
 
-        miniscope_timestamps = self.get_original_timestamps()
+        # Set before slicing, since a slice copies its parent's times
+        self.imaging_extractor.set_times(times=self.temporal_alignment[self._alignment_key].get_times())
         imaging_extractor = self.imaging_extractor
         if stub_test:
             stub_samples = min([stub_samples, self.imaging_extractor.get_num_samples()])
             imaging_extractor = self.imaging_extractor.slice_samples(start_sample=0, end_sample=stub_samples)
-            miniscope_timestamps = miniscope_timestamps[:stub_samples]
-
-        imaging_extractor.set_times(times=miniscope_timestamps)
 
         device_metadata = metadata["Ophys"]["Device"][0]
         add_miniscope_device(nwbfile=nwbfile, device_metadata=device_metadata)
@@ -208,7 +190,7 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
     and a metaData.json configuration file. It provides two usage modes:
 
     1. folder_path: For standard folder structures where files follow the expected naming convention
-    2. file_paths + configuration_file_path: For non-standard folder structures with custom organization
+    2. file_paths: For non-standard folder structures with custom organization
     """
 
     display_name = "Miniscope Imaging"
@@ -240,9 +222,8 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
     def __init__(
         self,
         folder_path: DirectoryPath = None,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         file_paths: list = None,
-        configuration_file_path: str = None,
         timeStamps_file_path: str = None,
         verbose: bool = False,
         metadata_key: str | None = None,
@@ -252,7 +233,7 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
 
         Two usage modes are supported:
         - Provide only folder_path for standard folder structures
-        - Provide file_paths and configuration_file_path for custom folder structures
+        - Provide file_paths for custom folder structures
         These modes are mutually exclusive.
 
         Parameters
@@ -276,9 +257,6 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
             recording session and must follow the naming convention (0.avi, 1.avi, 2.avi, ...).
             Files will be concatenated in numerical order.
             Use this for non-standard folder structures.
-        configuration_file_path : str, optional
-            Path to the metaData.json configuration file containing recording parameters.
-            Required when using file_paths parameter.
         timeStamps_file_path : str, optional
             Path to the timeStamps.csv file containing timestamps relative to the recording start.
             If not provided, the extractor will look for timeStamps.csv in the same directory
@@ -289,72 +267,27 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
             # TODO: improve docstring once #1653 (ophys metadata documentation) is merged
             Metadata key for this interface. When None, defaults to "miniscope_imaging".
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "file_paths",
-                "configuration_file_path",
-                "timeStamps_file_path",
-                "verbose",
-            ]
-            num_positional_args_before_args = 1  # folder_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to MiniscopeImagingInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            file_paths = positional_values.get("file_paths", file_paths)
-            configuration_file_path = positional_values.get("configuration_file_path", configuration_file_path)
-            timeStamps_file_path = positional_values.get("timeStamps_file_path", timeStamps_file_path)
-            verbose = positional_values.get("verbose", verbose)
 
-        if folder_path is None and (file_paths is None or configuration_file_path is None):
-            raise ValueError(
-                "Either 'folder_path' must be provided, or both 'file_paths' and 'configuration_file_path' must be provided."
-            )
+        if folder_path is None and file_paths is None:
+            raise ValueError("Either 'folder_path' or 'file_paths' must be provided.")
 
         from ._miniscope_readers import _raise_if_miniscope_v3_format
 
         if folder_path is not None:
             _raise_if_miniscope_v3_format(folder_path=str(folder_path))
-        elif configuration_file_path is not None:
-            _raise_if_miniscope_v3_format(folder_path=str(Path(configuration_file_path).parent))
         elif file_paths is not None:
             _raise_if_miniscope_v3_format(folder_path=str(Path(file_paths[0]).parent))
 
-        if folder_path is not None and (file_paths is not None or configuration_file_path is not None):
+        if folder_path is not None and file_paths is not None:
             raise ValueError(
-                "When 'folder_path' is provided, 'file_paths' and 'configuration_file_path' cannot be specified. "
-                "Use either folder_path alone or provide file_paths with configuration_file_path."
-            )
-
-        # Deprecation warning for configuration_file_path
-        if configuration_file_path is not None:
-            warnings.warn(
-                "The 'configuration_file_path' parameter is deprecated and will be removed on or after May 2026. "
-                "Use 'folder_path' instead for standard folder structures.",
-                DeprecationWarning,
-                stacklevel=2,
+                "When 'folder_path' is provided, 'file_paths' cannot be specified. "
+                "Use either folder_path alone or provide file_paths."
             )
 
         # Store the device folder path for metadata extraction
         # The device folder contains metaData.json and .avi files
         if folder_path is not None:
             self._device_folder_path = Path(folder_path)
-        elif configuration_file_path is not None:
-            self._device_folder_path = Path(configuration_file_path).parent
         elif file_paths is not None:
             # Infer from file_paths - all .avi files should be in the same folder
             self._device_folder_path = Path(file_paths[0]).parent
@@ -368,7 +301,6 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
         super().__init__(
             folder_path=folder_path,
             file_paths=file_paths,
-            configuration_file_path=configuration_file_path,
             timestamps_path=timeStamps_file_path,
             verbose=verbose,
             metadata_key=metadata_key,
@@ -395,29 +327,50 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
 
         return MiniscopeImagingExtractor._get_session_start_time(miniscope_folder_path=folder_path)
 
-    def get_metadata(self, *, use_new_metadata_format: bool = False) -> DeepDict:
+    @property
+    def device_metadata_key(self) -> str:
+        """The ``metadata["Devices"]`` key this recording's Miniscope is registered under.
+
+        Keyed by the Miniscope rather than by the per-interface ``metadata_key``, because their
+        cardinalities differ: one Miniscope recorded over several sessions is one device but one series
+        per session, and registering one device name under several keys is rejected. Reading it off the
+        device is also what lets a converter's interfaces agree on the entry without being told.
+        """
+        return to_snake_case(self._read_device_name())
+
+    def _read_device_name(self) -> str:
+        """Return the ``deviceName`` of this recording's device folder, or the default."""
+        from roiextractors import MiniscopeImagingExtractor
+
+        device_metadata_path = self._device_folder_path / "metaData.json"
+        if not device_metadata_path.exists():
+            return "Miniscope"
+
+        miniscope_config = MiniscopeImagingExtractor._read_device_folder_metadata(
+            metadata_file_path=str(device_metadata_path)
+        )
+        return miniscope_config.get("deviceName", "Miniscope")
+
+    def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
         """Get metadata with device information from Miniscope configuration.
 
         Parameters
         ----------
-        use_new_metadata_format : bool, default: False
+        use_new_metadata_format : bool, default: True
             When False, returns the old list-based metadata format (backward compatible).
             When True, returns dict-based metadata keyed by ``metadata_key`` under
             ``Devices``, ``Ophys.ImagingPlanes``, and ``Ophys.MicroscopySeries``.
         """
         from roiextractors import MiniscopeImagingExtractor
 
-        metadata = (
-            super().get_metadata()
-            if not use_new_metadata_format
-            else super().get_metadata(use_new_metadata_format=True)
-        )
+        metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
 
         # Read device metadata from metaData.json using the extractor's static method
         device_metadata_path = self._device_folder_path / "metaData.json"
 
         device_name = "Miniscope"  # Default
         model_name = None
+        miniscope_config = None
         if device_metadata_path.exists():
             miniscope_config = MiniscopeImagingExtractor._read_device_folder_metadata(
                 metadata_file_path=str(device_metadata_path)
@@ -433,19 +386,35 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
             metadata["NWBFile"]["session_start_time"] = session_start_time
 
         if use_new_metadata_format:
-            device_entry = {"name": device_name}
-            if model_name is not None:
-                device_entry["model_name"] = model_name
-            metadata["Devices"] = {self.metadata_key: device_entry}
+            device_metadata_key = self.device_metadata_key
+            # The whole device configuration reaches the Miniscope device, which the registry builds
+            # from the 'type' field; nothing here is written by hand.
+            if miniscope_config is not None:
+                device_entry = _config_to_miniscope_device_metadata(
+                    miniscope_config={**miniscope_config, "name": device_name}
+                )
+                # The model is keyed by the hardware design it names, since every Miniscope of that
+                # design shares it, and is linked from the device the way pynwb 4 asks for.
+                model_entry = _config_to_miniscope_device_model_metadata(miniscope_config=miniscope_config)
+                if model_entry is not None:
+                    device_model_metadata_key = to_snake_case(model_entry["name"])
+                    device_entry["device_model_metadata_key"] = device_model_metadata_key
+                    metadata["DeviceModels"] = {device_model_metadata_key: model_entry}
+            else:
+                device_entry = {"type": "Miniscope", "name": device_name}
+            metadata["Devices"] = {device_metadata_key: device_entry}
             metadata["Ophys"] = {
                 "ImagingPlanes": {
                     self.metadata_key: {
-                        "device_metadata_key": self.metadata_key,
+                        "name": "ImagingPlane",
+                        "device_metadata_key": device_metadata_key,
                         "imaging_rate": self.imaging_extractor.get_sampling_frequency(),
                     },
                 },
                 "MicroscopySeries": {
                     self.metadata_key: {
+                        "name": "OnePhotonSeries",
+                        "unit": "px",
                         "imaging_plane_metadata_key": self.metadata_key,
                         "description": "Imaging data acquired with a Miniscope.",
                     },
@@ -476,7 +445,7 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
         self,
         nwbfile: NWBFile,
         metadata: dict | None = None,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         photon_series_type: Literal["TwoPhotonSeries", "OnePhotonSeries"] = "OnePhotonSeries",
         **kwargs,
     ):
@@ -485,41 +454,14 @@ class MiniscopeImagingInterface(BaseImagingExtractorInterface):
 
         This method adds the Miniscope device and then delegates to the parent class.
         """
-        # Handle deprecated positional arguments
-        if args:
-            import warnings
 
-            parameter_names = [
-                "photon_series_type",
-            ]
-            num_positional_args_before_args = 2  # nwbfile, metadata
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"add_to_nwbfile() takes at most {len(parameter_names) + num_positional_args_before_args} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                "Passing arguments positionally to MiniscopeImagingInterface.add_to_nwbfile() is deprecated "
-                "and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            photon_series_type = positional_values.get("photon_series_type", photon_series_type)
+        from ....tools.roiextractors.roiextractors import _is_dict_based_metadata
 
-        from ndx_miniscope.utils import add_miniscope_device
+        if not _is_dict_based_metadata(metadata if metadata is not None else self.get_metadata()):
+            # Old list-based path: the device is not in the registry, so it is written here.
+            from ndx_miniscope.utils import add_miniscope_device
 
-        # Add Miniscope device - required for proper ndx_miniscope.Miniscope device type
-        if metadata is not None and "Devices" in metadata and self.metadata_key in metadata.get("Devices", {}):
-            device_metadata = metadata["Devices"][self.metadata_key]
-        else:
-            device_metadata = metadata["Ophys"]["Device"][0]
-        add_miniscope_device(nwbfile=nwbfile, device_metadata=device_metadata)
+            add_miniscope_device(nwbfile=nwbfile, device_metadata=metadata["Ophys"]["Device"][0])
 
         super().add_to_nwbfile(
             nwbfile=nwbfile,

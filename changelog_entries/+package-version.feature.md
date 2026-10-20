@@ -1,0 +1,1 @@
+Added `neuroconv.__version__`, exposing the installed version at the package root. SpikeInterface stamps the defining package's version into an extractor's provenance dict and reads `<package>.__version__` back when reloading it, so a neuroconv-owned extractor could not previously be pickled or reloaded.

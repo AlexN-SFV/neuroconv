@@ -1,6 +1,5 @@
 import json
 import re
-import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -157,7 +156,7 @@ class FicTracDataInterface(BaseTemporalAlignmentInterface):
     def __init__(
         self,
         file_path: FilePath,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         radius: float | None = None,
         configuration_file_path: FilePath | None = None,
         verbose: bool = False,
@@ -177,34 +176,6 @@ class FicTracDataInterface(BaseTemporalAlignmentInterface):
         verbose : bool, default: False
             controls verbosity. ``True`` by default.
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "radius",
-                "configuration_file_path",
-                "verbose",
-            ]
-            num_positional_args_before_args = 1  # file_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to FicTracDataInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            radius = positional_values.get("radius", radius)
-            configuration_file_path = positional_values.get("configuration_file_path", configuration_file_path)
-            verbose = positional_values.get("verbose", verbose)
 
         self.file_path = Path(file_path)
         self.verbose = verbose
@@ -300,7 +271,7 @@ class FicTracDataInterface(BaseTemporalAlignmentInterface):
             position_container.add_spatial_series(spatial_series)
 
         # Add the container to the processing module
-        processing_module = get_module(nwbfile=nwbfile, name="behavior")
+        processing_module = get_module(nwbfile=nwbfile, name="behavior", description="processed behavioral data")
         processing_module.add(position_container)
 
     def get_original_timestamps(self):
@@ -420,7 +391,7 @@ def extract_session_start_time(
     length_in_seconds_of_a_10_year_experiment = 10 * 365 * 24 * 60 * 60
     if first_timestamp > length_in_seconds_of_a_10_year_experiment:
         utc_timestamp = first_timestamp
-        return datetime.utcfromtimestamp(utc_timestamp).replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(utc_timestamp, tz=timezone.utc)
 
     if configuration_file_path is None:
         configuration_file_path = file_path.parent / "fictrac_config.txt"

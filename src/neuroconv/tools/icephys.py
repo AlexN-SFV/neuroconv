@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+import numpy as np
 from pynwb import NWBFile, TimeSeries
 from pynwb.epoch import TimeIntervals
 from pynwb.icephys import (
@@ -9,7 +12,8 @@ from pynwb.icephys import (
 )
 
 from .nwb_helpers import _add_device_to_nwbfile
-from ..utils import DeepDict
+from .nwb_helpers._metadata_and_file_helpers import _validate_metadata_key
+from ..utils import DeepDict, calculate_regular_series_rate
 
 # The key under which the default (placeholder) entries are registered. An interface re-keys these to its own
 # file-derived keys; mirrors the ophys ``default_metadata_key``.
@@ -28,6 +32,78 @@ _STIMULUS_CLASS = {
 }
 
 
+@dataclass
+class _IcephysSeriesData:
+    """One patch-clamp series before it is materialized as an NWB object."""
+
+    data: np.ndarray
+    timestamps: np.ndarray
+    conversion: float
+    offset: float = 0.0
+
+
+def _add_patch_clamp_series_to_nwbfile(
+    nwbfile: NWBFile,
+    metadata: dict,
+    series_metadata_key: str,
+    series_data: _IcephysSeriesData,
+    electrode,
+    mode: str,
+    is_stimulus: bool,
+):
+    """Construct and add one response or stimulus series from an icephys data record."""
+    metadata_registry = "PatchClampStimulusSeries" if is_stimulus else "PatchClampSeries"
+    _validate_metadata_key(
+        metadata,
+        metadata_path=("Icephys", metadata_registry),
+        metadata_key=series_metadata_key,
+    )
+    series_metadata = metadata["Icephys"][metadata_registry][series_metadata_key]
+    series_class = _STIMULUS_CLASS[mode] if is_stimulus else _RESPONSE_CLASS[mode]
+    series_kwargs = dict(
+        name=series_metadata["name"],
+        data=series_data.data,
+        electrode=electrode,
+        conversion=series_data.conversion,
+        offset=series_data.offset,
+        gain=np.nan,
+        description=series_metadata["description"],
+    )
+    rate = calculate_regular_series_rate(series=series_data.timestamps)
+    if rate is not None:
+        series_kwargs.update(starting_time=float(series_data.timestamps[0]), rate=rate)
+    else:
+        series_kwargs.update(timestamps=series_data.timestamps)
+
+    series = series_class(**series_kwargs)
+    if is_stimulus:
+        nwbfile.add_stimulus(series)
+    else:
+        nwbfile.add_acquisition(series)
+    return series
+
+
+# NWB requires a `stimulus_type` on every SequentialRecordings entry, so a source that describes none still has
+# to put a string there. It is written only at that level: an interface with nothing to say omits the column from
+# the recordings table entirely rather than filling every row with a placeholder.
+_UNDESCRIBED_STIMULUS_TYPE = "not described"
+
+# What a run-level column holds for a run that did not state a value, once a sibling run has forced the column
+# to exist. Empty rather than `_UNDESCRIBED_STIMULUS_TYPE`, since the recordings table should carry only what a
+# source or caller actually said; the readable placeholder is added once, at the sequential level.
+_UNSTATED_RUN_LEVEL_VALUE = ""
+
+# The run-level columns the interfaces denormalize onto every recordings row, and that
+# `_build_icephys_hierarchical_tables` reads back to build the upper tables. Shared so the two halves of that
+# contract cannot drift: one function writes these columns, the other consumes them.
+_RUN_LEVEL_COLUMN_DESCRIPTIONS = {
+    "sequence": "Run identity grouping rows into a sequential recording (shared by the run's sweeps).",
+    "stimulus_type": "Stimulus type of the run, carried up to its sequential recording when aggregated.",
+    "repetition": "Repetition label grouping sequential recordings into a repetition.",
+    "condition": "Experimental condition label grouping repetitions.",
+}
+
+
 def _get_icephys_metadata_placeholders() -> DeepDict:
     """
     Default intracellular-electrophysiology metadata, keyed by a single ``default_metadata_key``.
@@ -42,21 +118,29 @@ def _get_icephys_metadata_placeholders() -> DeepDict:
 
     Structure
     ---------
-    - ``Icephys.IntracellularElectrodes[key]``: the patch electrode, linked to its device by
-      ``device_metadata_key``. ``description`` is schema-required, so it carries a ``"no description"``
-      placeholder.
+    - ``Devices[key]``: the device an electrode records through, for a file that names none. Only ``name``
+      is here, the one field NWB requires of a ``Device``, and it names no instrument class: published
+      files put an amplifier, a digitizer, a rig or the pipette itself behind this link, so a default
+      cannot pick one. An electrode links its own device with ``device_metadata_key``; an electrode that
+      names none gets this one.
+    - ``Icephys.IntracellularElectrodes[key]``: the patch electrode. ``description`` is schema-required,
+      so it carries a ``"no description"`` placeholder.
     - ``Icephys.PatchClampSeries[key]``: the response series, linked to its electrode by
       ``electrode_metadata_key``.
     - ``Icephys.PatchClampStimulusSeries[key]``: the optional paired stimulus, in a parallel registry at the
       SAME key as its response. It reuses the response's electrode, so it carries no ``electrode_metadata_key``.
     """
     metadata = DeepDict()
+    metadata["Devices"] = {
+        DEFAULT_METADATA_KEY: {
+            "name": "PlaceholderIntracellularDevice",
+        },
+    }
     metadata["Icephys"] = {
         "IntracellularElectrodes": {
             DEFAULT_METADATA_KEY: {
                 "name": "IntracellularElectrode",
                 "description": "no description",
-                "device_metadata_key": DEFAULT_METADATA_KEY,
             }
         },
         "PatchClampSeries": {
@@ -78,13 +162,17 @@ def _add_intracellular_electrode_to_nwbfile(nwbfile: NWBFile, metadata: dict, el
     """Return the intracellular electrode named by the metadata entry ``electrode_metadata_key``, reusing an
     existing one by name or creating it (and its device) if absent.
 
-    Resolves the electrode entry, follows its ``device_metadata_key`` link, and fills any schema-required field the
-    entry omits from :func:`_get_icephys_metadata_placeholders` (defaults are applied here, at write time, so an
-    interface's ``get_metadata`` only returns what the source provides). The electrode dedups by ``name``, and the
-    device is added by the shared registry helper, which is idempotent on its own ``name``, so several interfaces
-    pointing at one entry share a single object.
+    Resolves the electrode entry, follows its ``device_metadata_key`` link where it states one, and fills any
+    schema-required field the entry omits from :func:`_get_icephys_metadata_placeholders` (defaults are applied
+    here, at write time, so an interface's ``get_metadata`` only returns what the source provides). The electrode
+    dedups by ``name``, and so does the device, so several interfaces pointing at one entry share a single object.
     """
     placeholders = _get_icephys_metadata_placeholders()
+    _validate_metadata_key(
+        metadata,
+        metadata_path=("Icephys", "IntracellularElectrodes"),
+        metadata_key=electrode_metadata_key,
+    )
     electrode_metadata = {
         **placeholders["Icephys"]["IntracellularElectrodes"][DEFAULT_METADATA_KEY],
         **metadata["Icephys"]["IntracellularElectrodes"][electrode_metadata_key],
@@ -94,9 +182,18 @@ def _add_intracellular_electrode_to_nwbfile(nwbfile: NWBFile, metadata: dict, el
     if name in nwbfile.icephys_electrodes:
         return nwbfile.icephys_electrodes[name]
 
-    device = _add_device_to_nwbfile(
-        nwbfile=nwbfile, metadata=metadata, metadata_key=electrode_metadata["device_metadata_key"]
-    )
+    # An electrode naming no device gets the placeholder: a plain Device carrying the one field NWB
+    # requires, built here rather than through the registry writer, since there is no registry entry to
+    # key it against. Reused by name, so several electrodes naming no device land on one device.
+    device_metadata_key = electrode_metadata.get("device_metadata_key")
+    if device_metadata_key is None:
+        placeholder_device_metadata = placeholders["Devices"][DEFAULT_METADATA_KEY]
+        placeholder_device_name = placeholder_device_metadata["name"]
+        if placeholder_device_name not in nwbfile.devices:
+            nwbfile.create_device(**placeholder_device_metadata)
+        device = nwbfile.devices[placeholder_device_name]
+    else:
+        device = _add_device_to_nwbfile(nwbfile=nwbfile, metadata=metadata, metadata_key=device_metadata_key)
     # Optional IntracellularElectrode fields passed through from metadata if present.
     electrode_fields = ("cell_id", "location", "slice", "resistance", "seal", "filtering", "initial_access_resistance")
     extra_fields = {field: electrode_metadata[field] for field in electrode_fields if field in electrode_metadata}
@@ -120,6 +217,95 @@ def _validate_grouping_levels(repetitions: list, conditions: list) -> None:
         raise ValueError("`repetition` must be provided on all interfaces or none of them.")
     if any(value is not None for value in conditions) and not all(value is not None for value in conditions):
         raise ValueError("`condition` must be provided on all interfaces or none of them.")
+
+
+def _add_intracellular_recordings_to_nwbfile(
+    nwbfile: NWBFile,
+    *,
+    electrode,
+    response_series,
+    sweep_sample_ranges: list,
+    sequence: str,
+    stimulus_series=None,
+    stimulus_type: str | None = None,
+    repetition: str | None = None,
+    condition: str | None = None,
+) -> None:
+    """
+    Write one ``IntracellularRecordings`` row per sweep, tagged with this run's run-level columns.
+
+    Each row addresses the run's continuous response series by the sweep's ``(start_index, count)`` range, and
+    carries the run-level values denormalized onto it, so the file stays information-complete even before the
+    upper tables exist. The columns are the ones :func:`_build_icephys_hierarchical_tables` reads back:
+    ``sequence`` always, and ``stimulus_type`` / ``repetition`` / ``condition`` when the source or caller stated
+    them.
+
+    A run-level column belongs to the table, not to the interface that introduced it, so an optional value has
+    to stay representable when runs disagree about whether they have one:
+
+    - the column already exists and this run has no value -> write ``_UNSTATED_RUN_LEVEL_VALUE`` on these rows,
+    - the column is introduced here and rows already exist -> backfill those rows with the same,
+    - the column does not exist and no run has a value -> it is never created.
+
+    Without both of the first two, a converter combining a run that stated a ``stimulus_type`` with one that did
+    not dies inside hdmf mid-write, with an error that names neither the argument nor the run it came from and
+    that changes with declaration order. ``repetition`` and ``condition`` cannot reach that state, since
+    :func:`_validate_grouping_levels` requires them on all runs or none (they are grouping keys, so a partial
+    one has no meaning); ``stimulus_type`` is purely descriptive, so a run that did not state one is a real
+    state rather than a mistake.
+
+    Parameters
+    ----------
+    nwbfile : NWBFile
+        The file to write the rows into.
+    electrode : IntracellularElectrode
+        The electrode every sweep of this run was recorded through.
+    response_series : PatchClampSeries
+        The run's continuous response, which the rows address by index range.
+    sweep_sample_ranges : list of tuple of int
+        One ``(start_index, count)`` per sweep, into ``response_series``.
+    sequence : str
+        The run identity shared by these sweeps, grouped on to build a ``SequentialRecordings`` entry.
+    stimulus_series : PatchClampStimulusSeries, optional
+        The run's stimulus, addressed by the same ranges, when the source carries one.
+    stimulus_type : str, optional
+        What kind of run this was. Omitted rather than given a placeholder when the source stated none.
+    repetition : str, optional
+        Label grouping this run's sequential recording into a repetition.
+    condition : str, optional
+        Label grouping this run's repetition into an experimental condition.
+    """
+    columns = {"sequence": sequence}
+    for name, value in (("stimulus_type", stimulus_type), ("repetition", repetition), ("condition", condition)):
+        if value is not None:
+            columns[name] = value
+
+    table = nwbfile.get_intracellular_recordings()
+    for name in _RUN_LEVEL_COLUMN_DESCRIPTIONS:
+        if name in table.colnames:
+            columns.setdefault(name, _UNSTATED_RUN_LEVEL_VALUE)
+    for name in columns:
+        if name not in table.colnames:
+            # `data` covers the rows written before this column existed; empty, so a no-op, for the first run.
+            table.add_column(
+                name=name,
+                description=_RUN_LEVEL_COLUMN_DESCRIPTIONS[name],
+                data=[_UNSTATED_RUN_LEVEL_VALUE] * len(table),
+            )
+
+    for start_index, count in sweep_sample_ranges:
+        keyword_arguments = dict(
+            electrode=electrode,
+            response=response_series,
+            response_start_index=start_index,
+            response_index_count=count,
+        )
+        if stimulus_series is not None:
+            keyword_arguments.update(
+                stimulus=stimulus_series, stimulus_start_index=start_index, stimulus_index_count=count
+            )
+        keyword_arguments.update(columns)
+        nwbfile.add_intracellular_recording(**keyword_arguments)
 
 
 def _disambiguate_run_labels(paths: list) -> dict:
@@ -151,19 +337,29 @@ def _build_icephys_hierarchical_tables(nwbfile: NWBFile) -> None:
     """
     Build the icephys hierarchy tables from the grouping columns on the intracellular-recordings table.
 
-    Reads, per row: the response ``(start_index, count)`` timing range, ``sequence``, ``stimulus_type``, and the
-    optional ``repetition`` / ``condition`` columns, then groups upward:
+    Reads, per row: the response's sweep timing, ``sequence``, and the optional ``stimulus_type`` /
+    ``repetition`` / ``condition`` columns, then groups upward:
 
-    - rows of one ``sequence`` sharing a timing range -> one ``SimultaneousRecordings`` entry,
+    - rows of one ``sequence`` covering the same span of time -> one ``SimultaneousRecordings`` entry,
     - the simultaneous entries of one ``sequence`` -> one ``SequentialRecordings`` entry (with its stimulus type),
     - the sequentials of one ``repetition`` -> one ``Repetitions`` entry (present, or identity per sequence
       when a ``condition`` needs a repetitions rung beneath it),
     - the repetitions of one ``condition`` -> one ``ExperimentalConditions`` entry (only if the column is present).
 
+    Simultaneity is decided on the sweep's resolved start and stop time rather than on its ``(start_index,
+    count)`` range, because an index is only a proxy for time while every series shares one clock origin. Two
+    electrodes of a dual patch write two series that both start at index 0 and are genuinely simultaneous; an
+    interface writing one series per sweep also produces rows that all start at index 0, and those are not. Only
+    the resolved time separates the two cases, and it groups the dual patch correctly either way. This is the same
+    notion of sweep identity :func:`_add_sweep_time_intervals_to_nwbfile` keys on, so the two projections of these
+    rows cannot disagree.
+
     Each grouping value is constant within a sequence (a run), so the run-level attributes are read off any of
     its rows. When a ``repetition`` column is absent, each sequence is its own repetition (identity grouping,
     the same width-1 default ``SimultaneousRecordings`` uses for a single electrode), so a ``condition`` without
-    a ``repetition`` still builds: it groups those identity repetitions.
+    a ``repetition`` still builds: it groups those identity repetitions. A ``stimulus_type`` column is likewise
+    optional: NWB requires the field on the sequential recording, so a placeholder is supplied there when the
+    source described none, but the recordings table is left without a column of repeated placeholders.
 
     Parameters
     ----------
@@ -178,7 +374,7 @@ def _build_icephys_hierarchical_tables(nwbfile: NWBFile) -> None:
     column_names = intracellular_recordings.colnames
     responses = intracellular_recordings["responses"]["response"]
     sequences = intracellular_recordings["sequence"]
-    stimulus_types = intracellular_recordings["stimulus_type"]
+    stimulus_types = intracellular_recordings["stimulus_type"] if "stimulus_type" in column_names else None
     repetitions = intracellular_recordings["repetition"] if "repetition" in column_names else None
     conditions = intracellular_recordings["condition"] if "condition" in column_names else None
 
@@ -192,12 +388,16 @@ def _build_icephys_hierarchical_tables(nwbfile: NWBFile) -> None:
             sequence_order.append(sequence_value)
             timing_groups_by_sequence[sequence_value] = {}
             attributes_by_sequence[sequence_value] = dict(
-                stimulus_type=stimulus_types[row_index],
+                stimulus_type=stimulus_types[row_index] if stimulus_types is not None else None,
                 repetition=repetitions[row_index] if repetitions is not None else None,
                 condition=conditions[row_index] if conditions is not None else None,
             )
         response_reference = responses[row_index]
-        timing_key = (response_reference.idx_start, response_reference.count)
+        timing_key = _get_sweep_start_and_stop_time(
+            series=response_reference.timeseries,
+            start_index=response_reference.idx_start,
+            count=response_reference.count,
+        )
         timing_groups_by_sequence[sequence_value].setdefault(timing_key, []).append(row_index)
 
     # Simultaneous + sequential: one sequential per sequence.
@@ -208,9 +408,12 @@ def _build_icephys_hierarchical_tables(nwbfile: NWBFile) -> None:
             nwbfile.add_icephys_simultaneous_recording(recordings=timing_groups[timing_key])
             for timing_key in sorted(timing_groups)
         ]
+        stimulus_type = attributes_by_sequence[sequence_value]["stimulus_type"]
         sequential_index_by_sequence[sequence_value] = nwbfile.add_icephys_sequential_recording(
             simultaneous_recordings=simultaneous_indices,
-            stimulus_type=attributes_by_sequence[sequence_value]["stimulus_type"],
+            # A run that stated none reaches here as `None` (no column at all) or as the unstated value (a
+            # sibling run forced the column); both mean the same thing and get the one readable placeholder.
+            stimulus_type=stimulus_type if stimulus_type else _UNDESCRIBED_STIMULUS_TYPE,
         )
 
     # The repetitions level is built when it was requested (a `repetition` column) or when `condition` needs a

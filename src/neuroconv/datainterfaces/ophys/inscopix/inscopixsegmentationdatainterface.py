@@ -1,9 +1,7 @@
-import warnings
-
 from pydantic import FilePath
 
 from ..basesegmentationextractorinterface import BaseSegmentationExtractorInterface
-from ....utils import DeepDict
+from ....utils import DeepDict, to_snake_case
 
 
 class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
@@ -22,7 +20,7 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
     def __init__(
         self,
         file_path: FilePath,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         verbose: bool = False,
         metadata_key: str | None = None,
     ):
@@ -36,43 +34,19 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
         metadata_key : str, optional
             Metadata key for this interface. When None, defaults to "inscopix_segmentation".
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "verbose",
-            ]
-            num_positional_args_before_args = 1  # file_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to InscopixSegmentationInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            verbose = positional_values.get("verbose", verbose)
 
         if metadata_key is None:
             metadata_key = "inscopix_segmentation"
 
         super().__init__(file_path=file_path, verbose=verbose, metadata_key=metadata_key)
 
-    def get_metadata(self, *, use_new_metadata_format: bool = False) -> DeepDict:
+    def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
         """
         Retrieve the metadata for the Inscopix segmentation data.
 
         Parameters
         ----------
-        use_new_metadata_format : bool, default: False
+        use_new_metadata_format : bool, default: True
             When False, returns the old list-based metadata format (backward compatible).
             When True, returns dict-based metadata with Inscopix provenance keyed by
             ``metadata_key`` under ``Devices`` and ``Ophys.PlaneSegmentations``.
@@ -89,11 +63,7 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
         See related issue: https://github.com/inscopix/pyisx/issues/62
 
         """
-        metadata = (
-            super().get_metadata()
-            if not use_new_metadata_format
-            else super().get_metadata(use_new_metadata_format=True)
-        )
+        metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
         extractor = self.segmentation_extractor
 
         # Get all metadata from extractor using the consolidated method
@@ -120,10 +90,15 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
             if session_info.get("session_name"):
                 metadata["NWBFile"]["session_id"] = session_info["session_name"]
 
-            # Devices
-            device_entry = {}
-            if device_info.get("device_name"):
-                device_entry["name"] = device_info["device_name"]
+            # Devices. The name is a convention for writing the file rather than something the source
+            # states, so it falls back to the generic microscope name the old format used. The registry is
+            # keyed by the microscope, on the serial number when the file records one, so this interface
+            # and the imaging interface of the same session resolve to one entry.
+            device_entry = {"name": device_info.get("device_name") or "Microscope"}
+            serial_number = device_info.get("device_serial_number")
+            device_metadata_key = (
+                f"inscopix_{to_snake_case(str(serial_number))}" if serial_number else "inscopix_microscope"
+            )
             desc_parts = []
             if device_info.get("device_serial_number"):
                 desc_parts.append(f"Serial: {device_info['device_serial_number']}")
@@ -142,8 +117,7 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
                     desc_parts.append(f"{field}: {value}")
             if desc_parts:
                 device_entry["description"] = f"Inscopix Microscope ({', '.join(desc_parts)})"
-            if device_entry:
-                metadata["Devices"] = {self.metadata_key: device_entry}
+            metadata["Devices"] = {device_metadata_key: device_entry}
 
             # PlaneSegmentations
             plane_segmentation_description = "Inscopix cell segmentation"
@@ -153,8 +127,14 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
                 plane_segmentation_description += f" with traces in {analysis_info['trace_units']}"
 
             metadata["Ophys"] = {
+                "ImagingPlanes": {
+                    self.metadata_key: {"device_metadata_key": device_metadata_key},
+                },
                 "PlaneSegmentations": {
-                    self.metadata_key: {"description": plane_segmentation_description},
+                    self.metadata_key: {
+                        "description": plane_segmentation_description,
+                        "imaging_plane_metadata_key": self.metadata_key,
+                    },
                 },
             }
         elif session_info.get("session_name"):
@@ -300,12 +280,11 @@ class InscopixSegmentationInterface(BaseSegmentationExtractorInterface):
                 subject_metadata["weight"] = subject_info["weight"]
                 has_any_subject_data = True
 
-        # Add Subject if we have ANY subject information, filling required fields with defaults
+        # Add Subject if we have ANY subject information. Only "sex" gets a fallback: "U" is NWB's own
+        # term for unknown, so recording it states that the file did not say. A subject_id or a species
+        # the file does not carry would be an invented value, indistinguishable once written from one
+        # the experimenter entered.
         if has_any_subject_data:
-            if "subject_id" not in subject_metadata:
-                subject_metadata["subject_id"] = "Unknown"
-            if "species" not in subject_metadata:
-                subject_metadata["species"] = "Unknown species"
             if "sex" not in subject_metadata:
                 subject_metadata["sex"] = "U"
 

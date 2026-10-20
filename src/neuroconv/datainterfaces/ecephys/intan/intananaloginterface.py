@@ -1,15 +1,14 @@
-import warnings
 from pathlib import Path
 
 from pydantic import FilePath
 from pynwb import NWBFile
 
 from ._utils import _warn_if_split_siblings_detected
-from ....basedatainterface import BaseDataInterface
+from ..baserecordingastimeseriesinterface import BaseRecordingAsTimeSeriesInterface
 from ....utils import DeepDict, get_json_schema_from_method_signature
 
 
-class IntanAnalogInterface(BaseDataInterface):
+class IntanAnalogInterface(BaseRecordingAsTimeSeriesInterface):
     """
     Primary data interface for converting non-amplifier analog data streams from Intan .rhd or .rhs files.
 
@@ -38,10 +37,10 @@ class IntanAnalogInterface(BaseDataInterface):
     def __init__(
         self,
         file_path: FilePath,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         stream_name: str,
         verbose: bool = False,
-        metadata_key: str = "TimeSeriesAnalogIntan",
+        metadata_key: str = "intan_analog",
         saved_files_are_split: bool = False,
     ):
         """
@@ -61,42 +60,15 @@ class IntanAnalogInterface(BaseDataInterface):
             - "DC Amplifier channel": DC amplifier channels (RHS system only)
         verbose : bool, default: False
             Verbose output
-        metadata_key : str, default: "TimeSeriesAnalogIntan"
-            Key for the TimeSeries metadata in the metadata dictionary.
+        metadata_key : str, default: "intan_analog"
+            Key for the TimeSeries metadata in the metadata dictionary. This addresses the entry;
+            the written object's name is the entry's ``name`` field, derived from ``stream_name``.
         saved_files_are_split : bool, default: False
             Set to True when the recording was saved using Intan RHX's "new save file every N minutes"
             option, producing several rotated ``.rhd``/``.rhs`` files in one session folder. All sibling
             files in ``file_path.parent`` are concatenated in filename order (Intan's default
             ``{prefix}_YYMMDD_HHMMSS`` naming makes lexicographic order match chronological order).
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "stream_name",
-                "verbose",
-                "metadata_key",
-            ]
-            num_positional_args_before_args = 1  # file_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to IntanAnalogInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            stream_name = positional_values.get("stream_name", stream_name)
-            verbose = positional_values.get("verbose", verbose)
-            metadata_key = positional_values.get("metadata_key", metadata_key)
 
         self._file_path = Path(file_path)
         self._stream_name = stream_name
@@ -168,45 +140,33 @@ class IntanAnalogInterface(BaseDataInterface):
         # Add device metadata (reuse from main Intan interface)
         system = self._file_path.suffix  # .rhd or .rhs
         device_description = {".rhd": "RHD Recording System", ".rhs": "RHS Stim/Recording System"}[system]
+        device_model_metadata_key = {".rhd": "intan_rhd2000_model", ".rhs": "intan_rhs2000_model"}[system]
+        device_model_name = {".rhd": "RHD2000 Recording System", ".rhs": "RHS2000 Stim-Recording System"}[system]
 
         intan_device = dict(
             name="Intan",
             description=device_description,
-            manufacturer="Intan",
+            device_model_metadata_key=device_model_metadata_key,
         )
-        metadata["Devices"] = [intan_device]
+        # Same key as ``IntanRecordingInterface``: one Intan system, one registry entry.
+        metadata["Devices"] = {"intan_device": intan_device}
+        metadata["DeviceModels"] = {device_model_metadata_key: dict(name=device_model_name, manufacturer="Intan")}
 
-        # Add TimeSeries metadata
         channel_names = self.get_channel_names()
-        description = (
-            f"{self.stream_info[self._stream_name]['description']}. " f"Channels are {channel_names} in that order."
+        metadata["TimeSeries"][self.metadata_key] = dict(
+            name=self._time_series_name,
+            description=(
+                f"{self.stream_info[self._stream_name]['description']}. " f"Channels are {channel_names} in that order."
+            ),
         )
-
-        metadata["TimeSeries"] = {
-            self.metadata_key: dict(
-                name=self._time_series_name,
-                description=description,
-            )
-        }
 
         return metadata
-
-    def get_channel_names(self) -> list[str]:
-        """
-        Get a list of channel names from the recording extractor.
-
-        Returns
-        -------
-        list of str
-            The names of all channels in the analog recording.
-        """
-        return list(self.recording_extractor.get_channel_ids())
 
     def add_to_nwbfile(
         self,
         nwbfile: NWBFile,
         metadata: dict | None = None,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         stub_test: bool = False,
         iterator_type: str | None = "v2",
         iterator_options: dict | None = None,
@@ -230,54 +190,12 @@ class IntanAnalogInterface(BaseDataInterface):
         always_write_timestamps : bool, default: False
             If True, always writes timestamps instead of using sampling rate
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "stub_test",
-                "iterator_type",
-                "iterator_options",
-                "always_write_timestamps",
-            ]
-            num_positional_args_before_args = 2  # nwbfile, metadata
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"add_to_nwbfile() takes at most {len(parameter_names) + num_positional_args_before_args} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to IntanAnalogInterface.add_to_nwbfile() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            stub_test = positional_values.get("stub_test", stub_test)
-            iterator_type = positional_values.get("iterator_type", iterator_type)
-            iterator_options = positional_values.get("iterator_options", iterator_options)
-            always_write_timestamps = positional_values.get("always_write_timestamps", always_write_timestamps)
-        from ....tools.spikeinterface import (
-            _stub_recording,
-            add_recording_as_time_series_to_nwbfile,
-        )
 
-        if metadata is None:
-            metadata = self.get_metadata()
-
-        recording = self.recording_extractor
-        if stub_test:
-            recording = _stub_recording(recording=recording)
-
-        add_recording_as_time_series_to_nwbfile(
-            recording=recording,
+        super().add_to_nwbfile(
             nwbfile=nwbfile,
             metadata=metadata,
+            stub_test=stub_test,
             iterator_type=iterator_type,
             iterator_options=iterator_options,
             always_write_timestamps=always_write_timestamps,
-            metadata_key=self.metadata_key,
         )

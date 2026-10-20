@@ -1,7 +1,6 @@
 import json
 import re
 import warnings
-from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
@@ -9,14 +8,19 @@ import numpy as np
 import pandas
 from hdmf.common import DynamicTableRegion
 from pydantic import DirectoryPath, validate_call
+from pynwb.base import TimeSeries
 from pynwb.core import VectorData
+from pynwb.event import EventsTable
 from pynwb.file import NWBFile
 
 from neuroconv.basedatainterface import BaseDataInterface
 from neuroconv.tools import get_package
+from neuroconv.tools.fiber_photometry import get_fiber_photometry_table
 from neuroconv.tools.nwb_helpers import get_module
 from neuroconv.utils import DeepDict, calculate_regular_series_rate
 from neuroconv.utils.json_schema import get_base_schema
+
+from .nwb_linking import resolve_acquisition_store_rows
 
 
 def _column_parses_as_float(column: str) -> bool:
@@ -31,11 +35,34 @@ def _column_parses_as_float(column: str) -> bool:
 _PREFIX_TO_TRACE_TYPE = dict(cntrl_sig_fit="control_fit", dff="dff", z_score="z_score")
 # GuPPy derived-trace prefix -> unit (deterministic from the output, not user-editable).
 _PREFIX_TO_UNIT = dict(cntrl_sig_fit="n.a.", dff="a.u.", z_score="a.u.")
+# GuPPy's label prefix for a spontaneous-mode event: the transients of one metric standing in for a TTL.
+_TRANSIENT_EVENT_PREFIX = "transients_"
+# GuPPy store-label prefix marking a behavioral covariate (e.g. 'covariate_akinesia').
+_COVARIATE_PREFIX = "covariate_"
+# ndx-guppy trace_type -> the column holding its mean, in both binned_metrics_<recording_site>.h5
+# (per bin) and tonic_<recording_site>.h5 (per epoch).
+_TRACE_TYPE_TO_MEAN_COLUMN = dict(z_score="mean_zscore", dff="mean_dff")
+# A binned-metrics column name -> the (trace_type, metric) pair it stands for. GuPPy spells the two
+# families differently ('mean_zscore' but 'transient_count_z_score'), so the mapping is written out.
+_BINNED_METRIC_COLUMN_TO_TRACE_TYPE_AND_METRIC = {
+    "mean_zscore": ("z_score", "mean"),
+    "mean_dff": ("dff", "mean"),
+    "transient_count_z_score": ("z_score", "transient_count"),
+    "transient_count_dff": ("dff", "transient_count"),
+}
 # Per-window peak/area metric row prefixes in the peak_AUC_*.h5 DataFrame index.
 _BIN_COLUMN_PATTERN = re.compile(r"bin_\((\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\)$")
+# The two registry tables every GuPPy product references. The recording sites table is shared with
+# ``GuppyConverter``, which may author it instead of this interface.
+_RECORDING_SITES_TABLE_NAME = "recording_sites"
+_RECORDING_SITES_TABLE_DESCRIPTION = "GuPPy recording sites (one row per recording site)."
+_EVENTS_TABLE_NAME = "events"
+_EVENTS_TABLE_DESCRIPTION = "GuPPy behavioral events (one row per event GuPPy aligned to)."
+# Default name of the core EventsTable this interface writes GuPPy's own analyzed onsets into.
+_ANALYZED_EVENTS_TABLE_NAME = "GuppyEvents"
 
 
-class _GuppyInterface(BaseDataInterface):
+class GuppyInterface(BaseDataInterface):
     """
     Data Interface for converting GuPPy (Guided Photometry Analysis in Python) processed outputs.
 
@@ -43,24 +70,44 @@ class _GuppyInterface(BaseDataInterface):
 
     * control-fit / ΔF/F / z-score traces
     * transient peaks and their per-(recording_site, trace_type) summary
-    * peri-event PSTHs
-    * peak / AUC summaries
+    * peri-event PSTHs and peak / AUC summaries, including those GuPPy's spontaneous mode aligned to its
+      own detected transients instead of to external TTLs
     * recording-site-pair cross-correlations
+    * bootstrap significance of the PSTHs, where that optional GuPPy step was run
+    * whole-session time-binned metrics, and the behavioral covariates binned onto and correlated
+      against them, where those optional GuPPy steps were run
+    * per-epoch tonic means, where GuPPy's optional tonic analysis was run
 
-    plus the GuPPy parameters (``GuppyParameters``), the ``GuppyValidSignalIntervals`` object, and two slim
+    plus the GuPPy parameters (``GuppyParameters``), the ``GuppyValidSignalIntervals`` object, and the two
     registry tables (``GuppyRecordingSitesTable``, ``GuppyEventsTable``) that give each recording_site and
     event a single structured identity referenced by every product.
 
     :meth:`add_to_nwbfile` takes **no linkage arguments** -- it writes only what the GuPPy output defines.
-    The two registries are slim (names only); their outward links are optional and populated afterwards by
-    a converter that owns the acquisition and events tables: the recording sites'
-    ``fiber_photometry_table_region`` into the acquisition ``FiberPhotometryTable``, and the events'
-    ``events`` DynamicTableRegion into the merged ``EventsTable`` (see ``TDTFiberPhotometryGuppyConverter``).
-    Run standalone, the file is valid without those two links. The converter reaches the parsed identifiers
-    it needs to build the links through the :attr:`recording_sites`, :attr:`event_names`, and
-    :attr:`recording_site_to_store_ids` read-only views.
+    The events registry's ``events`` DynamicTableRegion references an ``EventsTable`` of GuPPy's own
+    analyzed onsets, written into ``nwbfile.events``, so every peri-event product reaches the
+    occurrences it was built from however this interface is run.
 
-    All products are placed in a ``ProcessingModule`` (default name ``fiber_photometry``).
+    The recording sites registry carries the one outward link the GuPPy output cannot supply itself,
+    ``fiber_photometry_table_region`` into the acquisition ``FiberPhotometryTable``. How much of that
+    can be filled in depends on what the ``NWBFile`` already holds when this runs:
+
+    * **A converter authored the registry.** ``GuppyConverter`` owns the acquisition interfaces for a
+      session being converted from raw, so it builds the recording sites registry itself, in full,
+      before this interface runs; it is reused as it stands.
+    * **The NWBFile already holds the acquisition.** A session GuPPy processed out of an existing NWB
+      file is converted by handing that file here: GuPPy's ``storesList.csv`` store ids were derived
+      from its contents, so they address its response series directly and the registry is built linked
+      into the table already there. Nothing is copied or rewritten.
+    * **Neither**, or only some of GuPPy's stores address the file. The registry is built in its
+      minimal link-free form -- one row per recording site, name only -- since the interface has no
+      acquisition provenance to invent, and a partial resolution is reported as a warning naming the
+      stores that did not resolve.
+
+    A converter reaches the parsed identifiers it needs to build that registry itself, and to keep its
+    raw events to the stores GuPPy processed, through the :attr:`recording_sites`,
+    :attr:`recording_site_to_store_ids`, and :attr:`event_store_to_event_name` read-only views.
+
+    All products are placed in a ``ProcessingModule`` named ``guppy``.
     """
 
     keywords = ("fiber photometry", "GuPPy", "processed")
@@ -79,7 +126,7 @@ class _GuppyInterface(BaseDataInterface):
         metadata_key: str | None = None,
         verbose: bool = False,
     ):
-        """Initialize the _GuppyInterface.
+        """Initialize the GuppyInterface.
 
         Parameters
         ----------
@@ -115,6 +162,7 @@ class _GuppyInterface(BaseDataInterface):
         )
         recording_site_to_store_ids = self._discover_recording_site_to_store_ids(stores_list_path)
         event_store_to_event_name = self._discover_event_store_to_event_name(stores_list_path)
+        covariate_to_store_id = self._discover_covariates(stores_list_path)
         event_names = sorted(set(event_store_to_event_name.values()))
 
         traces_by_recording_site = {
@@ -141,13 +189,37 @@ class _GuppyInterface(BaseDataInterface):
         with open(parameters_file_path, "r", encoding="utf-8") as parameters_file:
             guppy_parameters = json.load(parameters_file)
 
+        transient_events = self._discover_transient_events(
+            folder_path=folder_path,
+            recording_sites=recording_sites,
+            transients_by_recording_site=transients_by_recording_site,
+        )
+        # Spontaneous-mode events are events as far as every peri-event product is concerned, so the
+        # products are discovered over both kinds. The registry rows differ (see the events table writer).
+        transient_event_names = sorted({event_name for event_name, _ in transient_events})
+        product_event_names = event_names + transient_event_names
+
         cross_correlations = self._discover_cross_correlations(folder_path=folder_path, recording_sites=recording_sites)
-        psths = self._discover_psths(folder_path=folder_path, event_names=event_names, recording_sites=recording_sites)
+        psths = self._discover_psths(
+            folder_path=folder_path, event_names=product_event_names, recording_sites=recording_sites
+        )
         peak_aucs = self._discover_peak_aucs(
-            folder_path=folder_path, event_names=event_names, recording_sites=recording_sites
+            folder_path=folder_path, event_names=product_event_names, recording_sites=recording_sites
+        )
+        psth_significance = self._discover_psth_significance(
+            folder_path=folder_path, event_names=product_event_names, recording_sites=recording_sites
         )
         valid_signal_intervals_by_recording_site = self._discover_valid_signal_intervals(
             folder_path=folder_path, recording_sites=recording_sites
+        )
+        binned_tables_by_recording_site = self._discover_binned_tables(
+            folder_path=folder_path, recording_sites=recording_sites
+        )
+        tonic_epochs_by_recording_site = self._discover_tonic_epochs(
+            folder_path=folder_path, recording_sites=recording_sites
+        )
+        analyzed_event_onsets = self._discover_analyzed_event_onsets(
+            folder_path=folder_path, event_names=event_names, recording_sites=recording_sites
         )
         remove_artifacts_flag = guppy_parameters.get("removeArtifacts")
         if remove_artifacts_flag is True and not valid_signal_intervals_by_recording_site:
@@ -173,13 +245,20 @@ class _GuppyInterface(BaseDataInterface):
         self._cross_correlations = cross_correlations
         self._psths = psths
         self._peak_aucs = peak_aucs
+        self._psth_significance = psth_significance
         self._valid_signal_intervals_by_recording_site = valid_signal_intervals_by_recording_site
+        self._covariate_to_store_id = covariate_to_store_id
+        self._binned_tables_by_recording_site = binned_tables_by_recording_site
+        self._tonic_epochs_by_recording_site = tonic_epochs_by_recording_site
+        self._analyzed_event_onsets = analyzed_event_onsets
+        self._transient_events = transient_events
+        self._transient_event_names = transient_event_names
+        self._product_event_names = product_event_names
         self._guppy_parameters = guppy_parameters
 
     # ------------------------------------------------------------------ #
-    # Read-only views of the parsed GuPPy identifiers, for a converter that owns the acquisition /
-    # events tables and needs to compute the registries' outward links (which the interface leaves
-    # unpopulated). No GuPPy-file parsing leaves the interface -- only the parsed identities.
+    # Read-only views of the parsed GuPPy identifiers, for a converter that owns the acquisition and
+    # raw events interfaces and needs to name what GuPPy processed.
     # ------------------------------------------------------------------ #
     @property
     def recording_sites(self) -> list[str]:
@@ -192,9 +271,28 @@ class _GuppyInterface(BaseDataInterface):
         return list(self._event_names)
 
     @property
+    def analyzed_event_onsets(self) -> dict[str, np.ndarray]:
+        """The onsets GuPPy kept for each event, keyed by event name.
+
+        These are the onsets GuPPy built trials around, which are what every peri-event product covers:
+        an occurrence the raw acquisition recorded but GuPPy discarded is not here.
+        """
+        return {event_name: onsets.copy() for event_name, onsets in self._analyzed_event_onsets.items()}
+
+    @property
     def recording_site_to_store_ids(self) -> dict[str, dict[str, str]]:
         """``{recording_site: {"signal": <store_id>, "control": <store_id>}}`` from storesList.csv."""
         return {recording_site: dict(stores) for recording_site, stores in self._recording_site_to_store_ids.items()}
+
+    @property
+    def event_store_to_event_name(self) -> dict[str, str]:
+        """``{store_id: event_name}`` for the behavioral event stores listed in storesList.csv.
+
+        A converter that also writes the raw acquisition's events needs this to keep exactly the
+        stores GuPPy processed and give each the human-readable name recorded there (e.g. the
+        ``PrtR`` store becomes the ``port_entries`` event type).
+        """
+        return dict(self._event_store_to_event_name)
 
     @staticmethod
     def _discover_recording_sites(stores_list_path: Path) -> list[str]:
@@ -251,10 +349,27 @@ class _GuppyInterface(BaseDataInterface):
         )
         event_store_to_event_name: dict[str, str] = {}
         for store_id, store_label in zip(store_ids, store_labels):
-            if store_label.startswith("signal_") or store_label.startswith("control_"):
+            if store_label.startswith(("signal_", "control_", _COVARIATE_PREFIX)):
                 continue
             event_store_to_event_name[store_id] = store_label
         return event_store_to_event_name
+
+    @staticmethod
+    def _discover_covariates(stores_list_path: Path) -> dict[str, str]:
+        """Return ``{covariate_name: store_id}`` for the behavioral covariate stores in ``storesList.csv``.
+
+        A behavioral covariate is a continuous variable scored outside the rig, labeled
+        ``covariate_<name>`` in row 1 (e.g. ``covariate_akinesia`` -> ``akinesia``). GuPPy writes its
+        scored values into the run folder under the row-0 store id, so the mapping is what reaches them.
+        """
+        rows = stores_list_path.read_text(encoding="utf-8").strip().splitlines()
+        store_ids = [name.strip() for name in rows[0].split(",")]
+        store_labels = [name.strip() for name in rows[1].split(",")]
+        return {
+            store_label[len(_COVARIATE_PREFIX) :]: store_id
+            for store_id, store_label in zip(store_ids, store_labels)
+            if store_label.startswith(_COVARIATE_PREFIX)
+        }
 
     @classmethod
     def _discover_cross_correlations(cls, folder_path: Path, recording_sites: list[str]) -> list[dict]:
@@ -357,6 +472,62 @@ class _GuppyInterface(BaseDataInterface):
         return entries
 
     @classmethod
+    def _discover_psth_significance(
+        cls, folder_path: Path, event_names: list[str], recording_sites: list[str]
+    ) -> list[dict]:
+        """Discover GuPPy PSTH significance files, absent unless the optional step ran.
+
+        GuPPy writes one table per comparison into ``psth_significance_output/``, named
+        ``significance_<event>_<recording_site>_<feature>_<recording_site>.h5`` for a test against zero
+        and ``significance_<event_a>_vs_<event_b>_<recording_site>_<feature>_<recording_site>.h5`` for a
+        comparison between two events. Expected names are constructed and checked on disk rather than
+        parsed, for the same reason the PSTHs are: event and recording_site names both contain
+        underscores, so ``_vs_`` is not a safe delimiter.
+
+        Every event is tested against zero; the pairs are whichever the user named, so both directions
+        are looked for. A comparison whose event has fewer than three trials is skipped by GuPPy rather
+        than written, so the entries here are a subset of the PSTHs'.
+        """
+        directory = folder_path / "psth_significance_output"
+        if not directory.is_dir():
+            return []
+
+        entries = []
+        for recording_site in recording_sites:
+            for feature in cls._TRANSIENT_FEATURES:
+                suffix = f"{recording_site}_{feature}_{recording_site}.h5"
+                for event in event_names:
+                    path = directory / f"significance_{event}_{suffix}"
+                    if path.is_file():
+                        entries.append(
+                            dict(
+                                path=path,
+                                event=event,
+                                event_b=None,
+                                recording_site=recording_site,
+                                feature=feature,
+                                paired=False,
+                            )
+                        )
+                for event_a in event_names:
+                    for event_b in event_names:
+                        if event_a == event_b:
+                            continue
+                        path = directory / f"significance_{event_a}_vs_{event_b}_{suffix}"
+                        if path.is_file():
+                            entries.append(
+                                dict(
+                                    path=path,
+                                    event=event_a,
+                                    event_b=event_b,
+                                    recording_site=recording_site,
+                                    feature=feature,
+                                    paired=True,
+                                )
+                            )
+        return entries
+
+    @classmethod
     def _discover_valid_signal_intervals(cls, folder_path: Path, recording_sites: list[str]) -> dict[str, np.ndarray]:
         """Return ``{recording_site: intervals_array}`` for each recording_site with a coords file.
 
@@ -378,15 +549,168 @@ class _GuppyInterface(BaseDataInterface):
             result[recording_site] = time_values.reshape(-1, 2)
         return result
 
+    @classmethod
+    def _discover_transient_events(
+        cls, folder_path: Path, recording_sites: list[str], transients_by_recording_site: dict[str, list[str]]
+    ) -> dict[tuple[str, str], np.ndarray]:
+        """Return ``{(event_name, recording_site): onsets}`` for GuPPy's spontaneous-mode events.
+
+        In spontaneous mode GuPPy stands its own detected transients in for external TTLs, writing each
+        recording site's transient times to ``transients_<metric>_<recording_site>.hdf5`` under key ``ts``
+        -- the shape of a corrected event file -- and building PSTHs and peak/AUC summaries around them.
+        The labels never reach ``storesList.csv``, so the events are discovered from those files.
+
+        Unlike a behavioral event, a transient train is *per recording site*: each site detects its own
+        transients. And like any other event, the onsets here are the ones that survived trial rejection,
+        so they are a subset of the detected transients in ``transientsOccurrences_<metric>_<recording_site>.csv``.
+        """
+        transient_events = {}
+        for recording_site in recording_sites:
+            for feature in transients_by_recording_site[recording_site]:
+                event_name = _TRANSIENT_EVENT_PREFIX + feature
+                onsets_path = folder_path / f"{event_name}_{recording_site}.hdf5"
+                if not onsets_path.is_file():
+                    continue
+                with h5py.File(onsets_path, "r") as onsets_file:
+                    transient_events[(event_name, recording_site)] = np.asarray(onsets_file["ts"][:], dtype=np.float64)
+        return transient_events
+
+    @classmethod
+    def _discover_binned_tables(cls, folder_path: Path, recording_sites: list[str]) -> dict[str, dict]:
+        """Return ``{recording_site: {"metrics": ..., "covariates": ..., "correlations": ...}}``.
+
+        GuPPy's optional whole-session binning writes ``binned_metrics_<recording_site>.h5``: one row per
+        fixed-width bin, indexed by bin number, with ``bin_start``, ``bin_end``, ``n_samples``,
+        ``mean_zscore``, ``mean_dff`` and a ``transient_count_<metric>`` column per metric the transient
+        detector ran on. When the session also carries a behavioral covariate, two more tables are written
+        on the same bins: ``binned_covariates_<recording_site>.h5`` (``bin_start``, ``bin_end``, a
+        ``<covariate>`` mean column and an ``n_samples_<covariate>`` column per covariate) and
+        ``covariate_correlations_<recording_site>.h5`` (one row per (metric, covariate) pair, with
+        ``metric``, ``covariate``, ``pearson_r``, ``spearman_rho`` and ``n_bins``).
+
+        The ``.csv`` twin of each table holds the same frame and is not read. The covariate tables are
+        computed from the metrics table's own bins, so they never appear without it.
+        """
+        result: dict[str, dict] = {}
+        for recording_site in recording_sites:
+            metrics_path = folder_path / f"binned_metrics_{recording_site}.h5"
+            covariates_path = folder_path / f"binned_covariates_{recording_site}.h5"
+            correlations_path = folder_path / f"covariate_correlations_{recording_site}.h5"
+            if not metrics_path.is_file():
+                assert not covariates_path.is_file() and not correlations_path.is_file(), (
+                    f"{folder_path} holds covariate tables for recording site '{recording_site}' but no "
+                    f"{metrics_path.name}; GuPPy bins a covariate onto the bins of that table, so it "
+                    f"cannot be missing."
+                )
+                continue
+            assert covariates_path.is_file() == correlations_path.is_file(), (
+                f"GuPPy writes {covariates_path.name} and {correlations_path.name} together, but only one "
+                f"of them is in {folder_path}; the covariate outputs for recording site "
+                f"'{recording_site}' are incomplete."
+            )
+            tables = dict(metrics=pandas.read_hdf(metrics_path), covariates=None, correlations=None)
+            if covariates_path.is_file():
+                tables["covariates"] = pandas.read_hdf(covariates_path)
+                tables["correlations"] = pandas.read_hdf(correlations_path)
+            result[recording_site] = tables
+        return result
+
+    @classmethod
+    def _discover_tonic_epochs(cls, folder_path: Path, recording_sites: list[str]) -> dict[str, pandas.DataFrame]:
+        """Return ``{recording_site: epochs_dataframe}`` for each recording_site with tonic outputs.
+
+        GuPPy's optional tonic analysis writes a recording site's epoch windows to
+        ``tonic_epochs_<recording_site>.csv`` (columns ``label``, ``start``, ``end``, in seconds on the
+        emitted timebase) and the mean of each trace over each window to ``tonic_<recording_site>.h5``
+        (a DataFrame under key ``df``, indexed by the epoch label, columns ``mean_zscore`` and
+        ``mean_dff``). The two are written and deleted together, so a site with one and not the other is
+        an incomplete output rather than a site without tonic analysis.
+
+        ``epochs_dataframe`` is the join of the two on the epoch label, with columns ``label``,
+        ``start``, ``end``, ``mean_zscore``, ``mean_dff``, in the order the windows were defined.
+        """
+        result = {}
+        for recording_site in recording_sites:
+            epochs_path = folder_path / f"tonic_epochs_{recording_site}.csv"
+            means_path = folder_path / f"tonic_{recording_site}.h5"
+            if not epochs_path.is_file() and not means_path.is_file():
+                continue
+            assert epochs_path.is_file() and means_path.is_file(), (
+                f"GuPPy writes {epochs_path.name} and {means_path.name} together, but only one of them is in "
+                f"{folder_path}; the tonic outputs for recording site '{recording_site}' are incomplete."
+            )
+            epochs = pandas.read_csv(epochs_path)
+            means = pandas.read_hdf(means_path)
+            assert list(epochs["label"]) == list(means.index), (
+                f"The epoch labels in {epochs_path.name} ({list(epochs['label'])}) do not match those in "
+                f"{means_path.name} ({list(means.index)}) for recording site '{recording_site}'."
+            )
+            result[recording_site] = epochs.join(means.reset_index(drop=True))
+        return result
+
+    def _read_covariate_series(self) -> dict[str, dict[str, np.ndarray]]:
+        """Return ``{covariate_name: {"timestamps": ..., "values": ...}}`` for each labeled covariate.
+
+        Step 2 carries a covariate into the run folder as an ordinary store, ``<store_id>.hdf5`` with
+        ``timestamps`` and ``data`` datasets, and leaves the scored values untouched.
+        """
+        covariate_series = {}
+        for covariate_name, store_id in self._covariate_to_store_id.items():
+            store_path = self._folder_path / f"{store_id}.hdf5"
+            assert store_path.is_file(), (
+                f"{store_path.name} not found in {self._folder_path}; storesList.csv labels store "
+                f"'{store_id}' as the covariate '{covariate_name}', so its scored values should be here."
+            )
+            with h5py.File(store_path, "r") as store_file:
+                covariate_series[covariate_name] = dict(
+                    timestamps=np.asarray(store_file["timestamps"][:], dtype=np.float64),
+                    values=np.asarray(store_file["data"][:], dtype=np.float64),
+                )
+        return covariate_series
+
+    @staticmethod
+    def _discover_analyzed_event_onsets(
+        folder_path: Path, event_names: list[str], recording_sites: list[str]
+    ) -> dict[str, np.ndarray]:
+        """Read the onsets GuPPy kept for each event from ``<event>_<recording_site>.hdf5``.
+
+        GuPPy does not build a trial for every occurrence of an event: it drops an onset that falls
+        earlier than ``abs(baselineCorrectionStart)`` into the recording, and the later of any pair
+        closer together than ``timeInterval``. The survivors are what every peri-event product is built
+        from, so they are what the events registry should reference.
+
+        The file is written per event per recording site during preprocessing and rewritten with the
+        survivors when PSTHs are computed, so its contents are the right answer either way.
+        """
+        analyzed_event_onsets = {}
+        for event_name in event_names:
+            onsets_by_recording_site = {}
+            for recording_site in recording_sites:
+                onsets_path = folder_path / f"{event_name}_{recording_site}.hdf5"
+                assert onsets_path.is_file(), (
+                    f"{onsets_path.name} not found in {folder_path}; GuPPy writes one per event per "
+                    f"recording site, so this does not look like a complete GuPPy output folder."
+                )
+                with h5py.File(onsets_path, "r") as onsets_file:
+                    onsets_by_recording_site[recording_site] = np.asarray(onsets_file["ts"][:], dtype=np.float64)
+
+            first_recording_site = recording_sites[0]
+            reference_onsets = onsets_by_recording_site[first_recording_site]
+            for recording_site, onsets in onsets_by_recording_site.items():
+                assert np.array_equal(onsets, reference_onsets), (
+                    f"GuPPy kept different onsets for event '{event_name}' on recording sites "
+                    f"'{first_recording_site}' ({reference_onsets.size}) and '{recording_site}' "
+                    f"({onsets.size}). GuppyEventsTable has one row per event and cannot represent a "
+                    f"per-recording-site onset list."
+                )
+            analyzed_event_onsets[event_name] = reference_onsets
+        return analyzed_event_onsets
+
     def _read_time_correction(self, recording_site: str) -> dict:
         time_correction_path = self._folder_path / f"timeCorrection_{recording_site}.hdf5"
         assert time_correction_path.is_file(), f"Missing {time_correction_path} for recording_site '{recording_site}'."
         with h5py.File(time_correction_path, "r") as f:
-            # `timeRecStart` is absent for some acquisition formats (e.g. headerless CSV inputs)
-            # that do not carry an absolute recording start time.
-            time_rec_start = float(f["timeRecStart"][0]) if "timeRecStart" in f else None
             return dict(
-                time_rec_start=time_rec_start,
                 timestamps=f["timestampNew"][:],
                 sampling_rate=float(f["sampling_rate"][0]),
             )
@@ -406,8 +730,14 @@ class _GuppyInterface(BaseDataInterface):
             zscore_method="zscore_method",
             artifactsRemovalMethod="artifacts_removal_method",
         )
-        bool_keys = dict(isosbestic_control="isosbestic_control", removeArtifacts="remove_artifacts")
-        int_keys = dict(bin_psth_trials="bin_psth_trials")
+        bool_keys = dict(
+            isosbestic_control="isosbestic_control",
+            removeArtifacts="remove_artifacts",
+            useTransientsAsEvents="use_transients_as_events",
+            computeBinnedMetrics="compute_binned_metrics",
+            computePsthSignificance="compute_psth_significance",
+        )
+        int_keys = dict(bin_psth_trials="bin_psth_trials", psthBootstrapResamples="psth_bootstrap_resamples")
         float_keys = dict(
             baselineWindowStart="baseline_window_start",
             baselineWindowEnd="baseline_window_end",
@@ -420,6 +750,8 @@ class _GuppyInterface(BaseDataInterface):
             timeInterval="time_interval",
             baselineCorrectionStart="baseline_correction_start",
             baselineCorrectionEnd="baseline_correction_end",
+            binnedMetricsWidth="binned_metrics_width",
+            psthSignificanceAlpha="psth_significance_alpha",
         )
 
         kwargs = dict(name="guppy_parameters")
@@ -435,6 +767,20 @@ class _GuppyInterface(BaseDataInterface):
         for json_key, attribute in float_keys.items():
             if parameters.get(json_key) is not None:
                 kwargs[attribute] = float(parameters[json_key])
+        # The comparison table is stored as two parallel lists and starts with one blank row, so a
+        # session that ran only the tests against zero leaves nothing to record. These are the pairs
+        # that were *requested*: one whose event had too few trials is skipped and appears in no product.
+        comparison_events_a = parameters.get("psthComparisonsA") or []
+        comparison_events_b = parameters.get("psthComparisonsB") or []
+        requested_pairs = [
+            (event_a.strip(), event_b.strip())
+            for event_a, event_b in zip(comparison_events_a, comparison_events_b)
+            # A blank row reaches the JSON as either "" or NaN, depending on how it was cleared.
+            if isinstance(event_a, str) and isinstance(event_b, str) and event_a.strip() and event_b.strip()
+        ]
+        if requested_pairs:
+            kwargs["psth_comparison_events_a"] = [event_a for event_a, _ in requested_pairs]
+            kwargs["psth_comparison_events_b"] = [event_b for _, event_b in requested_pairs]
         # GuPPy pads peak_startPoint/peak_endPoint to a fixed length with NaN; keep only the real windows.
         if parameters.get("peak_startPoint") is not None:
             start_points = np.asarray(parameters["peak_startPoint"], dtype=np.float64)
@@ -452,8 +798,7 @@ class _GuppyInterface(BaseDataInterface):
         return start_points[valid], end_points[valid]
 
     # ------------------------------------------------------------------ #
-    # Object-name / metadata-key builders (single source of truth shared by get_metadata and
-    # add_to_nwbfile, so the producer and consumer can never drift into a KeyError).
+    # Object-name / metadata-key builders, shared by get_metadata and add_to_nwbfile.
     # ------------------------------------------------------------------ #
     @staticmethod
     def _trace_name(recording_site: str, prefix: str) -> str:
@@ -476,15 +821,14 @@ class _GuppyInterface(BaseDataInterface):
     def _peak_auc_name(recording_site: str, feature: str) -> str:
         return f"peak_auc_{recording_site}_{feature}"
 
+    @staticmethod
+    def _psth_significance_name(recording_site: str, feature: str, paired: bool) -> str:
+        kind = "significance_paired" if paired else "significance"
+        return f"psth_{kind}_{recording_site}_{feature}"
+
     def get_metadata(self) -> DeepDict:
         """Return metadata pre-populated from the GuPPy outputs and parameters file."""
         metadata = super().get_metadata()
-
-        first_recording_site = self._recording_sites[0]
-        time_correction = self._read_time_correction(first_recording_site)
-        if time_correction["time_rec_start"] is not None:
-            session_start_datetime = datetime.fromtimestamp(time_correction["time_rec_start"], tz=timezone.utc)
-            metadata["NWBFile"]["session_start_time"] = session_start_datetime
 
         guppy_parameters = self._guppy_parameters
 
@@ -493,9 +837,8 @@ class _GuppyInterface(BaseDataInterface):
         # "tag"); the value carries the editable presentation fields -- ``name`` (defaults to the tag,
         # a stable handle add_to_nwbfile recomputes) and a generic ``description``. Descriptions omit
         # processing parameters, which live once in the GuppyParameters lab metadata. Internal join
-        # keys (recording_site, trace_basename, trace_type, recording-site pair, baseline flag, event lists) and units
-        # are NOT stored here -- editing them would break the join or contradict the data, so
-        # add_to_nwbfile derives them from self._* instead.
+        # keys (recording_site, trace_basename, trace_type, recording-site pair, baseline flag, event
+        # lists) and units are not stored here; add_to_nwbfile derives them from self._* instead.
         prefix_to_description_template = dict(
             cntrl_sig_fit="GuPPy fitted control trace for recording_site '{recording_site}'.",
             dff="GuPPy ΔF/F trace for recording_site '{recording_site}'.",
@@ -559,7 +902,7 @@ class _GuppyInterface(BaseDataInterface):
 
         metadata["FiberPhotometry"]["Guppy"][self.metadata_key] = dict(
             ProcessingModule=dict(
-                name="fiber_photometry",
+                name="guppy",
                 description=processing_module_description,
             ),
             Traces=traces_metadata,
@@ -573,7 +916,71 @@ class _GuppyInterface(BaseDataInterface):
             CrossCorrelations=cross_correlations_metadata,
             PSTHs=psths_metadata,
             PeakAUCs=peak_aucs_metadata,
+            Events=dict(
+                name=_ANALYZED_EVENTS_TABLE_NAME,
+                description=(
+                    "Behavioral event occurrences GuPPy aligned its peri-event products to, as GuPPy "
+                    "kept them: onsets it dropped while building trials are not here."
+                ),
+            ),
         )
+        guppy_metadata = metadata["FiberPhotometry"]["Guppy"][self.metadata_key]
+
+        # Whole-session binning and behavioral covariates are optional GuPPy steps, so their entries
+        # appear only for a session that ran them.
+        if self._binned_tables_by_recording_site:
+            guppy_metadata["BinnedMetrics"] = dict(
+                name="binned_metrics",
+                description="GuPPy metrics reduced to fixed-width time bins, one row per (recording_site, bin, trace_type).",
+            )
+        if self._covariate_to_store_id:
+            guppy_metadata["Covariates"] = {
+                covariate_name: dict(
+                    name=covariate_name,
+                    description=f"Scored values of the behavioral covariate '{covariate_name}'.",
+                )
+                for covariate_name in self._covariate_to_store_id
+            }
+        if any(tables["covariates"] is not None for tables in self._binned_tables_by_recording_site.values()):
+            guppy_metadata["BinnedCovariates"] = dict(
+                name="binned_covariates",
+                description=(
+                    "Behavioral covariates averaged onto the binned-metrics bins, one row per "
+                    "(recording_site, bin, covariate)."
+                ),
+            )
+            guppy_metadata["CovariateCorrelations"] = dict(
+                name="covariate_correlations",
+                description=(
+                    "Descriptive correlation of each behavioral covariate against each per-bin GuPPy " "metric."
+                ),
+            )
+        # PSTH significance is an optional GuPPy step, so its entries appear only for a session that ran
+        # it. The two comparison kinds are separate objects, so each gets its own entry.
+        if self._psth_significance:
+            psth_significance_metadata = {}
+            for recording_site, feature, paired in self._group_by_condition(
+                self._psth_significance, ("recording_site", "feature", "paired")
+            ):
+                name = self._psth_significance_name(recording_site, feature, paired)
+                against = "each other" if paired else "zero"
+                psth_significance_metadata[name] = dict(
+                    name=name,
+                    description=(
+                        f"Bootstrap significance of the '{feature}' PSTH for recording_site "
+                        f"'{recording_site}', testing event responses against {against}."
+                    ),
+                )
+            guppy_metadata["PSTHSignificance"] = psth_significance_metadata
+        # Tonic analysis is an optional GuPPy step, so its entry appears only for a session that ran it.
+        if self._tonic_epochs_by_recording_site:
+            guppy_metadata["TonicEpochs"] = dict(
+                name="tonic_epochs",
+                description=(
+                    "Mean level of each GuPPy normalized trace within each tonic epoch window, one row "
+                    "per (recording_site, epoch, trace_type)."
+                ),
+            )
         return metadata
 
     def get_metadata_schema(self) -> dict:
@@ -584,8 +991,8 @@ class _GuppyInterface(BaseDataInterface):
         # Every product family is a keyed collection: an object whose keys are the derived object names
         # mapping to a ``{name, description}`` value schema (additionalProperties), not a positional
         # array. name/description are the editable presentation surface; units and all internal join
-        # keys are derived at write time and never appear here. The two singular objects
-        # (ProcessingModule, TransientSummary) are plain ``{name, description}`` objects.
+        # keys are derived at write time and never appear here. The singular objects
+        # (ProcessingModule, TransientSummary, Events) are plain ``{name, description}`` objects.
         named_object = dict(
             type="object",
             required=["name", "description"],
@@ -605,6 +1012,7 @@ class _GuppyInterface(BaseDataInterface):
                 "ProcessingModule",
                 "Traces",
                 "TransientSummary",
+                "Events",
             ],
             properties=dict(
                 ProcessingModule=named_object,
@@ -614,6 +1022,13 @@ class _GuppyInterface(BaseDataInterface):
                 CrossCorrelations=named_collection,
                 PSTHs=named_collection,
                 PeakAUCs=named_collection,
+                PSTHSignificance=named_collection,
+                Events=named_object,
+                BinnedMetrics=named_object,
+                Covariates=named_collection,
+                BinnedCovariates=named_object,
+                CovariateCorrelations=named_object,
+                TonicEpochs=named_object,
             ),
         )
         return metadata_schema
@@ -636,17 +1051,24 @@ class _GuppyInterface(BaseDataInterface):
         """
         Add GuPPy-derived fiber photometry products to an NWBFile as ndx-guppy neurodata types.
 
-        Builds the ``GuppyParameters`` lab metadata, the slim ``GuppyRecordingSitesTable`` and
+        Builds the ``GuppyParameters`` lab metadata, the ``GuppyRecordingSitesTable`` and
         ``GuppyEventsTable`` registries, the per-product objects (traces, transients, summary,
-        cross-correlation, PSTH, peak/AUC) each referencing its registry rows, and the
-        ``GuppyValidSignalIntervals`` object. Products are written on the timestamps GuPPy emits.
+        cross-correlation, PSTH, peak/AUC, binned metrics, binned covariates, covariate correlations) each
+        referencing its registry rows, the ``GuppyValidSignalIntervals`` object, and, where GuPPy's optional
+        tonic analysis and PSTH significance testing were run, the ``GuppyTonicEpochs`` and
+        ``GuppyPSTHSignificance`` objects. Products are written on the timestamps
+        GuPPy emits. Each behavioral covariate's scored values are written as a ``TimeSeries`` that the two
+        covariate products reference.
 
         This method takes **no linkage arguments**: it writes only what the GuPPy output defines. The
-        registries are slim (names only), and their outward links -- the recording sites' acquisition
-        ``fiber_photometry_table_region`` and the events' ``events`` reference into the merged
-        ``EventsTable`` -- are populated afterwards by a converter that owns the acquisition and events
-        tables (see ``TDTFiberPhotometryGuppyConverter``). Run standalone, the file is valid without
-        those two links.
+        events registry references an ``EventsTable`` of GuPPy's own analyzed onsets, written into
+        ``nwbfile.events``. A spontaneous-mode event is registered once per recording site, since each
+        site stood its own detected transients in for the TTLs. The recording sites registry's acquisition
+        ``fiber_photometry_table_region`` is the one link the GuPPy output cannot supply: a converter that
+        owns the acquisition authors that registry before this method runs and the table found in the
+        processing module is reused as it stands (see ``GuppyConverter``); failing that, the link is
+        resolved against the ``FiberPhotometryTable`` the ``nwbfile`` already holds, and standalone the
+        registry is written link-free.
 
         Parameters
         ----------
@@ -678,18 +1100,65 @@ class _GuppyInterface(BaseDataInterface):
         # Session-wide typed parameters.
         self._add_guppy_parameters_to_nwbfile(ndx_guppy=ndx_guppy, nwbfile=nwbfile)
 
-        # Registries: recording_site and event identity, referenced by every product. Slim by design --
-        # the converter enriches them with the fiber / events links afterwards.
-        recording_sites_table = self._add_guppy_recording_sites_table_to_nwbfile(
-            ndx_guppy=ndx_guppy, processing_module=processing_module
+        # Registries: recording_site and event identity, referenced by every product. The recording
+        # sites are reused as-is if a converter already authored them (with their fiber link), else
+        # linked into the FiberPhotometryTable the nwbfile holds, else written link-free; the events
+        # always reference GuPPy's own onsets, written here.
+        recording_sites_table = self._get_or_add_guppy_recording_sites_table(
+            ndx_guppy=ndx_guppy, nwbfile=nwbfile, processing_module=processing_module
         )
-        events_table = self._add_guppy_events_table_to_nwbfile(ndx_guppy=ndx_guppy, processing_module=processing_module)
+        events_table = self._add_guppy_events_table_to_nwbfile(
+            ndx_guppy=ndx_guppy,
+            nwbfile=nwbfile,
+            processing_module=processing_module,
+            events_metadata=guppy_metadata["Events"],
+        )
         # Valid-signal (artifact-free) intervals: one object, one row per interval, referencing its site.
         self._add_guppy_valid_signal_intervals_to_nwbfile(
             ndx_guppy=ndx_guppy,
             processing_module=processing_module,
             recording_sites_table=recording_sites_table,
         )
+        # Behavioral covariates: the scored series first, since the binned covariates and the
+        # correlations reference it, then the whole-session binned tables.
+        covariate_name_to_series = {}
+        if self._covariate_to_store_id:
+            covariate_name_to_series = self._add_guppy_covariate_series_to_nwbfile(
+                processing_module=processing_module,
+                covariates_metadata=guppy_metadata["Covariates"],
+            )
+        if self._binned_tables_by_recording_site:
+            self._add_guppy_binned_metrics_to_nwbfile(
+                ndx_guppy=ndx_guppy,
+                processing_module=processing_module,
+                recording_sites_table=recording_sites_table,
+                binned_metrics_metadata=guppy_metadata["BinnedMetrics"],
+            )
+        if any(tables["covariates"] is not None for tables in self._binned_tables_by_recording_site.values()):
+            self._add_guppy_binned_covariates_to_nwbfile(
+                ndx_guppy=ndx_guppy,
+                processing_module=processing_module,
+                recording_sites_table=recording_sites_table,
+                covariate_name_to_series=covariate_name_to_series,
+                binned_covariates_metadata=guppy_metadata["BinnedCovariates"],
+            )
+            self._add_guppy_covariate_correlations_to_nwbfile(
+                ndx_guppy=ndx_guppy,
+                processing_module=processing_module,
+                recording_sites_table=recording_sites_table,
+                covariate_name_to_series=covariate_name_to_series,
+                correlations_metadata=guppy_metadata["CovariateCorrelations"],
+            )
+
+        # Tonic epoch means: one object, one row per (recording_site, epoch, trace_type).
+        if self._tonic_epochs_by_recording_site:
+            self._add_guppy_tonic_epochs_to_nwbfile(
+                ndx_guppy=ndx_guppy,
+                processing_module=processing_module,
+                recording_sites_table=recording_sites_table,
+                tonic_epochs_metadata=guppy_metadata["TonicEpochs"],
+            )
+
         # Derived continuous traces.
         self._add_guppy_derived_response_series_to_nwbfile(
             ndx_guppy=ndx_guppy,
@@ -752,6 +1221,94 @@ class _GuppyInterface(BaseDataInterface):
             bin_basis=bin_basis,
         )
 
+        # PSTH significance: one GuppyPSTHSignificance per (recording_site, trace_type, comparison kind),
+        # written only for a session that ran that optional GuPPy step.
+        if self._psth_significance:
+            self._add_guppy_psth_significance_to_nwbfile(
+                ndx_guppy=ndx_guppy,
+                processing_module=processing_module,
+                psth_significance_metadata=guppy_metadata["PSTHSignificance"],
+                recording_sites_table=recording_sites_table,
+                events_table=events_table,
+            )
+
+    def _add_guppy_psth_significance_to_nwbfile(
+        self,
+        *,
+        ndx_guppy,
+        processing_module,
+        psth_significance_metadata: dict,
+        recording_sites_table,
+        events_table,
+    ) -> None:
+        """Add one GuppyPSTHSignificance per (recording_site, trace_type, comparison kind).
+
+        Each comparison's table is one row per timepoint over the PSTH's own peri-event axis, so the
+        comparisons of one condition stack into ``(num_samples, num_comparisons)`` matrices. The two
+        comparison kinds are separate objects: the event-versus-event one additionally carries the
+        ``event_b`` region and ``num_trials_b``, which is what distinguishes it, mirroring the ``n_b``
+        column that distinguishes the two kinds on disk.
+        """
+        significance_groups = self._group_by_condition(self._psth_significance, ("recording_site", "feature", "paired"))
+        for (recording_site, feature, paired), entries in significance_groups.items():
+            entry_metadata = psth_significance_metadata[self._psth_significance_name(recording_site, feature, paired)]
+
+            axis = None
+            estimate_columns: list[np.ndarray] = []
+            lower_columns: list[np.ndarray] = []
+            upper_columns: list[np.ndarray] = []
+            significant_columns: list[np.ndarray] = []
+            num_trials: list[int] = []
+            num_trials_b: list[int] = []
+            event_names: list[str] = []
+            event_b_names: list[str] = []
+
+            for entry in entries:
+                dataframe = pandas.read_hdf(entry["path"])
+
+                comparison_axis = dataframe["timestamps"].to_numpy(dtype=np.float64)
+                if axis is None:
+                    axis = comparison_axis
+                else:
+                    assert np.array_equal(axis, comparison_axis), (
+                        f"GuPPy significance files for one condition must share an identical peri-event "
+                        f"axis to be concatenated across comparisons, but '{entry['path'].name}' differs."
+                    )
+
+                estimate_columns.append(dataframe["estimate"].to_numpy(dtype=np.float64))
+                lower_columns.append(dataframe["ci_lower"].to_numpy(dtype=np.float64))
+                upper_columns.append(dataframe["ci_upper"].to_numpy(dtype=np.float64))
+                significant_columns.append(dataframe["significant"].to_numpy(dtype=bool))
+                # alpha and n are constant down a file's rows.
+                num_trials.append(int(dataframe["n"].iloc[0]))
+                event_names.append(entry["event"])
+                if paired:
+                    num_trials_b.append(int(dataframe["n_b"].iloc[0]))
+                    event_b_names.append(entry["event_b"])
+
+            significance_kwargs = dict(
+                name=entry_metadata["name"],
+                description=entry_metadata["description"],
+                trace_type=feature,
+                unit="a.u.",
+                recording_site=self._recording_site_reference(recording_sites_table, [recording_site]),
+                event=self._event_reference(events_table, event_names, recording_site=recording_site),
+                peri_event_time=axis,
+                estimate=np.stack(estimate_columns, axis=1),
+                confidence_interval_lower=np.stack(lower_columns, axis=1),
+                confidence_interval_upper=np.stack(upper_columns, axis=1),
+                significant=np.stack(significant_columns, axis=1),
+                num_trials=np.array(num_trials, dtype=np.int32),
+            )
+            if paired:
+                significance_kwargs.update(
+                    event_b=self._event_reference(
+                        events_table, event_b_names, name="event_b", recording_site=recording_site
+                    ),
+                    num_trials_b=np.array(num_trials_b, dtype=np.int32),
+                )
+            processing_module.add(ndx_guppy.GuppyPSTHSignificance(**significance_kwargs))
+
     def _recording_site_reference(self, recording_sites_table, recording_site_names: list[str]) -> DynamicTableRegion:
         """Build a DynamicTableRegion into the GuppyRecordingSitesTable for the given recording_site name(s)."""
         recording_site_to_row_index = {
@@ -764,12 +1321,46 @@ class _GuppyInterface(BaseDataInterface):
             table=recording_sites_table,
         )
 
-    def _event_reference(self, events_table, event_names: list[str], name: str = "event") -> DynamicTableRegion:
-        """Build a DynamicTableRegion into the GuppyEventsTable for the given event name(s)."""
-        event_to_row_index = {event_name: index for index, event_name in enumerate(self._event_names)}
+    def _event_row_indices(self) -> dict[object, int]:
+        """Map each registry key to its row index: an event name, or (event name, recording site).
+
+        A behavioral event is one row, since every recording site saw the same occurrences. A
+        spontaneous-mode event is one row *per recording site*, since each site stood its own detected
+        transients in for the TTLs, so those rows are keyed by the pair.
+        """
+        row_indices: dict[object, int] = {event_name: index for index, event_name in enumerate(self._event_names)}
+        for event_name, recording_site in self._transient_event_keys():
+            row_indices[(event_name, recording_site)] = len(row_indices)
+        return row_indices
+
+    def _transient_event_keys(self) -> list[tuple[str, str]]:
+        """The (event name, recording site) pairs of the spontaneous-mode rows, in registry row order."""
+        return [
+            (event_name, recording_site)
+            for event_name in self._transient_event_names
+            for recording_site in self._recording_sites
+            if (event_name, recording_site) in self._transient_events
+        ]
+
+    def _event_reference(
+        self, events_table, event_names: list[str], name: str = "event", recording_site: str | None = None
+    ) -> DynamicTableRegion:
+        """Build a DynamicTableRegion into the GuppyEventsTable for the given event name(s).
+
+        ``recording_site`` selects which row a spontaneous-mode event resolves to, since those rows are
+        per recording site; it is unused for a behavioral event.
+        """
+        row_indices = self._event_row_indices()
         return DynamicTableRegion(
             name=name,
-            data=[event_to_row_index[event_name] for event_name in event_names],
+            data=[
+                (
+                    row_indices[(event_name, recording_site)]
+                    if event_name in self._transient_event_names
+                    else row_indices[event_name]
+                )
+                for event_name in event_names
+            ],
             description="GuPPy behavioral event(s) this object's columns were aligned to.",
             table=events_table,
         )
@@ -984,9 +1575,14 @@ class _GuppyInterface(BaseDataInterface):
                 baseline_corrected=bool(baseline_corrected),
                 unit="a.u.",
                 recording_site=self._recording_site_reference(recording_sites_table, [recording_site]),
-                event=self._event_reference(events_table, concatenated["trial_event_names"]),
+                event=self._event_reference(
+                    events_table, concatenated["trial_event_names"], recording_site=recording_site
+                ),
                 summary_event=self._event_reference(
-                    events_table, concatenated["summary_event_names"], name="summary_event"
+                    events_table,
+                    concatenated["summary_event_names"],
+                    name="summary_event",
+                    recording_site=recording_site,
                 ),
                 peri_event_time=concatenated["axis"],
                 trial_onset_times=concatenated["trial_onset_times"],
@@ -998,7 +1594,12 @@ class _GuppyInterface(BaseDataInterface):
                 psth_kwargs.update(
                     bin_edges=concatenated["bin_edges"],
                     bin_edges__bin_basis=bin_basis,
-                    bin_event=self._event_reference(events_table, concatenated["bin_event_names"], name="bin_event"),
+                    bin_event=self._event_reference(
+                        events_table,
+                        concatenated["bin_event_names"],
+                        name="bin_event",
+                        recording_site=recording_site,
+                    ),
                     binned_mean=concatenated["binned_value"],
                     binned_error=concatenated["binned_error"],
                 )
@@ -1035,21 +1636,90 @@ class _GuppyInterface(BaseDataInterface):
             )
             processing_module.add(peak_auc)
 
-    def _add_guppy_recording_sites_table_to_nwbfile(self, *, ndx_guppy, processing_module):
-        """Build and add the slim GuppyRecordingSitesTable: one row per recording site, name only.
+    def _get_or_add_guppy_recording_sites_table(self, *, ndx_guppy, nwbfile, processing_module):
+        """Reuse the GuppyRecordingSitesTable a converter authored, link into the acquisition, or build minimal.
 
-        The optional ``fiber_photometry_table_region`` link into the acquisition FiberPhotometryTable is
-        populated afterwards by a converter that owns that table; the interface does not know the
-        acquisition row layout, so it writes only the recording-site identities here.
+        Three cases, in order. A converter that owns the acquisition FiberPhotometryTable builds this
+        registry itself, with the ``fiber_photometry_table_region`` link populated, before this interface
+        runs; that table is reused as it stands. Failing that, an ``nwbfile`` that already holds the
+        acquisition answers for the link itself -- GuPPy's store ids address its response series, each of
+        which states the table rows its columns were recorded on -- so the registry is built linked into
+        the table already there. With neither, the interface does not know the acquisition row layout and
+        builds the minimal version: one row per recording site, name only.
         """
+        existing_table = processing_module.data_interfaces.get(_RECORDING_SITES_TABLE_NAME)
+        if existing_table is not None:
+            # Every product references its recording site by position in self._recording_sites, so a
+            # registry whose rows sit in a different order would silently repoint every reference.
+            assert list(existing_table["recording_site"].data) == self._recording_sites, (
+                f"The existing '{_RECORDING_SITES_TABLE_NAME}' registry lists "
+                f"{list(existing_table['recording_site'].data)}, which does not match the GuPPy recording "
+                f"sites {self._recording_sites}; the products' registry references would point at the "
+                "wrong rows."
+            )
+            return existing_table
+
+        recording_site_to_rows = self._resolve_recording_site_rows(nwbfile=nwbfile)
+        is_linked = recording_site_to_rows is not None
+        table_kwargs = (
+            {"target_tables": {"fiber_photometry_table_region": get_fiber_photometry_table(nwbfile=nwbfile)}}
+            if is_linked
+            else {}
+        )
+
         recording_sites_table = ndx_guppy.GuppyRecordingSitesTable(
-            name="recording_sites",
-            description="GuPPy recording sites (one row per recording site).",
+            name=_RECORDING_SITES_TABLE_NAME,
+            description=_RECORDING_SITES_TABLE_DESCRIPTION,
+            **table_kwargs,
         )
         for recording_site in self._recording_sites:
-            recording_sites_table.add_row(recording_site=recording_site)
+            row_kwargs = {"fiber_photometry_table_region": recording_site_to_rows[recording_site]} if is_linked else {}
+            recording_sites_table.add_row(recording_site=recording_site, **row_kwargs)
         processing_module.add(recording_sites_table)
         return recording_sites_table
+
+    def _resolve_recording_site_rows(self, *, nwbfile) -> dict[str, list[int]] | None:
+        """Map each recording site to its FiberPhotometryTable rows, or ``None`` if the file cannot say.
+
+        Every store GuPPy listed must resolve to a row -- naming a response series that states which
+        table rows its columns were recorded on -- since a registry linking only some of the sites would
+        describe the acquisition as sparser than it is. A file holding no FiberPhotometryTable at all is
+        the ordinary standalone case and is not warned about; one that holds a table GuPPy's stores do
+        not address is a mismatch worth reporting, under whichever of the two causes applies.
+        """
+        if get_fiber_photometry_table(nwbfile=nwbfile) is None:
+            return None
+
+        store_ids = [store_id for stores in self._recording_site_to_store_ids.values() for store_id in stores.values()]
+        store_id_to_row = resolve_acquisition_store_rows(nwbfile=nwbfile, store_ids=store_ids)
+        stores_naming_no_series = [store_id for store_id in store_ids if store_id not in store_id_to_row]
+        stores_without_region = [store_id for store_id, row in store_id_to_row.items() if row is None]
+        if stores_naming_no_series:
+            warnings.warn(
+                f"GuPPy acquisition store(s) {stores_naming_no_series} name no FiberPhotometryResponseSeries "
+                f"in the NWB file, so the '{_RECORDING_SITES_TABLE_NAME}' registry is written without links "
+                f"to the FiberPhotometryTable. A multi-channel series is addressed as "
+                f"'<series_name>_<column_index>'.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if stores_without_region:
+            warnings.warn(
+                f"GuPPy acquisition store(s) {stores_without_region} name a FiberPhotometryResponseSeries "
+                f"that carries no 'fiber_photometry_table_region', so the file states no "
+                f"FiberPhotometryTable row for them and the '{_RECORDING_SITES_TABLE_NAME}' registry is "
+                f"written without links to the table.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if stores_naming_no_series or stores_without_region:
+            return None
+
+        recording_site_to_rows: dict[str, list[int]] = {}
+        for recording_site in self._recording_sites:
+            stores = self._recording_site_to_store_ids[recording_site]
+            recording_site_to_rows[recording_site] = sorted({store_id_to_row[store_id] for store_id in stores.values()})
+        return recording_site_to_rows
 
     def _add_guppy_valid_signal_intervals_to_nwbfile(
         self,
@@ -1091,21 +1761,272 @@ class _GuppyInterface(BaseDataInterface):
         processing_module.add(valid_signal_intervals)
         return valid_signal_intervals
 
-    def _add_guppy_events_table_to_nwbfile(self, *, ndx_guppy, processing_module):
-        """Build and add the slim GuppyEventsTable: one row per event GuPPy aligned to, name only.
+    def _add_guppy_covariate_series_to_nwbfile(self, *, processing_module, covariates_metadata: dict) -> dict:
+        """Add each behavioral covariate's scored values as a TimeSeries, and return them by covariate name.
 
-        The optional ``events`` link -- a ragged DynamicTableRegion into the merged pynwb EventsTable's
-        occurrence rows -- is populated afterwards by a converter that merges every event type into one
-        EventsTable; the interface writes only the event identities here.
+        The scores are what the experimenter supplied, carried through unchanged, and they are written on
+        their own timestamps because a covariate is scored at whatever cadence suits it. The series is the
+        covariate's identity: the binned-covariate and correlation tables reference it rather than
+        re-spelling its name.
         """
-        events_table = ndx_guppy.GuppyEventsTable(
-            name="events",
-            description="GuPPy behavioral events (one row per event GuPPy aligned to).",
+        covariate_series = self._read_covariate_series()
+        name_to_series = {}
+        for covariate_name, series in covariate_series.items():
+            entry = covariates_metadata[covariate_name]
+            time_series = TimeSeries(
+                name=entry["name"],
+                description=entry["description"],
+                data=series["values"],
+                unit="a.u.",
+                timestamps=series["timestamps"],
+            )
+            processing_module.add(time_series)
+            name_to_series[covariate_name] = time_series
+        return name_to_series
+
+    def _add_guppy_binned_metrics_to_nwbfile(
+        self, *, ndx_guppy, processing_module, recording_sites_table, binned_metrics_metadata: dict
+    ):
+        """Build and add the GuppyBinnedMetrics object over the bins GuPPy tiled each recording site into.
+
+        One row per (recording_site, bin, trace_type), carrying that trace's mean over the bin and, where
+        the transient detector ran on it, the number of transients the bin holds. ``n_samples`` is a
+        property of the bin, so it repeats across the bin's rows.
+        """
+        recording_site_to_row_index = {
+            recording_site: index for index, recording_site in enumerate(self._recording_sites)
+        }
+        binned_metrics = ndx_guppy.GuppyBinnedMetrics(
+            name=binned_metrics_metadata["name"],
+            description=binned_metrics_metadata["description"],
+            target_tables={"recording_site": recording_sites_table},
         )
-        for event_name in self._event_names:
-            events_table.add_row(event_name=event_name)
+        for recording_site in self._recording_sites:
+            tables = self._binned_tables_by_recording_site.get(recording_site)
+            if tables is None:
+                continue
+            for row in tables["metrics"].itertuples(index=False):
+                for trace_type in self._TRANSIENT_FEATURES:
+                    count_column = f"transient_count_{trace_type}"
+                    binned_metrics.add_interval(
+                        start_time=float(row.bin_start),
+                        stop_time=float(row.bin_end),
+                        trace_type=trace_type,
+                        mean=float(getattr(row, _TRACE_TYPE_TO_MEAN_COLUMN[trace_type])),
+                        transient_count=float(getattr(row, count_column, np.nan)),
+                        n_samples=int(row.n_samples),
+                        recording_site=recording_site_to_row_index[recording_site],
+                    )
+        processing_module.add(binned_metrics)
+        return binned_metrics
+
+    def _add_guppy_binned_covariates_to_nwbfile(
+        self,
+        *,
+        ndx_guppy,
+        processing_module,
+        recording_sites_table,
+        covariate_name_to_series: dict,
+        binned_covariates_metadata: dict,
+    ):
+        """Build and add the GuppyBinnedCovariates object, one row per (recording_site, bin, covariate).
+
+        The bins are the ones the metrics table was reduced to, so the two tables line up row for row on
+        their windows.
+        """
+        recording_site_to_row_index = {
+            recording_site: index for index, recording_site in enumerate(self._recording_sites)
+        }
+        binned_covariates = ndx_guppy.GuppyBinnedCovariates(
+            name=binned_covariates_metadata["name"],
+            description=binned_covariates_metadata["description"],
+            target_tables={"recording_site": recording_sites_table},
+        )
+        for recording_site in self._recording_sites:
+            tables = self._binned_tables_by_recording_site.get(recording_site)
+            if tables is None or tables["covariates"] is None:
+                continue
+            for row in tables["covariates"].itertuples(index=False):
+                for covariate_name in self._covariate_to_store_id:
+                    binned_covariates.add_interval(
+                        start_time=float(row.bin_start),
+                        stop_time=float(row.bin_end),
+                        covariate=covariate_name_to_series[covariate_name],
+                        mean=float(getattr(row, covariate_name)),
+                        n_samples=int(getattr(row, f"n_samples_{covariate_name}")),
+                        recording_site=recording_site_to_row_index[recording_site],
+                    )
+        processing_module.add(binned_covariates)
+        return binned_covariates
+
+    def _add_guppy_covariate_correlations_to_nwbfile(
+        self,
+        *,
+        ndx_guppy,
+        processing_module,
+        recording_sites_table,
+        covariate_name_to_series: dict,
+        correlations_metadata: dict,
+    ):
+        """Build and add the GuppyCovariateCorrelations table.
+
+        GuPPy names the correlated quantity with one composite string (``mean_zscore``,
+        ``transient_count_dff``); it is split into the trace_type and metric it stands for, so a row names
+        exactly the GuppyBinnedMetrics rows the coefficients were computed over.
+        """
+        recording_site_to_row_index = {
+            recording_site: index for index, recording_site in enumerate(self._recording_sites)
+        }
+        correlations_table = ndx_guppy.GuppyCovariateCorrelations(
+            name=correlations_metadata["name"],
+            description=correlations_metadata["description"],
+            target_tables={"recording_site": recording_sites_table},
+        )
+        for recording_site in self._recording_sites:
+            tables = self._binned_tables_by_recording_site.get(recording_site)
+            if tables is None or tables["correlations"] is None:
+                continue
+            for row in tables["correlations"].itertuples(index=False):
+                assert row.metric in _BINNED_METRIC_COLUMN_TO_TRACE_TYPE_AND_METRIC, (
+                    f"covariate_correlations_{recording_site}.h5 correlates the covariate "
+                    f"'{row.covariate}' against '{row.metric}', which is not a binned-metrics column this "
+                    f"interface knows: expected one of "
+                    f"{sorted(_BINNED_METRIC_COLUMN_TO_TRACE_TYPE_AND_METRIC)}."
+                )
+                trace_type, metric = _BINNED_METRIC_COLUMN_TO_TRACE_TYPE_AND_METRIC[row.metric]
+                correlations_table.add_row(
+                    recording_site=recording_site_to_row_index[recording_site],
+                    trace_type=trace_type,
+                    metric=metric,
+                    covariate=covariate_name_to_series[row.covariate],
+                    pearson_r=float(row.pearson_r),
+                    spearman_rho=float(row.spearman_rho),
+                    n_bins=int(row.n_bins),
+                )
+        processing_module.add(correlations_table)
+        return correlations_table
+
+    def _add_guppy_tonic_epochs_to_nwbfile(
+        self,
+        *,
+        ndx_guppy,
+        processing_module,
+        recording_sites_table,
+        tonic_epochs_metadata: dict,
+    ):
+        """Build and add the GuppyTonicEpochs object over the epochs the tonic analysis defined.
+
+        One row per (recording_site, epoch, trace_type): the window is the epoch GuPPy averaged over,
+        on its emitted recording timebase, and ``mean`` is that trace's mean over the window. Each row
+        references its recording site via a DynamicTableRegion into the GuppyRecordingSitesTable.
+        """
+        recording_site_to_row_index = {
+            recording_site: index for index, recording_site in enumerate(self._recording_sites)
+        }
+        tonic_epochs = ndx_guppy.GuppyTonicEpochs(
+            name=tonic_epochs_metadata["name"],
+            description=tonic_epochs_metadata["description"],
+            target_tables={"recording_site": recording_sites_table},
+        )
+        for recording_site in self._recording_sites:
+            epochs = self._tonic_epochs_by_recording_site.get(recording_site)
+            if epochs is None:
+                continue
+            for epoch in epochs.itertuples(index=False):
+                for trace_type in self._TRANSIENT_FEATURES:
+                    tonic_epochs.add_interval(
+                        start_time=float(epoch.start),
+                        stop_time=float(epoch.end),
+                        label=str(epoch.label),
+                        trace_type=trace_type,
+                        mean=float(getattr(epoch, _TRACE_TYPE_TO_MEAN_COLUMN[trace_type])),
+                        recording_site=recording_site_to_row_index[recording_site],
+                    )
+        processing_module.add(tonic_epochs)
+        return tonic_epochs
+
+    def _add_guppy_events_table_to_nwbfile(self, *, ndx_guppy, nwbfile, processing_module, events_metadata: dict):
+        """Build the GuppyEventsTable registry over GuPPy's own analyzed onsets.
+
+        The occurrences the registry references are GuPPy's own output, written into ``nwbfile.events``
+        by :meth:`_add_guppy_events_to_nwbfile`, so the registry is the same whether this interface runs
+        standalone or inside ``GuppyConverter``, and every peri-event product reaches the occurrences it
+        was built from either way.
+
+        A spontaneous-mode event gets one row per recording site rather than one row: GuPPy stood each
+        site's own detected transients in for the TTLs, so the sites do not share a train.
+
+        A session that analyzed no event at all is the one registry without a link target: it has no rows,
+        and there is nothing to write.
+        """
+        registry_keys = list(self._event_names) + self._transient_event_keys()
+        if not registry_keys:
+            events_table = ndx_guppy.GuppyEventsTable(
+                name=_EVENTS_TABLE_NAME,
+                description=_EVENTS_TABLE_DESCRIPTION,
+            )
+            processing_module.add(events_table)
+            return events_table
+
+        target_events_table, registry_key_to_rows = self._add_guppy_events_to_nwbfile(
+            nwbfile=nwbfile, events_metadata=events_metadata
+        )
+        events_table = ndx_guppy.GuppyEventsTable(
+            name=_EVENTS_TABLE_NAME,
+            description=_EVENTS_TABLE_DESCRIPTION,
+            target_tables={"events": target_events_table},
+        )
+        for registry_key in registry_keys:
+            event_name = registry_key if isinstance(registry_key, str) else registry_key[0]
+            events_table.add_row(event_name=event_name, events=registry_key_to_rows[registry_key])
         processing_module.add(events_table)
         return events_table
+
+    def _add_guppy_events_to_nwbfile(
+        self, *, nwbfile, events_metadata: dict
+    ) -> tuple[EventsTable, dict[str, list[int]]]:
+        """Write the onsets GuPPy analyzed as a core EventsTable, and return it with each event's rows.
+
+        The rows are the onsets GuPPy kept: the ones it dropped while building trials are not here, and
+        neither are durations, which GuPPy does not record. A file that also holds the raw events those
+        onsets came from keeps them as they are, in their own tables.
+
+        The table is laid out the way one an events interface wrote is: chronological, with an
+        ``event_type`` column naming each row's event.
+        """
+        table_name = events_metadata["name"]
+        assert nwbfile.events is None or table_name not in nwbfile.events, (
+            f"The NWB file already holds an events table named '{table_name}', which is where GuPPy's "
+            f"analyzed onsets would be written. Set a different name in "
+            f"metadata['FiberPhotometry']['Guppy']['{self.metadata_key}']['Events']['name']."
+        )
+
+        # Chronological across every event, which is the order a table an events interface wrote is in.
+        # The sort is stable, so onsets shared by two events keep the registry's row order. A
+        # spontaneous-mode event contributes one train per recording site, keyed by the pair.
+        registry_keys = list(self._event_names) + self._transient_event_keys()
+        rows = [
+            (float(onset), registry_key)
+            for registry_key in registry_keys
+            for onset in (
+                self._analyzed_event_onsets[registry_key]
+                if isinstance(registry_key, str)
+                else self._transient_events[registry_key]
+            )
+        ]
+        rows.sort(key=lambda row: row[0])
+
+        events_table = EventsTable(name=table_name, description=events_metadata["description"])
+        events_table.add_column(name="event_type", description="The event type of each event.")
+        registry_key_to_rows: dict[object, list[int]] = {registry_key: [] for registry_key in registry_keys}
+        for row_index, (onset, registry_key) in enumerate(rows):
+            # The recording site is part of a spontaneous-mode event's type here, since two sites'
+            # transient trains are different events sharing a name; the registry keeps them structured.
+            event_type = registry_key if isinstance(registry_key, str) else "_".join(registry_key)
+            events_table.add_row(timestamp=onset, event_type=event_type)
+            registry_key_to_rows[registry_key].append(row_index)
+        nwbfile.add_events_table(events_table)
+        return events_table, registry_key_to_rows
 
     def _add_guppy_transient_summary_table_to_nwbfile(
         self, *, ndx_guppy, processing_module, recording_sites_table, summary_metadata: dict
@@ -1166,10 +2087,10 @@ class _GuppyInterface(BaseDataInterface):
 
         ``key_fields`` are the entry fields that define a condition (everything except the event),
         e.g. ``("recording_site", "feature", "baseline_corrected")`` for PSTHs. Within each group the entries
-        are ordered by their event's position in ``self._event_names`` so concatenation across events
-        is deterministic.
+        are ordered by their event's position in ``self._product_event_names`` -- the behavioral events
+        followed by any spontaneous-mode ones -- so concatenation across events is deterministic.
         """
-        event_order = {event_name: index for index, event_name in enumerate(self._event_names)}
+        event_order = {event_name: index for index, event_name in enumerate(self._product_event_names)}
         groups: dict[tuple, list[dict]] = {}
         for entry in entries:
             key = tuple(entry[field] for field in key_fields)
@@ -1253,9 +2174,7 @@ class _GuppyInterface(BaseDataInterface):
 
         Bin value columns match ``bin_(<start>-<stop>)`` (integer ``bin_(0-3)`` for "# of trials" binning
         or decimal ``bin_(0.0-2.0)`` for "Time (min)" binning) and their errors ``bin_err_(<start>-<stop>)``.
-        The original column labels are reused verbatim for lookup -- and the error column is derived by
-        swapping the ``bin_(`` prefix for ``bin_err_(`` -- so both label formats resolve without
-        reconstructing the name from the parsed edges. Bin edges are assumed non-negative.
+        Bin edges are assumed non-negative.
         """
         bin_columns = sorted(
             (float(match.group(1)), float(match.group(2)), match.string)
@@ -1285,8 +2204,7 @@ class _GuppyInterface(BaseDataInterface):
         ``trial_rows`` is a sorted list of ``(onset_time: float, row_label)``; ``bin_rows`` a sorted list
         of ``(start: float, stop: float, row_label)``; ``mean_row`` the single ``..._mean`` label. Bin rows
         are session-id-prefixed labels like ``..._bin_(0-3)`` (integer "# of trials" binning) or
-        ``..._bin_(0.0-2.0)`` (decimal "Time (min)" binning); both are routed to ``bin_rows`` rather than
-        crashing the trial-onset parse. Bin edges are assumed non-negative.
+        ``..._bin_(0.0-2.0)`` (decimal "Time (min)" binning). Bin edges are assumed non-negative.
         """
         mean_row = None
         trial_rows: list[tuple[float, str]] = []
@@ -1384,8 +2302,10 @@ class _GuppyInterface(BaseDataInterface):
             trace_type=trace_type,
             unit="a.u.",
             recording_site=self._recording_site_reference(recording_sites_table, [recording_site]),
-            event=self._event_reference(events_table, trial_event_names),
-            summary_event=self._event_reference(events_table, summary_event_names, name="summary_event"),
+            event=self._event_reference(events_table, trial_event_names, recording_site=recording_site),
+            summary_event=self._event_reference(
+                events_table, summary_event_names, name="summary_event", recording_site=recording_site
+            ),
             window_start=window_start,
             window_stop=window_stop,
             trial_onset_times=np.array(trial_onset_times, dtype=np.float64),
@@ -1400,7 +2320,9 @@ class _GuppyInterface(BaseDataInterface):
             kwargs.update(
                 bin_edges=np.concatenate(bin_edges_blocks, axis=0),
                 bin_edges__bin_basis=bin_basis,
-                bin_event=self._event_reference(events_table, bin_event_names, name="bin_event"),
+                bin_event=self._event_reference(
+                    events_table, bin_event_names, name="bin_event", recording_site=recording_site
+                ),
                 binned_peak_positive=np.concatenate(binned_peak_positive_blocks, axis=1),
                 binned_peak_negative=np.concatenate(binned_peak_negative_blocks, axis=1),
                 binned_area_under_curve=np.concatenate(binned_area_blocks, axis=1),
