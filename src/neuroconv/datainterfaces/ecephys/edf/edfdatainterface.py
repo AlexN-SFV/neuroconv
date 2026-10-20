@@ -1,5 +1,6 @@
 import re
 import warnings
+import weakref
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -417,6 +418,12 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         if metadata_key is None:
             self.metadata_key = "edf_recording"
 
+        # The NWB files this file's annotations and runs tables have been written to, each with the names of
+        # the tables. split_by_offset makes shallow copies, so every partition of this file shares this
+        # mapping and nothing else does: it tells a partition the file's rows are already written. Keyed
+        # weakly by the NWBFile itself, not by id(), which Python reuses once a file is discarded.
+        self._intervals_written = weakref.WeakKeyDictionary()
+
         self.edf_header = self._edf_header
 
         # On the EDF+D path channels_to_skip was already honored while reading.
@@ -603,11 +610,19 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
         Several EDF files written into one NWB file through a ``ConverterPipe`` share the table, with a
         ``source_file`` column saying which file each row came from, so no file's rows are lost. The
-        sub-interfaces from ``split_by_offset`` all come from one file and carry the same rows, so when
-        every row is already in the table under this file's name, none is written again. A table of that
-        name with other columns came from something else and is left alone, with a warning.
+        sub-interfaces from ``split_by_offset`` all come from one file and carry the same rows, so only the
+        first of them to reach this NWB file writes them. A table of that name with other columns came from
+        something else and is left alone, with a warning.
         """
         from pynwb.epoch import TimeIntervals
+
+        # Partitions are recognised by the state they share, not by comparing rows: two recordings with the
+        # same file name and the same record layout have identical runs rows, and both must be kept.
+        tables_written = self._intervals_written.setdefault(nwbfile, set())
+        if name in tables_written:
+            return
+        # Marked before writing, so a clash with a foreign table warns once per file, not once per partition.
+        tables_written.add(name)
 
         source_file = Path(self.source_data["file_path"]).name
         columns = dict(columns, source_file="Name of the EDF file the row was read from.")
@@ -629,13 +644,6 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
                     UserWarning,
                     stacklevel=4,
                 )
-                return
-            # Whole rows are compared, source_file among them, rather than the name alone, so a second
-            # file that merely shares this one's name — the same name in another directory — still has
-            # its rows written.
-            column_names = ["start_time", "stop_time", *columns]
-            existing = set(zip(*(table[column_name][:] for column_name in column_names)))
-            if {tuple(row[column_name] for column_name in column_names) for row in rows} <= existing:
                 return
 
         for row in rows:

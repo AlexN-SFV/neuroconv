@@ -1447,17 +1447,62 @@ class TestEDFDRecordingInterface:
         assert list(annotations["source_file"]) == ["first.edf", "first.edf", "second.edf"]
         assert list(runs["source_file"]) == ["first.edf"] * 3 + ["second.edf"] * 2
 
-    def test_same_file_name_in_two_directories_keeps_both_files_rows(self, tmp_path, digital_data):
-        """Rows are deduplicated by content, not by file name, which two directories can share."""
-        (tmp_path / "a").mkdir()
-        (tmp_path / "b").mkdir()
-        first, second = _write_two_files(
-            tmp_path, digital_data, first_name=Path("a") / "eeg.edf", second_name=Path("b") / "eeg.edf"
-        )
-        annotations, runs = _convert_through_pipe(tmp_path, [first, second])
+    def test_same_name_and_layout_in_two_directories_keeps_both_files_rows(self, tmp_path, digital_data):
+        """
+        Two recordings that differ only in their data keep both files' rows.
 
+        A device writing fixed-length blocks with fixed gaps gives every recording the same runs rows, and
+        BIDS gives them the same file name, so nothing in the rows tells them apart. Comparing rows to
+        recognise split_by_offset's partitions dropped the second file's runs here.
+        """
+        interfaces = []
+        for subject in ("sub-01", "sub-02"):
+            (tmp_path / subject).mkdir()
+            path = write_edf(
+                tmp_path / subject / "eeg.edf",
+                record_onsets=GAPPED_ONSETS,
+                data=digital_data if subject == "sub-01" else -digital_data,
+                annotations=[(2.5, None, "Marker: 601")],
+            )
+            interfaces.append(EDFRecordingInterface(file_path=path, metadata_key=subject.replace("-", "")))
+        annotations, runs = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(annotations["label"]) == ["Marker: 601"] * 2
+        assert list(runs["run_index"]) == [0, 1, 2] * 2
+        assert list(runs["source_file"]) == ["eeg.edf"] * 6
+
+    def test_one_interface_converted_into_two_nwb_files_writes_both(self, tmp_path, digital_data):
+        """What the partitions share is per NWB file; a stub run first must not empty the full run's tables."""
+        path = write_edf(
+            tmp_path / "d.edf", record_onsets=GAPPED_ONSETS, data=digital_data, annotations=[(2.5, None, "x")]
+        )
+        interface = EDFRecordingInterface(file_path=path)
+        for name in ("stub.nwb", "full.nwb"):
+            interface.run_conversion(
+                nwbfile_path=str(tmp_path / name), metadata=_metadata(interface), overwrite=True, stub_test=True
+            )
+            with NWBHDF5IO(str(tmp_path / name), "r") as io:
+                nwbfile = io.read()
+                assert list(nwbfile.intervals["annotations"].to_dataframe()["label"]) == ["x"]
+                assert list(nwbfile.intervals["runs"].to_dataframe()["run_index"]) == [0, 1, 2]
+
+    def test_a_file_appended_on_disk_joins_the_tables(self, tmp_path, digital_data):
+        """The tables read back from HDF5 are extended, and their string columns read back as str."""
+        first, second = _write_two_files(tmp_path, digital_data)
+        nwbfile_path = str(tmp_path / "appended.nwb")
+        for interface, kwargs in ((first, dict(overwrite=True)), (second, dict(append_on_disk_nwbfile=True))):
+            metadata = _metadata(interface)
+            metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = f"{interface.metadata_key}_series"
+            interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, **kwargs)
+
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            annotations = nwbfile.intervals["annotations"].to_dataframe()
+            runs = nwbfile.intervals["runs"].to_dataframe()
         assert list(annotations["label"]) == ["first: marker", "first: seizure", "second: marker"]
-        assert list(annotations["source_file"]) == ["eeg.edf"] * 3
+        assert list(annotations["source_file"]) == ["first.edf", "first.edf", "second.edf"]
+        assert all(isinstance(value, str) for value in [*annotations["label"], *annotations["source_file"]])
+        assert list(runs["source_file"]) == ["first.edf"] * 3 + ["second.edf"] * 2
         assert list(runs["run_index"]) == [0, 1, 2, 0, 1]
 
     def test_foreign_table_of_the_same_name_is_left_alone_with_a_warning(self, tmp_path, digital_data):
@@ -1488,17 +1533,17 @@ class TestEDFDRecordingInterface:
 SECOND_FILE_ONSETS = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0]
 
 
-def _write_two_files(tmp_path, digital_data, *, first_name="first.edf", second_name="second.edf", **kwargs):
+def _write_two_files(tmp_path, digital_data, **kwargs):
     """Two EDF+D files with different channels, run layouts and annotations, as interfaces with distinct keys."""
     first_path = write_edf(
-        tmp_path / first_name,
+        tmp_path / "first.edf",
         record_onsets=GAPPED_ONSETS,
         data=digital_data,
         annotations=[(2.5, None, "first: marker"), (10.25, 1.5, "first: seizure")],
         **kwargs,
     )
     second_path = write_edf(
-        tmp_path / second_name,
+        tmp_path / "second.edf",
         record_onsets=SECOND_FILE_ONSETS,
         data=digital_data,
         channel_names=["x0", "x1", "x2"],
