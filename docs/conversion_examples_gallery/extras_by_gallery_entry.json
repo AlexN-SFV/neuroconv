@@ -141,6 +141,9 @@
   "recording/blackrock.rst": {
     "extra": "blackrock"
   },
+  "recording/brainvision.rst": {
+    "extra": "brainvision"
+  },
   "recording/brukervoltagerecording.rst": {
     "extra": null,
     "note": "Converts on a base install, so there is no extra to name"

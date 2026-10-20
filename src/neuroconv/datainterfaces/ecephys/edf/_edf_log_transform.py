@@ -21,6 +21,8 @@ from typing import NamedTuple
 import numpy as np
 from pydantic import FilePath
 
+from .._voltage_units import unit_to_microvolts as _unit_to_microvolts
+
 # The physical dimension EDF+ reserves to mark a logarithmically transformed signal.
 _LOG_TRANSFORM_DIMENSION = "FILTERED"
 
@@ -41,31 +43,6 @@ _PREFILTER_WIDTH = 80
 # Widths of the per-signal fields preceding each of the two this module needs.
 _WIDTHS_BEFORE_DIMENSION = (16, 80)  # label, transducer
 _WIDTHS_BEFORE_PREFILTER = (16, 80, 8, 8, 8, 8, 8)  # ... dimension, physical/digital min and max
-
-# Voltage units, written out rather than taken from utils.units.get_conversion_from_unit, whose contract
-# is volts and whose fallback for an unrecognized unit is 1.0 — "assume volts" — which here would scale a
-# decoded signal by 1e6. These are exact powers of ten.
-_VOLTAGE_UNIT_TO_MICROVOLTS = {
-    "V": 1e6,
-    "VOLT": 1e6,
-    "VOLTS": 1e6,
-    "MV": 1e3,
-    "MVOLT": 1e3,
-    "MVOLTS": 1e3,
-    "MILLIVOLT": 1e3,
-    "MILLIVOLTS": 1e3,
-    "UV": 1.0,
-    "UVOLT": 1.0,
-    "UVOLTS": 1.0,
-    "MICROV": 1.0,
-    "MICROVOLT": 1.0,
-    "MICROVOLTS": 1.0,
-    "NV": 1e-3,
-    "NVOLT": 1e-3,
-    "NVOLTS": 1e-3,
-    "NANOVOLT": 1e-3,
-    "NANOVOLTS": 1e-3,
-}
 
 
 class LogTransform(NamedTuple):
@@ -234,17 +211,6 @@ def read_log_transforms(file_path: FilePath, channels_to_skip: list | None = Non
         if transform is not None:
             transforms[label] = transform
     return transforms
-
-
-def _unit_to_microvolts(unit: str) -> float | None:
-    """
-    Factor converting a decoded signal's original unit to microvolts, or None if it is not a voltage.
-
-    Returning None rather than assuming here lets the caller aggregate, so a file whose transformed
-    channels share an odd unit warns once rather than once per channel.
-    """
-    normalized = str(unit or "").strip().replace("µ", "u").replace("μ", "u").upper()
-    return _VOLTAGE_UNIT_TO_MICROVOLTS.get(normalized)
 
 
 def _warn_assumed_microvolts(unit_to_channel_names: dict) -> None:
