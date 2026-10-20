@@ -469,7 +469,8 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
         file_path: FilePath,
         *,
         verbose: bool = False,
-        es_key: str = "ElectricalSeries",
+        es_key: str | None = None,
+        metadata_key: str | None = None,
         import_bids_subject_metadata: bool = False,
     ):
         """
@@ -483,7 +484,10 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
         verbose : bool, default: False
             Allows verbose.
         es_key : str, default: "ElectricalSeries"
-            Key for the ElectricalSeries metadata.
+            Deprecated. Use ``metadata_key`` instead.
+        metadata_key : str, optional
+            Key that indexes this interface's entries in the dict-based metadata. Defaults to
+            ``"eeglab_recording"``.
         import_bids_subject_metadata : bool, default: False
             If True, subject demographics (sex, age) are read from the ``EEG.BIDS.pInfo`` struct — the
             per-subject copy of ``participants.tsv`` that ``pop_importbids`` stamps into the ``.set``.
@@ -491,7 +495,9 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
             the dataset-root ``participants.tsv``, better read by a BIDS-aware layer. ``subject_id`` is
             always taken from ``EEG.subject`` regardless of this flag.
         """
-        super().__init__(file_path=file_path, verbose=verbose, es_key=es_key)
+        super().__init__(file_path=file_path, verbose=verbose, es_key=es_key, metadata_key=metadata_key)
+        if metadata_key is None:
+            self.metadata_key = "eeglab_recording"
         self._import_bids_subject_metadata = import_bids_subject_metadata
 
     @property
@@ -499,10 +505,13 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
         """Whether the EEGLAB dataset is epoched (``EEG.trials > 1``)."""
         return self.recording_extractor.get_num_segments() > 1
 
-    def get_metadata(self) -> DeepDict:
-        metadata = super().get_metadata()
-        if self.es_key is not None:
-            metadata["Ecephys"][self.es_key]["description"] = "EEG data imported from an EEGLAB dataset."
+    def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
+        metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
+        description = "EEG data imported from an EEGLAB dataset."
+        if use_new_metadata_format:
+            metadata["Ecephys"]["ElectricalSeries"][self.metadata_key]["description"] = description
+        elif self.es_key is not None:
+            metadata["Ecephys"][self.es_key]["description"] = description
 
         # subject_id comes from EEG.subject; BIDS.pInfo demographics only when opted in (see __init__).
         info = getattr(self, "_eeglab_subject_info", dict())
@@ -565,10 +574,17 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
         # For epoched data the recording is multi-segment, so the ecephys writer emits one
         # ElectricalSeries per epoch and appends the segment index to the series name. Marking the name
         # with "Epoch" lets downstream consumers recognize the epoch split (vs. e.g. an offset split).
-        if self.is_epoched and self.es_key is not None:
+        if self.is_epoched:
+            from ....tools.spikeinterface.spikeinterface import _is_dict_based_metadata
+
             metadata = copy.deepcopy(metadata)
-            series_metadata = metadata["Ecephys"].setdefault(self.es_key, dict())
-            series_metadata["name"] = f"{series_metadata.get('name', self.es_key)}Epoch"
+            if _is_dict_based_metadata(metadata):
+                registry = metadata["Ecephys"].setdefault("ElectricalSeries", dict())
+                series_metadata = registry.setdefault(self.metadata_key, dict())
+                series_metadata["name"] = f"{series_metadata.get('name', 'ElectricalSeries')}Epoch"
+            elif self.es_key is not None:
+                series_metadata = metadata["Ecephys"].setdefault(self.es_key, dict())
+                series_metadata["name"] = f"{series_metadata.get('name', self.es_key)}Epoch"
 
         super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
 

@@ -223,7 +223,10 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
             # of ``metadata_key`` (the dict key). No description: a generic one carries no information, so it
             # is left to the interfaces, which can say something the source actually supports, and otherwise
             # to the write pipeline.
-            metadata["Ecephys"] = {"ElectricalSeries": {self.metadata_key: dict(name="ElectricalSeries")}}
+            # A sub-interface from split_by_offset carries its own name, so the partitions of one recording
+            # do not collide when they are written into one file.
+            series_name = getattr(self, "_split_series_name", None) or "ElectricalSeries"
+            metadata["Ecephys"] = {"ElectricalSeries": {self.metadata_key: dict(name=series_name)}}
 
             return metadata
 
@@ -612,8 +615,9 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
         restricted (via :py:meth:`~spikeinterface.core.BaseRecording.select_channels`) to the channels
         that share that offset.
 
-        Each sub-interface is given a distinct ``es_key`` (``{es_key}0``, ``{es_key}1``, ...), so the
-        returned interfaces can be combined in a :py:class:`~neuroconv.nwbconverter.ConverterPipe` to
+        Each sub-interface is given a distinct ``metadata_key`` (``{metadata_key}0``, ``{metadata_key}1``,
+        ...) and writes a distinctly named series (``ElectricalSeries0``, ``ElectricalSeries1``, ...), so
+        the returned interfaces can be combined in a :py:class:`~neuroconv.nwbconverter.ConverterPipe` to
         write one ``ElectricalSeries`` per offset into a single NWB file, or converted individually.
 
         Returns
@@ -638,7 +642,13 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
                 channel_ids=offset_to_channel_ids[offset]
             )
             sub_interface._number_of_segments = sub_interface.recording_extractor.get_num_segments()
-            sub_interface.es_key = f"{self.es_key}{index:0{width}}"
+            suffix = f"{index:0{width}}"
+            sub_interface.es_key = f"{self.es_key}{suffix}"
+            # The dict-based metadata keys each series by metadata_key and names it independently of the
+            # key, so both get the suffix: distinct keys so a ConverterPipe keeps every partition's entry,
+            # and distinct names so the series do not collide in the file.
+            sub_interface.metadata_key = f"{self.metadata_key}{suffix}"
+            sub_interface._split_series_name = f"ElectricalSeries{suffix}"
             sub_interfaces.append(sub_interface)
 
         return sub_interfaces

@@ -416,7 +416,7 @@ class TestEDFDReader:
         for segment_index, (first_record, number_of_records, t_start) in enumerate(EXPECTED_RUNS):
             expected = _expected_run_traces(digital_data, first_record, number_of_records)
             np.testing.assert_array_equal(recording.get_traces(segment_index=segment_index), expected)
-            assert recording._recording_segments[segment_index].t_start == t_start
+            assert recording.get_start_time(segment_index=segment_index) == t_start
 
     @pytest.mark.parametrize("start_frame, end_frame", [(0, 1), (3, 7), (9, 11), (10, 20), (37, 40), (0, 40)])
     def test_chunked_reads_match_full_read(self, tmp_path, digital_data, start_frame, end_frame):
@@ -1176,7 +1176,7 @@ class TestEDFDRecordingInterface:
         interface = EDFRecordingInterface(file_path=path)
         metadata = interface.get_metadata()
         assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 9, 16, 12, 35, 13)
-        assert metadata["NWBFile"]["experimenter"] == "Tech7"
+        assert metadata["NWBFile"]["experimenter"] == ["Tech7"]
         assert metadata["Subject"]["subject_id"] == "MCH-42"
         assert metadata["Subject"]["date_of_birth"] == datetime(1951, 5, 2)
         # Schema-required fields are filled in so the metadata stays valid.

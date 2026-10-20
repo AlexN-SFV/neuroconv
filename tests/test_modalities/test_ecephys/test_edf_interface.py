@@ -373,5 +373,5 @@ class TestEDFSubjectMetadata:
         interface = EDFRecordingInterface(file_path=path)
 
         metadata = interface.get_metadata()
-        assert metadata["NWBFile"]["experimenter"] == "Tech7"
+        assert metadata["NWBFile"]["experimenter"] == ["Tech7"]
         assert metadata["NWBFile"]["session_start_time"] is not None

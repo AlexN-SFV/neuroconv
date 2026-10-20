@@ -52,7 +52,9 @@ def _read_bdf_recording(file_path: FilePath, channels_to_skip: list | None = Non
         channel_names = [str(reader.getLabel(index)).strip() for index in range(number_of_signals)]
         sampling_frequencies = [float(reader.getSampleFrequency(index)) for index in range(number_of_signals)]
 
-        keep = [index for index, name in enumerate(channel_names) if not (channels_to_skip and name in channels_to_skip)]
+        keep = [
+            index for index, name in enumerate(channel_names) if not (channels_to_skip and name in channels_to_skip)
+        ]
         if not keep:
             raise ValueError("No channels remain after applying channels_to_skip.")
 
@@ -153,7 +155,8 @@ class BDFRecordingInterface(BaseRecordingExtractorInterface):
         file_path: FilePath,
         *,
         verbose: bool = False,
-        es_key: str = "ElectricalSeries",
+        es_key: str | None = None,
+        metadata_key: str | None = None,
         channels_to_skip: list | None = None,
     ):
         """
@@ -166,17 +169,26 @@ class BDFRecordingInterface(BaseRecordingExtractorInterface):
         verbose : bool, default: False
             Allows verbose.
         es_key : str, default: "ElectricalSeries"
-            Key for the ElectricalSeries metadata.
+            Deprecated. Use ``metadata_key`` instead.
+        metadata_key : str, optional
+            Key that indexes this interface's entries in the dict-based metadata. Defaults to
+            ``"bdf_recording"``.
         channels_to_skip : list, default: None
             Channels to skip when adding the data to the nwbfile. Use this to drop non-neural channels
             such as the BioSemi ``Status`` trigger channel, or channels sampled at a different rate.
         """
         super().__init__(
-            file_path=file_path, verbose=verbose, es_key=es_key, channels_to_skip=channels_to_skip
+            file_path=file_path,
+            verbose=verbose,
+            es_key=es_key,
+            metadata_key=metadata_key,
+            channels_to_skip=channels_to_skip,
         )
+        if metadata_key is None:
+            self.metadata_key = "bdf_recording"
 
-    def get_metadata(self) -> DeepDict:
-        metadata = super().get_metadata()
+    def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
+        metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
 
         header = getattr(self, "_bdf_header", dict())
         nwbfile_metadata = dict(session_start_time=header.get("startdate"), experimenter=header.get("technician"))
@@ -187,9 +199,7 @@ class BDFRecordingInterface(BaseRecordingExtractorInterface):
 
         subject_metadata = {
             key: value
-            for key, value in dict(
-                subject_id=header.get("patientcode"), date_of_birth=header.get("birthdate")
-            ).items()
+            for key, value in dict(subject_id=header.get("patientcode"), date_of_birth=header.get("birthdate")).items()
             if value
         }
         if subject_metadata:
