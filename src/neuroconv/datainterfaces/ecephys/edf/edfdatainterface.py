@@ -189,10 +189,39 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         source_schema["properties"]["file_path"]["description"] = "Path to the .edf file."
         return source_schema
 
+    @classmethod
+    def get_stream_names(cls, file_path: FilePath) -> list[str]:
+        """
+        Get the names of the streams available in an EDF file.
+
+        A stream is a set of channels that share a sampling rate, so a file that sampled some of
+        its signals at a different rate than the rest carries more than one. Streams apply to plain
+        EDF and ``EDF+C`` files only; neuroconv's ``EDF+D`` reader has no notion of them.
+
+        Parameters
+        ----------
+        file_path : FilePath
+            Path to the EDF file
+
+        Returns
+        -------
+        list of str
+            List of the stream names in the EDF file
+        """
+        from spikeinterface.extractors.extractor_classes import EDFRecordingExtractor
+
+        stream_names, _ = EDFRecordingExtractor.get_streams(file_path=file_path)
+        return stream_names
+
     @staticmethod
     def get_available_channel_ids(file_path: FilePath) -> list:
         """
         Get all available channel names from an EDF file.
+
+        The names span the whole file. A file that sampled some of its signals at a different rate
+        than the rest holds them in separate streams, and an interface reads one stream at a time, so
+        the channels of the stream it holds are a subset of these. They are read from the file's
+        header, so this works on a file with more than one stream.
 
         Parameters
         ----------
@@ -207,26 +236,25 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         from ._edfd_reader import is_discontinuous_edf, read_edf_header
 
         if is_discontinuous_edf(file_path=file_path):
-            # SpikeInterface cannot open EDF+D at all; read the labels out of the header directly. The
-            # annotations signals are left out, as on the SpikeInterface path — they are never data
+            # pyedflib cannot open EDF+D at all; read the labels out of the header directly. The
+            # annotations signals are left out, as pyedflib leaves them out — they are never data
             # channels, so listing them would only invite a pointless channels_to_skip entry.
             with open(file_path, "rb") as file:
                 header = read_edf_header(file)
             annotations_indices = set(header.annotations_signal_indices)
             return [label for index, label in enumerate(header.labels) if index not in annotations_indices]
 
-        from spikeinterface.extractors import read_edf
+        from pyedflib import EdfReader
 
-        # Load the recording to inspect channels
-        recording = read_edf(file_path=file_path, all_annotations=True, use_names_as_ids=True)
+        edf_reader = EdfReader(str(file_path))
+        try:
+            channel_names = edf_reader.getSignalLabels()
+        finally:
+            # EDFlib refuses to open a file it already has open, so the handle is released here
+            # rather than left to garbage collection.
+            edf_reader.close()
 
-        # Get all channel IDs
-        channel_ids = recording.get_channel_ids()
-
-        # Clean up to avoid dangling references
-        del recording
-
-        return channel_ids.tolist()
+        return channel_names
 
     @classmethod
     def get_extractor_class(cls):
@@ -251,6 +279,13 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         # path below does; so only EDF+D is routed away.
         self._is_discontinuous = is_discontinuous_edf(file_path=interface_kwargs["file_path"])
         if self._is_discontinuous:
+            if interface_kwargs.get("stream_name") is not None:
+                raise ValueError(
+                    "stream_name applies only to plain EDF and EDF+C files, which are read by SpikeInterface. "
+                    f"'{interface_kwargs['file_path']}' is a discontinuous EDF+ (EDF+D) file, read by neuroconv's "
+                    "own reader, which has no streams; drop the channels at another sampling rate with "
+                    "channels_to_skip instead."
+                )
             # channels_to_skip is applied while reading here rather than afterwards, so a channel at a
             # differing sampling rate — or a transformed signal whose parameters are unreadable — can be
             # dropped before it stops the conversion.
@@ -284,6 +319,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         self.extractor_kwargs = interface_kwargs.copy()
         self.extractor_kwargs.pop("verbose", None)
         self.extractor_kwargs.pop("es_key", None)
+        self.extractor_kwargs.pop("metadata_key", None)
         self.extractor_kwargs.pop("channels_to_skip")
         self.extractor_kwargs["all_annotations"] = True
         self.extractor_kwargs["use_names_as_ids"] = True
@@ -335,15 +371,17 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
     def __init__(
         self,
         file_path: FilePath,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         verbose: bool = False,
-        es_key: str = "ElectricalSeries",
+        es_key: str | None = None,
+        metadata_key: str | None = None,
         channels_to_skip: list | None = None,
+        stream_name: str | None = None,
     ):
         """
         Load and prepare data for EDF.
-        Currently, only continuous EDF+ files (EDF+C) and original EDF files (EDF) are supported
 
+        Plain EDF, continuous EDF+ (``EDF+C``) and discontinuous EDF+ (``EDF+D``) files are supported.
 
         Parameters
         ----------
@@ -353,41 +391,31 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             Allows verbose.
         es_key : str, default: "ElectricalSeries"
             Key for the ElectricalSeries metadata
+        metadata_key : str, optional
+            Key that indexes this interface's entries in the dict-based metadata. Defaults to
+            ``"edf_recording"``.
         channels_to_skip : list, default: None
             Channels to skip when adding the data to the nwbfile. These parameter can be used to skip non-neural
             channels that are present in the EDF file.
+        stream_name : str, optional
+            Name of the stream to read, as returned by ``get_stream_names``. A file that sampled some
+            of its signals at a different rate than the rest carries more than one stream and cannot
+            be read without naming one, since a single recording holds a single sampling rate. Not
+            accepted for ``EDF+D`` files; use ``channels_to_skip`` there.
 
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "verbose",
-                "es_key",
-                "channels_to_skip",
-            ]
-            num_positional_args_before_args = 1  # file_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to EDFRecordingInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            verbose = positional_values.get("verbose", verbose)
-            es_key = positional_values.get("es_key", es_key)
-            channels_to_skip = positional_values.get("channels_to_skip", channels_to_skip)
+        super().__init__(
+            file_path=file_path,
+            verbose=verbose,
+            es_key=es_key,
+            metadata_key=metadata_key,
+            channels_to_skip=channels_to_skip,
+            stream_name=stream_name,
+        )
 
-        super().__init__(file_path=file_path, verbose=verbose, es_key=es_key, channels_to_skip=channels_to_skip)
+        if metadata_key is None:
+            self.metadata_key = "edf_recording"
+
         self.edf_header = self._edf_header
 
         # On the EDF+D path channels_to_skip was already honored while reading.
@@ -395,9 +423,11 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             self.recording_extractor = self.recording_extractor.remove_channels(remove_channel_ids=channels_to_skip)
 
     def extract_nwb_file_metadata(self) -> dict:
+        # The header names a single technician, while experimenter is a list of names.
+        technician = self.edf_header["technician"]
         nwbfile_metadata = dict(
             session_start_time=self.edf_header["startdate"],
-            experimenter=self.edf_header["technician"],
+            experimenter=[technician] if technician else None,
         )
 
         # Filter empty values
@@ -488,6 +518,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         stub_test: bool = False,
         write_as: Literal["raw", "lfp", "processed"] | None = None,
         parent_container: Literal["acquisition", "processing/LFP", "processing/FilteredEphys"] = "acquisition",
+        data_representation: Literal["digital_counts", "physical_units"] = "digital_counts",
         write_electrical_series: bool = True,
         iterator_type: str | None = "v2",
         iterator_options: dict | None = None,
@@ -515,6 +546,10 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             Deprecated alias for ``parent_container``.
         parent_container : {'acquisition', 'processing/LFP', 'processing/FilteredEphys'}
             The NWB container the electrical series is written to.
+        data_representation : {'digital_counts', 'physical_units'}, default='digital_counts'
+            Whether to store raw integer samples with the gain and offset alongside, or float physical
+            values. ``'physical_units'`` is the one that holds channels with heterogeneous offsets in a
+            single series. See ``BaseRecordingExtractorInterface.add_to_nwbfile``.
         write_electrical_series : bool, default: True
             If False, only device, electrode groups and electrodes are written.
         iterator_type : {'v2', None}, default: 'v2'
@@ -537,6 +572,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         conversion_options = dict(
             stub_test=stub_test,
             parent_container=parent_container,
+            data_representation=data_representation,
             write_electrical_series=write_electrical_series,
             iterator_type=iterator_type,
             iterator_options=iterator_options,
@@ -628,8 +664,8 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         """
         return dict(self._log_transforms)
 
-    def get_metadata(self) -> DeepDict:
-        metadata = super().get_metadata()
+    def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
+        metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
         nwbfile_metadata = self.extract_nwb_file_metadata()
         metadata["NWBFile"].update(nwbfile_metadata)
 

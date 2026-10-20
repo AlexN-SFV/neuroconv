@@ -26,6 +26,7 @@ class TestCSVFiberPhotometryInterface(FiberPhotometryInterfaceTestMixin):
     """Single-file CSV fiber photometry interface (one FiberPhotometryResponseSeries)."""
 
     data_interface_cls = CSVFiberPhotometryInterface
+    expected_temporal_alignment_keys = ("calcium_signal",)
     conversion_options = dict(stub_test=True, stub_samples=STUB_SAMPLES)
 
     # First STUB_SAMPLES samples of the "data" column, written from the bare scaffold metadata.
@@ -35,8 +36,8 @@ class TestCSVFiberPhotometryInterface(FiberPhotometryInterfaceTestMixin):
     expected_rate = SAMPLING_RATE
 
     @pytest.fixture(scope="class", autouse=True)
-    def setup_test(self, request, tmp_path_factory):
-        cls = request.cls
+    @classmethod
+    def setup_test(cls, tmp_path_factory):
         data_directory = tmp_path_factory.mktemp("csv_fiber_photometry")
         signal_path = data_directory / "Sample_Signal_Channel.csv"
         pd.DataFrame({"timestamps": TIMESTAMPS, "data": SIGNAL_DATA}).to_csv(signal_path, index=False)

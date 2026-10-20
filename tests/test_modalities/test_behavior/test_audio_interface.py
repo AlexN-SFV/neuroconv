@@ -43,10 +43,10 @@ class TestAudioInterface(AudioInterfaceTestMixin):
     data_interface_cls = AudioInterface
 
     @pytest.fixture(scope="class", autouse=True)
-    def setup_test(self, request, tmp_path_factory):
-        cls = request.cls
+    @classmethod
+    def setup_test(cls, tmp_path_factory):
 
-        cls.session_start_time = datetime.now(tz=gettz(name="US/Pacific"))
+        cls.session_start_time = datetime.now(tz=gettz(name="Asia/Tokyo"))
         cls.num_frames = int(1e7)
         cls.num_audio_files = 3
         cls.sampling_rate = 500
@@ -178,6 +178,24 @@ class TestAudioInterface(AudioInterfaceTestMixin):
             relative_starting_time + aligned_starting_time for relative_starting_time in relative_starting_times
         ]
         assert_array_equal(fresh_interface._segment_starting_times, expecting_starting_times)
+
+    def test_set_aligned_starting_time_accumulates_for_a_single_file(self):
+        # A shift, so a second call moves the one file again rather than raising.
+        fresh_interface = AudioInterface(file_paths=self.file_paths[:1])
+        fresh_interface.set_aligned_starting_time(aligned_starting_time=1.0)
+        fresh_interface.set_aligned_starting_time(aligned_starting_time=0.5)
+        assert_array_equal(fresh_interface._segment_starting_times, [1.5])
+
+    def test_set_aligned_starting_time_after_segment_starting_times_for_a_single_file(self):
+        fresh_interface = AudioInterface(file_paths=self.file_paths[:1])
+        fresh_interface.set_aligned_segment_starting_times(aligned_segment_starting_times=[2.0])
+        fresh_interface.set_aligned_starting_time(aligned_starting_time=0.5)
+        assert_array_equal(fresh_interface._segment_starting_times, [2.5])
+
+    def test_set_aligned_starting_time_requires_segment_starting_times_for_several_files(self):
+        fresh_interface = AudioInterface(file_paths=self.file_paths[:2])
+        with pytest.raises(ValueError, match="There are no segment starting times to shift"):
+            fresh_interface.set_aligned_starting_time(aligned_starting_time=1.0)
 
     def test_run_conversion(self):
         file_paths = self.nwb_converter.data_interface_objects["Audio"].source_data["file_paths"]

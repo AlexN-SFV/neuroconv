@@ -1,6 +1,5 @@
 """DataInterfaces for SpikeGLX."""
 
-import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -56,10 +55,11 @@ class SpikeGLXRecordingInterface(BaseRecordingExtractorInterface):
     def __init__(
         self,
         folder_path: DirectoryPath,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         stream_id: str,
         verbose: bool = False,
         es_key: str | None = None,
+        metadata_key: str | None = None,
     ):
         """
         Parameters
@@ -73,35 +73,10 @@ class SpikeGLXRecordingInterface(BaseRecordingExtractorInterface):
             Whether to output verbose text.
         es_key : str, optional
             The key to access the metadata of the ElectricalSeries.
+        metadata_key : str, optional
+            Key that indexes this interface's entries in the dict-based metadata. Defaults to
+            ``"spikeglx_{probe}_{band}"`` (e.g. ``"spikeglx_imec0_ap"``).
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "stream_id",
-                "verbose",
-                "es_key",
-            ]
-            num_positional_args_before_args = 1  # folder_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to SpikeGLXRecordingInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            stream_id = positional_values.get("stream_id", stream_id)
-            verbose = positional_values.get("verbose", verbose)
-            es_key = positional_values.get("es_key", es_key)
 
         if stream_id == "nidq":
             raise ValueError(
@@ -121,16 +96,19 @@ class SpikeGLXRecordingInterface(BaseRecordingExtractorInterface):
             folder_path=folder_path,
             verbose=verbose,
             es_key=es_key,
+            metadata_key=metadata_key,
         )
 
         signal_info_key = (0, self.stream_id)  # Key format is (segment_index, stream_id)
         self._signals_info_dict = self.recording_extractor.neo_reader.signals_info_dict[signal_info_key]
         self.meta = self._signals_info_dict["meta"]
 
+        stream_kind = self._signals_info_dict["stream_kind"]  # ap or lf
+        probe_id = self._signals_info_dict["device"]  # imec0, imec1, etc.
+
         if es_key is None:
-            stream_kind = self._signals_info_dict["stream_kind"]  # ap or lf
             stream_kind_caps = stream_kind.upper()
-            device = self._signals_info_dict["device"].capitalize()  # imec0, imec1, etc.
+            device = probe_id.capitalize()  # Imec0, Imec1, etc.
 
             electrical_series_name = f"ElectricalSeries{stream_kind_caps}"
 
@@ -141,6 +119,19 @@ class SpikeGLXRecordingInterface(BaseRecordingExtractorInterface):
                 electrical_series_name += f"{device}"
 
             self.es_key = electrical_series_name
+            # The interface owns the ElectricalSeries object name, disambiguated per stream/probe and
+            # computed here independently of ``es_key`` (legacy, to be removed).
+            self._series_name = electrical_series_name
+        else:
+            # A user-supplied ``es_key`` (legacy) is still honored as the name override until it is removed.
+            self._series_name = es_key
+
+        # ``metadata_key`` is the dict key, a snake_case handle rather than the CamelCase series name. SpikeGLX
+        # yields several streams per session (one per probe and band), so it is derived from the stream handle
+        # the format itself provides. The base seeded it from the (None) ``es_key``, so set it here unless the
+        # user passed one explicitly.
+        if metadata_key is None:
+            self.metadata_key = f"spikeglx_{probe_id}_{stream_kind}"  # e.g. spikeglx_imec0_ap
 
         # Set electrode properties from probe information
         probe = self.recording_extractor.get_probe()
@@ -207,8 +198,103 @@ class SpikeGLXRecordingInterface(BaseRecordingExtractorInterface):
         if "inter_sample_shift" in self.recording_extractor.get_property_keys():
             self.recording_extractor.delete_property(key="inter_sample_shift")
 
-    def get_metadata(self) -> DeepDict:
-        metadata = super().get_metadata()
+    def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
+        from ....tools.spikeinterface.spikeinterface import _get_probe_device_metadata
+
+        if use_new_metadata_format:
+            metadata = super().get_metadata(use_new_metadata_format=True)
+            # State the series name here, where the metadata is produced: it is the interface's own,
+            # stream/probe-disambiguated name, and it is independent of ``metadata_key`` (the dict key), so
+            # re-keying an entry never renames the written series.
+            metadata["Ecephys"]["ElectricalSeries"][self.metadata_key]["name"] = self._series_name
+
+            session_start_time = self._get_session_start_time()
+            if session_start_time:
+                metadata["NWBFile"]["session_start_time"] = session_start_time
+
+            # The probe identity is split across the two registries: the model carries what names the
+            # catalogue entry (``manufacturer`` and ``model_number``), the device carries what names the
+            # individual unit (``serial_number``). Written this way,
+            # ``probeinterface.get_probe(manufacturer, model_number)`` rebuilds the geometry from the
+            # file, which the description blob this replaces could not offer.
+            probe = self.recording_extractor.get_probe()
+            serial_number = probe.serial_number if probe.serial_number not in (None, "", "0") else None
+
+            # The key names the physical probe rather than the stream, because the AP and LF interfaces
+            # hold the same probe and their metadata has to deep-merge into one entry instead of two.
+            # The serial number is the only field that identifies a unit across both. Without one, the
+            # key is scoped to the interface, which is already unique per ``metadata_key``, so two
+            # serial-less interfaces in a converter cannot collide on it.
+            device_metadata_key = f"neuropixels_{serial_number}" if serial_number else f"{self.metadata_key}_probe"
+
+            # The probe answers what the hardware is, this interface answers what to call it: the name
+            # is the stream's own ``Imec0``, which comes from the filename and not from the probe.
+            probe_name = self._signals_info_dict["device"].capitalize()  # Imec0, Imec1, etc.
+            device = dict(name=f"Neuropixels{probe_name}")
+
+            probe_metadata = _get_probe_device_metadata(probe=probe)
+            if probe_metadata is not None:
+                device_model = probe_metadata["device_model"]
+                # Every caller has to key a model the same way, or two entries for one model collide.
+                device_model_metadata_key = f"{device_model.get('manufacturer')}_{device_model['model_number']}"
+                device = {**probe_metadata["device"], **device}
+                device["device_model_metadata_key"] = device_model_metadata_key
+                metadata["DeviceModels"] = {device_model_metadata_key: device_model}
+            elif serial_number:
+                device["serial_number"] = serial_number
+
+            # Every electrode group links to the device, both so the Neuropixels provenance reaches the
+            # file instead of the pipeline's placeholder and because a device is only written when a
+            # group references it.
+            metadata["Devices"] = {device_metadata_key: device}
+
+            metadata["Ecephys"]["ElectrodeGroups"] = {
+                group_name: dict(
+                    name=group_name,
+                    description=f"A group representing probe/shank '{group_name}'.",
+                    location="unknown",
+                    device_metadata_key=device_metadata_key,
+                )
+                for group_name in set(self.recording_extractor.get_property("group_name"))
+            }
+
+            # Electrode-table column descriptions are orthogonal to the device/group dict migration and
+            # keep their list shape here; folding electrode-level metadata into the dict format is a
+            # separate, still-unsettled follow-up.
+            metadata["Ecephys"]["Electrodes"] = [
+                dict(name="group_name", description="Name of the ElectrodeGroup this electrode is a part of."),
+                dict(
+                    name="electrode_name",
+                    description=(
+                        "The unique name of this electrode. Derived from probe contact identifiers. "
+                        "Multiple channels (e.g., AP and LF bands) from the same physical electrode "
+                        "will share the same electrode_name."
+                    ),
+                ),
+                dict(name="contact_shapes", description="The shape of the electrode"),
+                dict(
+                    name="adc_group",
+                    description=(
+                        "The ADC (Analog-to-Digital Converter) index to which each electrode is connected. "
+                        "This hardware configuration determines which channels are sampled simultaneously."
+                    ),
+                ),
+                dict(
+                    name="adc_sample_order",
+                    description=(
+                        "The sampling order index (0-based) of this electrode within its ADC group. "
+                        "Combined with adc_group, this determines the precise temporal offset of each channel's samples."
+                    ),
+                ),
+            ]
+            if self.recording_extractor.get_probe().get_shank_count() > 1:
+                metadata["Ecephys"]["Electrodes"].append(
+                    dict(name="shank_ids", description="The shank id of the electrode")
+                )
+
+            return metadata
+
+        metadata = super().get_metadata(use_new_metadata_format=False)
         session_start_time = self._get_session_start_time()
         if session_start_time:
             metadata["NWBFile"]["session_start_time"] = session_start_time
@@ -308,9 +394,10 @@ class SpikeGLXRecordingInterface(BaseRecordingExtractorInterface):
         """
         import json
 
-        # Get probe info from recording extractor annotation
-        probes_info = self.recording_extractor.get_annotation("probes_info")
-        probe_info = probes_info[0]  # Get first probe info
+        # Get probe info from the probe's own annotations. SpikeInterface 0.105 moved this out of the
+        # recording's "probes_info" annotation and into the probe, but 0.104 already writes it to both,
+        # so reading it from the probe works on either version.
+        probe_info = self.recording_extractor.get_probes()[0].annotations
 
         metadata_dict = dict()
 

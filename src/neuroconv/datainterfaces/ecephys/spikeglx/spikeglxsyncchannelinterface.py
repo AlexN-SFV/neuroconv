@@ -1,15 +1,14 @@
-import warnings
 from datetime import datetime
 from pathlib import Path
 
 from pydantic import ConfigDict, DirectoryPath, validate_call
 from pynwb import NWBFile
 
-from ....basedatainterface import BaseDataInterface
+from ..baserecordingastimeseriesinterface import BaseRecordingAsTimeSeriesInterface
 from ....utils import DeepDict, get_json_schema_from_method_signature
 
 
-class SpikeGLXSyncChannelInterface(BaseDataInterface):
+class SpikeGLXSyncChannelInterface(BaseRecordingAsTimeSeriesInterface):
     """
     Data interface for SpikeGLX synchronization channels from Neuropixel probes.
 
@@ -68,10 +67,10 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
     def __init__(
         self,
         folder_path: DirectoryPath,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         stream_id: str,
         verbose: bool = False,
-        metadata_key: str = "SpikeGLXSync",
+        metadata_key: str = "spikeglx_sync",
     ):
         """
         Read synchronization channel data from SpikeGLX Neuropixel probe recordings.
@@ -88,10 +87,11 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
             Examples: 'imec0.ap-SYNC', 'imec1.lf-SYNC'
         verbose : bool, default: False
             Whether to output verbose text.
-        metadata_key : str, default: "SpikeGLXSync"
+        metadata_key : str, default: "spikeglx_sync"
             Key used to organize metadata in the metadata dictionary. This is especially useful
             when multiple sync channel interfaces are used in the same conversion. The metadata_key is used
-            to organize TimeSeries metadata.
+            to organize TimeSeries metadata. It addresses the entry; the written object's name is the
+            entry's ``name`` field, derived from the probe index.
 
         Raises
         ------
@@ -100,34 +100,6 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
         NotImplementedError
             If stream_id contains 'obx' (OneBox support not yet implemented).
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "stream_id",
-                "verbose",
-                "metadata_key",
-            ]
-            num_positional_args_before_args = 1  # folder_path
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"__init__() takes at most {len(parameter_names) + num_positional_args_before_args + 1} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args + 1} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to SpikeGLXSyncChannelInterface.__init__() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            stream_id = positional_values.get("stream_id", stream_id)
-            verbose = positional_values.get("verbose", verbose)
-            metadata_key = positional_values.get("metadata_key", metadata_key)
 
         # Validate stream_id
         if "-SYNC" not in stream_id:
@@ -210,7 +182,7 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
         Returns
         -------
         DeepDict
-            Metadata dictionary containing device and TimeSeries information.
+            Metadata dictionary containing the TimeSeries information.
         """
         metadata = super().get_metadata()
 
@@ -218,28 +190,11 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
         if session_start_time:
             metadata["NWBFile"]["session_start_time"] = session_start_time
 
-        # Device metadata - link to the parent probe device
-        device_name = f"NeuropixelsImec{self._probe_index}"
-        device = dict(
-            name=device_name,
-            description=f"Neuropixels probe {self._probe_index} used with SpikeGLX.",
-            manufacturer="Imec",
-        )
-
-        metadata["Devices"] = [device]
-
-        # TimeSeries metadata for sync channel
-        if "TimeSeries" not in metadata:
-            metadata["TimeSeries"] = {}
-
-        # Generate TimeSeries name based on probe only (band info in description)
-        # Example: "TimeSeriesImec0Sync" for imec0.ap-SYNC or imec0.lf-SYNC
-        # Multi-segment recordings will have segment suffix added automatically (e.g., "TimeSeriesImec0Sync0")
-        timeseries_name = f"TimeSeriesImec{self._probe_index}Sync"
-
-        metadata["TimeSeries"][self.metadata_key] = {
-            "name": timeseries_name,
-            "description": (
+        # Named after the probe, with the band left to the description. A multi-segment recording has a
+        # segment suffix appended automatically, so "TimeSeriesImec0Sync" becomes "TimeSeriesImec0Sync0".
+        metadata["TimeSeries"][self.metadata_key] = dict(
+            name=f"TimeSeriesImec{self._probe_index}Sync",
+            description=(
                 f"Synchronization channel (SY0) from Neuropixel probe {self._probe_index} "
                 f"{self._stream_kind} stream (stream: {self.stream_id}). Contains a 16-bit status word where bit 6 carries a 1 Hz "
                 f"square wave (toggling between 0 and 1 every 0.5 seconds) used for sub-millisecond timing "
@@ -248,7 +203,7 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
                 f"The sync signal can be generated internally by the Imec module (PXIe or OneBox) or externally "
                 f"by an NI-DAQ device acting as the master sync generator for multi-device setups."
             ),
-        }
+        )
 
         return metadata
 
@@ -256,7 +211,7 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
         self,
         nwbfile: NWBFile,
         metadata: dict | None = None,
-        *args,  # TODO: change to * (keyword only) on or after August 2026
+        *,
         stub_test: bool = False,
         iterator_type: str | None = "v2",
         iterator_options: dict | None = None,
@@ -281,60 +236,12 @@ class SpikeGLXSyncChannelInterface(BaseDataInterface):
         always_write_timestamps : bool, default: False
             If True, always writes timestamps instead of using sampling rate.
         """
-        # Handle deprecated positional arguments
-        if args:
-            parameter_names = [
-                "stub_test",
-                "iterator_type",
-                "iterator_options",
-                "always_write_timestamps",
-            ]
-            num_positional_args_before_args = 2  # nwbfile, metadata
-            if len(args) > len(parameter_names):
-                raise TypeError(
-                    f"add_to_nwbfile() takes at most {len(parameter_names) + num_positional_args_before_args} positional arguments but "
-                    f"{len(args) + num_positional_args_before_args} were given. "
-                    "Note: Positional arguments are deprecated and will be removed on or after August 2026. "
-                    "Please use keyword arguments."
-                )
-            positional_values = dict(zip(parameter_names, args))
-            passed_as_positional = list(positional_values.keys())
-            warnings.warn(
-                f"Passing arguments positionally to SpikeGLXSyncChannelInterface.add_to_nwbfile() is deprecated "
-                f"and will be removed on or after August 2026. "
-                f"The following arguments were passed positionally: {passed_as_positional}. "
-                "Please use keyword arguments instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            stub_test = positional_values.get("stub_test", stub_test)
-            iterator_type = positional_values.get("iterator_type", iterator_type)
-            iterator_options = positional_values.get("iterator_options", iterator_options)
-            always_write_timestamps = positional_values.get("always_write_timestamps", always_write_timestamps)
 
-        from ....tools.spikeinterface import (
-            _stub_recording,
-            add_recording_as_time_series_to_nwbfile,
-        )
-
-        recording = self.recording_extractor
-        if stub_test:
-            recording = _stub_recording(recording=self.recording_extractor)
-
-        metadata = metadata or self.get_metadata()
-
-        # Add device (probe) if not already present
-        device_metadata = metadata.get("Devices", [])
-        for device in device_metadata:
-            if device["name"] not in nwbfile.devices:
-                nwbfile.create_device(**device)
-
-        add_recording_as_time_series_to_nwbfile(
-            recording=recording,
+        super().add_to_nwbfile(
             nwbfile=nwbfile,
             metadata=metadata,
+            stub_test=stub_test,
             iterator_type=iterator_type,
             iterator_options=iterator_options,
             always_write_timestamps=always_write_timestamps,
-            metadata_key=self.metadata_key,
         )

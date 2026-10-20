@@ -24,3 +24,15 @@ Multi-File CSV Fiber Photometry
 NPM Fiber Photometry
 --------------------
 .. autoclass:: neuroconv.datainterfaces.fiber_photometry.npm.npmfiberphotometrydatainterface.NPMFiberPhotometryInterface
+
+pyPhotometry Fiber Photometry
+-----------------------------
+.. autoclass:: neuroconv.datainterfaces.fiber_photometry.pyphotometry.pyphotometrydatainterface.PyPhotometryFiberPhotometryInterface
+
+.. autoclass:: neuroconv.datainterfaces.fiber_photometry.pyphotometry.pyphotometryconverter.PyPhotometryConverter
+
+GuPPy Fiber Photometry
+----------------------
+.. autoclass:: neuroconv.datainterfaces.fiber_photometry.guppy.guppydatainterface.GuppyInterface
+
+.. autoclass:: neuroconv.datainterfaces.fiber_photometry.guppy.guppyconverter.GuppyConverter

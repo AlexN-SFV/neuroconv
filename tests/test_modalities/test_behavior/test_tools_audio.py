@@ -12,7 +12,7 @@ from neuroconv.tools.nwb_helpers import make_nwbfile_from_metadata
 class TestAddAcousticWaveformSeries(TestCase):
     @classmethod
     def setUpClass(cls):
-        session_start_time = datetime.now(tz=gettz(name="US/Pacific"))
+        session_start_time = datetime.now(tz=gettz(name="Asia/Tokyo"))
         cls.num_frames = 1000
         cls.sampling_rate = 500.0
 
@@ -31,13 +31,14 @@ class TestAddAcousticWaveformSeries(TestCase):
         )
 
     def test_add_series_with_default_parent_container(self):
-        add_acoustic_waveform_series(
+        returned_nwbfile = add_acoustic_waveform_series(
             acoustic_series=self.data,
             rate=self.sampling_rate,
             nwbfile=self.nwbfile,
             metadata=self.audio_metadata,
         )
 
+        self.assertIs(returned_nwbfile, self.nwbfile)
         self.assertIn(self.audio_metadata["name"], self.nwbfile.stimulus)
         self.assertNotIn(self.audio_metadata["name"], self.nwbfile.acquisition)
 

@@ -74,6 +74,54 @@ class _NWBConversionOptionsEncoder(_GenericNeuroconvEncoder):
 NWBMetaDataEncoder = _NWBMetaDataEncoder
 
 
+def _metadata_uses_old_list_format(metadata: dict) -> bool:
+    """
+    Detect whether a metadata dictionary is in the old list-based format.
+
+    Transitional, and deliberately written around the format that is going away: the singular,
+    list-valued modality keys and the legacy list-valued top-level ``Devices``. When the old format is
+    removed this function goes with it, and the callers keep the branch they already take for everything
+    else.
+
+    This is a shape sniff for validation routing only. The write pipelines have their own,
+    modality-specific detectors (``tools.spikeinterface._is_dict_based_metadata`` and
+    ``tools.roiextractors._is_dict_based_metadata``), which also choose a write path and therefore treat
+    ambiguous metadata differently from each other.
+
+    Parameters
+    ----------
+    metadata : dict
+        The metadata dictionary to inspect.
+
+    Returns
+    -------
+    bool
+        True when the metadata carries old list-based structures, False otherwise (including for empty
+        or ambiguous metadata, which the current schemas describe just as well).
+    """
+    if isinstance(metadata.get("Devices"), list):
+        return True
+
+    list_valued_keys = {
+        "Ecephys": ("Device", "ElectrodeGroup"),
+        "Ophys": ("Device", "ImagingPlane"),
+    }
+    for modality, key_names in list_valued_keys.items():
+        modality_metadata = metadata.get(modality, {})
+        if any(isinstance(modality_metadata.get(key_name), list) for key_name in key_names):
+            return True
+
+    # "ElectricalSeries" exists in both formats: a flat mapping of fields is the old one, a mapping of
+    # per-``metadata_key`` entries is not.
+    electrical_series = metadata.get("Ecephys", {}).get("ElectricalSeries")
+    if isinstance(electrical_series, dict) and electrical_series:
+        first_entry = next(iter(electrical_series.values()))
+        if not isinstance(first_entry, dict):
+            return True
+
+    return False
+
+
 def _validate_device_registry_names(metadata: dict[str, dict]) -> None:
     """Require 1 metadata key for each device or device model name."""
     for registry_name, object_name in (
@@ -173,8 +221,8 @@ def get_json_schema_from_method_signature(method: Callable, exclude: list[str] |
     json_schema : dict
         The JSON schema corresponding to the method signature.
     """
-    exclude = exclude or []
-    exclude += ["self", "cls"]
+    # A new list rather than ``+=``, which would extend the caller's own list in place.
+    exclude = [*(exclude or []), "self", "cls"]
 
     split_qualname = method.__qualname__.split(".")[-2:]
     method_display = ".".join(split_qualname) if "<" not in split_qualname[0] else method.__name__
@@ -316,6 +364,22 @@ def _is_member(types: type | tuple[type, ...], target_types: type | tuple[type, 
     return any(t in target_types for t in types)
 
 
+# Small array-valued metadata that must stay in the generated schema whatever pynwb declares for it.
+# The branch below infers "this is a bulk dataset, leave it out" from `DataIO` appearing among the
+# accepted types, since only bulk data is ever wrapped for chunked and compressed writing. pynwb's
+# development branch replaced the `collections.abc.Iterable` these fields used to declare, which was too
+# wide because it also accepted `str`, with the same explicit tuple that `data` and `timestamps` carry,
+# `DataIO` included. That reclassified a fixed-length pair of integers as bulk data. Nobody compresses a
+# frame size, so the signal carries no information for these and they are named instead of inferred.
+ARRAY_VALUED_METADATA_ARGUMENTS = (
+    "dimension",
+    "field_of_view",
+    "starting_frame",
+    "control",
+    "control_description",
+)
+
+
 def get_schema_from_hdmf_class(hdmf_class: type) -> dict[str, Any]:
     """
     Get metadata schema from hdmf class.
@@ -361,6 +425,8 @@ def get_schema_from_hdmf_class(hdmf_class: type) -> dict[str, Any]:
         elif _is_member(arg_type, str):
             schema_val.update(type="string")
         elif _is_member(arg_type, collections.abc.Iterable):
+            schema_val.update(type="array")
+        elif arg_name in ARRAY_VALUED_METADATA_ARGUMENTS:
             schema_val.update(type="array")
         elif isinstance(arg_type, tuple) and (np.ndarray in arg_type and hdmf.data_utils.DataIO not in arg_type):
             # extend type array without including type where DataIO in tuple

@@ -9,6 +9,8 @@ from .mock_guppy import generate_mock_guppy_output_folder
 from .mock_interfaces import (
     MockBehaviorEventInterface,
     MockEventsInterface,
+    MockExternalVideoInterface,
+    MockSignalEncodedEventsInterface,
     MockFiberPhotometryInterface,
     MockIcephysInterface,
     MockSpikeGLXNIDQInterface,
