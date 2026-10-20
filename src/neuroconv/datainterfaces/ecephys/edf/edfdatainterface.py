@@ -1,6 +1,7 @@
 import re
 import warnings
 from datetime import date, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import FilePath
@@ -560,11 +561,13 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             If True, always write an explicit timestamps array rather than a starting time and rate.
         write_annotations : bool, default: True
             If True and the file is ``EDF+D``, the annotations carried in the ``EDF Annotations`` signals
-            are written to a ``TimeIntervals`` table named ``"annotations"``. Has no effect on plain EDF
-            or ``EDF+C`` files, whose handling is unchanged.
+            are written to a ``TimeIntervals`` table named ``"annotations"``, with a ``source_file``
+            column. If another EDF interface has already written that table to the file, the rows are
+            added to it. Has no effect on plain EDF or ``EDF+C`` files, whose handling is unchanged.
         write_runs : bool, default: True
             If True and the file is discontinuous with more than one contiguous run, the run boundaries
-            are written to a ``TimeIntervals`` table named ``"runs"``.
+            are written to a ``TimeIntervals`` table named ``"runs"``, or added to it as for the
+            annotations.
         """
         # The full signature is redeclared rather than taking **conversion_options, because
         # get_conversion_options_schema is built from it: a catch-all erases every inherited option from
@@ -594,30 +597,65 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         if write_runs and len(getattr(self, "_edf_runs", [])) > 1:
             self._add_runs_to_nwbfile(nwbfile=nwbfile)
 
-    def _add_annotations_to_nwbfile(self, nwbfile: NWBFile):
-        """Write the EDF+ annotations to a TimeIntervals table, on the session timeline."""
+    def _add_rows_to_table(self, nwbfile: NWBFile, name: str, description: str, columns: dict, rows: list[dict]):
+        """
+        Add ``rows`` to the ``TimeIntervals`` table ``name``, creating the table if the file has none.
+
+        Several EDF files written into one NWB file through a ``ConverterPipe`` share the table, with a
+        ``source_file`` column saying which file each row came from, so no file's rows are lost. The
+        sub-interfaces from ``split_by_offset`` all come from one file and carry the same rows, so when
+        every row is already in the table under this file's name, none is written again. A table of that
+        name with other columns came from something else and is left alone, with a warning.
+        """
         from pynwb.epoch import TimeIntervals
 
-        # split_by_offset produces several interfaces backed by the same file, each carrying the same
-        # annotations, and they are written into one NWBFile — so only the first one writes the table.
-        if nwbfile.intervals is not None and "annotations" in nwbfile.intervals:
-            return
+        source_file = Path(self.source_data["file_path"]).name
+        columns = dict(columns, source_file="Name of the EDF file the row was read from.")
+        rows = [dict(row, source_file=source_file) for row in rows]
 
-        annotations_table = TimeIntervals(
-            name="annotations",
-            description="Annotations imported from the EDF+ 'EDF Annotations' signal.",
-        )
-        annotations_table.add_column(name="label", description="The EDF+ annotation text.")
+        if nwbfile.intervals is None or name not in nwbfile.intervals:
+            table = TimeIntervals(name=name, description=description)
+            for column_name, column_description in columns.items():
+                table.add_column(name=column_name, description=column_description)
+            nwbfile.add_time_intervals(table)
+        else:
+            table = nwbfile.intervals[name]
+            expected = {"start_time", "stop_time", *columns}
+            if set(table.colnames) != expected:
+                warnings.warn(
+                    f"The NWB file already has an intervals table named {name!r}, with columns "
+                    f"{sorted(table.colnames)} rather than an EDF {name} table's {sorted(expected)}. "
+                    f"The {name} of '{source_file}' are not written.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+                return
+            # Whole rows are compared, source_file among them, rather than the name alone, so a second
+            # file that merely shares this one's name — the same name in another directory — still has
+            # its rows written.
+            column_names = ["start_time", "stop_time", *columns]
+            existing = set(zip(*(table[column_name][:] for column_name in column_names)))
+            if {tuple(row[column_name] for column_name in column_names) for row in rows} <= existing:
+                return
+
+        for row in rows:
+            table.add_row(**row)
+
+    def _add_annotations_to_nwbfile(self, nwbfile: NWBFile):
+        """Write the EDF+ annotations to a TimeIntervals table, on the session timeline."""
+        rows = []
         for annotation in self._edf_annotations:
             duration = annotation["duration"] or 0.0
             onset = float(annotation["onset"])
             start_time = onset + self._shift_for_time(onset)
-            annotations_table.add_row(
-                start_time=start_time,
-                stop_time=start_time + float(duration),
-                label=annotation["text"],
-            )
-        nwbfile.add_time_intervals(annotations_table)
+            rows.append(dict(start_time=start_time, stop_time=start_time + float(duration), label=annotation["text"]))
+        self._add_rows_to_table(
+            nwbfile=nwbfile,
+            name="annotations",
+            description="Annotations imported from the 'EDF Annotations' signals of EDF+ files.",
+            columns={"label": "The EDF+ annotation text."},
+            rows=rows,
+        )
 
     def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
         """
@@ -630,29 +668,27 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         ``ValueError: column must have the same number of rows as 'id'``. This also keeps the runs
         consistent with how the annotations are written.
         """
-        from pynwb.epoch import TimeIntervals
-
-        # As with the annotations table, sub-interfaces from split_by_offset share these runs.
-        if nwbfile.intervals is not None and "runs" in nwbfile.intervals:
-            return
-
         time_shifts = self._time_shifts
-        runs_table = TimeIntervals(
-            name="runs",
-            description=(
-                "Contiguous runs of data records in a discontinuous EDF+ (EDF+D) file. Each run is "
-                "written as its own ElectricalSeries, positioned at the run's start time."
-            ),
-        )
-        runs_table.add_column(name="run_index", description="0-based index of the contiguous run of EDF data records.")
+        rows = []
         for run_index, run in enumerate(self._edf_runs):
             start_time = float(run.start_time) + time_shifts[run_index]
-            runs_table.add_row(
-                start_time=start_time,
-                stop_time=start_time + run.number_of_records * self._edf_record_duration,
-                run_index=run_index,
+            rows.append(
+                dict(
+                    start_time=start_time,
+                    stop_time=start_time + run.number_of_records * self._edf_record_duration,
+                    run_index=run_index,
+                )
             )
-        nwbfile.add_time_intervals(runs_table)
+        self._add_rows_to_table(
+            nwbfile=nwbfile,
+            name="runs",
+            description=(
+                "Contiguous runs of data records in discontinuous EDF+ (EDF+D) files. Each run is "
+                "written as its own ElectricalSeries, positioned at the run's start time."
+            ),
+            columns={"run_index": "0-based index of the contiguous run of data records within its EDF file."},
+            rows=rows,
+        )
 
     @property
     def log_transformed_channels(self) -> dict:

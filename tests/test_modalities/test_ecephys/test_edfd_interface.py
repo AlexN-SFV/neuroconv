@@ -1411,9 +1411,123 @@ class TestEDFDRecordingInterface:
                 "ElectricalSeries11",
                 "ElectricalSeries12",
             ]
-            assert len(nwbfile.intervals["annotations"].to_dataframe()) == 1
+            annotations_table = nwbfile.intervals["annotations"].to_dataframe()
+            assert list(annotations_table["label"]) == ["Marker: 601"]
+            assert list(annotations_table["source_file"]) == ["offsets.edf"]
             # And the run rows are written once, not once per sub-interface.
-            assert list(nwbfile.intervals["runs"].to_dataframe()["run_index"]) == [0, 1, 2]
+            runs = nwbfile.intervals["runs"].to_dataframe()
+            assert list(runs["run_index"]) == [0, 1, 2]
+            assert list(runs["source_file"]) == ["offsets.edf"] * 3
+
+    def test_two_files_in_one_converter_pipe_keep_both_files_tables(self, tmp_path, digital_data):
+        """
+        Each file's annotations and runs reach the shared tables, labelled by source_file.
+
+        The tables used to be written only by whichever interface came first, so every later file's
+        annotations and runs were dropped without a word.
+        """
+        first, second = _write_two_files(tmp_path, digital_data)
+        annotations, runs = _convert_through_pipe(tmp_path, [first, second])
+
+        assert list(annotations["label"]) == ["first: marker", "first: seizure", "second: marker"]
+        assert list(annotations["source_file"]) == ["first.edf", "first.edf", "second.edf"]
+        assert list(annotations["start_time"]) == pytest.approx([2.5, 10.25, 21.0])
+        assert list(runs["source_file"]) == ["first.edf"] * 3 + ["second.edf"] * 2
+        assert list(runs["run_index"]) == [0, 1, 2, 0, 1]
+        assert list(runs["start_time"]) == pytest.approx([0.0, 9.0, 14.5, 0.0, 20.0])
+
+    def test_split_by_offset_of_two_files_writes_each_files_rows_once(self, tmp_path, digital_data):
+        """The pipeline's call pattern: every file split by offset, all partitions in one ConverterPipe."""
+        offsets = dict(physical_min=[-1000.0, 0.0, -1000.0], physical_max=[1000.0, 1000.0, 1000.0])
+        first, second = _write_two_files(tmp_path, digital_data, **offsets)
+        sub_interfaces = [*first.split_by_offset(), *second.split_by_offset()]
+        assert len(sub_interfaces) == 4
+        annotations, runs = _convert_through_pipe(tmp_path, sub_interfaces)
+
+        assert list(annotations["source_file"]) == ["first.edf", "first.edf", "second.edf"]
+        assert list(runs["source_file"]) == ["first.edf"] * 3 + ["second.edf"] * 2
+
+    def test_same_file_name_in_two_directories_keeps_both_files_rows(self, tmp_path, digital_data):
+        """Rows are deduplicated by content, not by file name, which two directories can share."""
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        first, second = _write_two_files(
+            tmp_path, digital_data, first_name=Path("a") / "eeg.edf", second_name=Path("b") / "eeg.edf"
+        )
+        annotations, runs = _convert_through_pipe(tmp_path, [first, second])
+
+        assert list(annotations["label"]) == ["first: marker", "first: seizure", "second: marker"]
+        assert list(annotations["source_file"]) == ["eeg.edf"] * 3
+        assert list(runs["run_index"]) == [0, 1, 2, 0, 1]
+
+    def test_foreign_table_of_the_same_name_is_left_alone_with_a_warning(self, tmp_path, digital_data):
+        """An ``annotations`` table with other columns was not written by this interface; it is not extended."""
+        from pynwb.epoch import TimeIntervals
+        from pynwb.testing.mock.file import mock_NWBFile
+
+        path = write_edf(
+            tmp_path / "d.edf", record_onsets=GAPPED_ONSETS, data=digital_data, annotations=[(2.5, None, "x")]
+        )
+        interface = EDFRecordingInterface(file_path=path)
+
+        nwbfile = mock_NWBFile()
+        foreign = TimeIntervals(name="annotations", description="Someone else's annotations.")
+        foreign.add_column(name="note", description="A note.")
+        foreign.add_row(start_time=0.0, stop_time=1.0, note="theirs")
+        nwbfile.add_time_intervals(foreign)
+
+        with pytest.warns(UserWarning, match="already has an intervals table named 'annotations'"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+
+        assert list(nwbfile.intervals["annotations"].to_dataframe()["note"]) == ["theirs"]
+        # The runs table is unaffected by the clash.
+        assert list(nwbfile.intervals["runs"].to_dataframe()["run_index"]) == [0, 1, 2]
+
+
+# Records 0-5 contiguous, a 14 s gap, records 6-11 contiguous: a different layout from GAPPED_ONSETS.
+SECOND_FILE_ONSETS = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0]
+
+
+def _write_two_files(tmp_path, digital_data, *, first_name="first.edf", second_name="second.edf", **kwargs):
+    """Two EDF+D files with different channels, run layouts and annotations, as interfaces with distinct keys."""
+    first_path = write_edf(
+        tmp_path / first_name,
+        record_onsets=GAPPED_ONSETS,
+        data=digital_data,
+        annotations=[(2.5, None, "first: marker"), (10.25, 1.5, "first: seizure")],
+        **kwargs,
+    )
+    second_path = write_edf(
+        tmp_path / second_name,
+        record_onsets=SECOND_FILE_ONSETS,
+        data=digital_data,
+        channel_names=["x0", "x1", "x2"],
+        annotations=[(21.0, None, "second: marker")],
+        **kwargs,
+    )
+    return (
+        EDFRecordingInterface(file_path=first_path, metadata_key="first"),
+        EDFRecordingInterface(file_path=second_path, metadata_key="second"),
+    )
+
+
+def _convert_through_pipe(tmp_path, interfaces):
+    """Write the interfaces into one NWB file through a ConverterPipe; return its annotations and runs tables."""
+    from neuroconv import ConverterPipe
+
+    converter = ConverterPipe(data_interfaces={interface.metadata_key: interface for interface in interfaces})
+    metadata = converter.get_metadata()
+    metadata["NWBFile"].update(session_start_time=datetime(2021, 9, 16, 12, 35, 13))
+    for interface in interfaces:
+        metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = f"{interface.metadata_key}_series"
+
+    nwbfile_path = tmp_path / "pipe.nwb"
+    converter.run_conversion(nwbfile_path=str(nwbfile_path), metadata=metadata, overwrite=True)
+    with NWBHDF5IO(str(nwbfile_path), "r") as io:
+        nwbfile = io.read()
+        # Every run of every interface reaches the file as its own series, whatever happens to the tables.
+        assert len(nwbfile.acquisition) == sum(interface.number_of_runs for interface in interfaces)
+        return nwbfile.intervals["annotations"].to_dataframe(), nwbfile.intervals["runs"].to_dataframe()
 
 
 def _metadata(interface) -> dict:
