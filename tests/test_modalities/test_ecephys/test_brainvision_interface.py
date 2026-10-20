@@ -4,18 +4,26 @@ Each test writes a small BrainVision recording with :func:`write_brainvision`, s
 Where a test reproduces a real exporter's quirk, the header text follows that exporter's output verbatim.
 """
 
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pytest
 from pynwb import NWBHDF5IO
+from pynwb.epoch import TimeIntervals
+from pynwb.testing.mock.file import mock_NWBFile
 
+from neuroconv import ConverterPipe
 from neuroconv.datainterfaces import BrainVisionRecordingInterface
 from neuroconv.datainterfaces.ecephys.brainvision._brainvision_extractor import (
     BrainVisionRecordingExtractor,
 )
 from neuroconv.datainterfaces.ecephys.brainvision._brainvision_reader import (
     read_brainvision_header,
+)
+from neuroconv.tools.testing.data_interface_mixins import (
+    RecordingExtractorInterfaceTestMixin,
 )
 
 SAMPLING_FREQUENCY = 1000.0
@@ -218,6 +226,22 @@ class TestHeaderText:
         path = write_brainvision(tmp_path, int16_data, codepage="ANSI", encoding="cp1252")
         assert read_brainvision_header(path).units == ["µV"] * 3
 
+    def test_utf8_text_declared_ansi_is_read_as_utf8(self, tmp_path, int16_data):
+        """Writers declare ANSI over UTF-8 text; decoding it as Windows-1252 garbles every non-ASCII character."""
+        path = write_brainvision(
+            tmp_path,
+            int16_data,
+            channels=["Ö1,,1,µV", "C2,,1,µV", "C3,,1,µV"],
+            markers=["Comment,Übung,11,1,0"],
+            codepage="ANSI",
+            encoding="utf-8",
+        )
+        header = read_brainvision_header(path)
+
+        assert header.channel_names[0] == "Ö1"
+        assert header.units == ["µV"] * 3
+        assert header.markers[0].description == "Übung"
+
     def test_utf8_byte_order_mark(self, tmp_path, int16_data):
         path = write_brainvision(tmp_path, int16_data, bom=True)
         header = read_brainvision_header(path)
@@ -238,6 +262,28 @@ class TestHeaderText:
     def test_unsupported_layouts_are_refused(self, tmp_path, int16_data, extra_common, error, match):
         path = write_brainvision(tmp_path, int16_data, extra_common=extra_common)
         with pytest.raises(error, match=match):
+            read_brainvision_header(path)
+
+    @pytest.mark.parametrize(
+        "old, new, match",
+        [
+            ("NumberOfChannels=3", "NumberOfChannels=0", "at least one channel"),
+            ("NumberOfChannels=3", "NumberOfChannels=three", "NumberOfChannels as 'three', which is not an integer"),
+            ("SamplingInterval=1000.0", "SamplingInterval=fast", "SamplingInterval as 'fast', which is not a number"),
+            ("SamplingInterval=1000.0", "SamplingInterval=0", "must be positive"),
+            ("Ch1=C1,,1,µV", "Ch1=C1,,one,µV", "resolution of Ch1 as 'one', which is not a number"),
+        ],
+    )
+    def test_malformed_numbers_name_the_file_and_field(self, tmp_path, int16_data, old, new, match):
+        path = write_brainvision(tmp_path, int16_data)
+        path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+        with pytest.raises(ValueError, match=f"recording.vhdr.*{match}"):
+            read_brainvision_header(path)
+
+    def test_decimal_comma_resolution_warns(self, tmp_path, int16_data):
+        """'0,1' meaning 0.1 splits into a resolution of 0 and a unit of '1'."""
+        path = write_brainvision(tmp_path, int16_data, channels=["C1,,0,1,µV", "C2,,1,µV", "C3,,1,µV"])
+        with pytest.warns(UserWarning, match="resolution of 0"):
             read_brainvision_header(path)
 
     def test_ascii_data_is_refused(self, tmp_path, int16_data):
@@ -347,6 +393,20 @@ class TestSegments:
         markers = ["New Segment,,1,1,0", "New Segment,,101,1,0"]
         recording = BrainVisionRecordingExtractor(write_brainvision(tmp_path, int16_data, markers=markers))
         assert recording.get_start_time(segment_index=1) == pytest.approx(0.1)
+
+    def test_later_segments_are_placed_from_the_dated_segment_before_them(self, tmp_path, int16_data):
+        markers = [
+            "New Segment,,1,1,0",
+            "New Segment,,101,1,0,20210101120000000000",
+            "New Segment,,201,1,0,20210101120030000000",  # resumed 30 s after the second segment started
+        ]
+        path = write_brainvision(tmp_path, int16_data, markers=markers)
+        with pytest.warns(UserWarning, match="nothing to measure"):
+            header = read_brainvision_header(path)
+
+        # The first dated segment has no earlier date to be placed by, so the pause before it is unknown.
+        assert header.recording_start is None
+        assert [segment.start_time for segment in header.segments] == pytest.approx([0.0, 0.1, 30.1])
 
     def test_segment_dated_before_the_previous_one_ends_warns(self, tmp_path, int16_data):
         markers = ["New Segment,,1,1,0,20210101120000000000", "New Segment,,101,1,0,20210101120000050000"]
@@ -458,3 +518,128 @@ class TestBrainVisionRecordingInterface:
         with NWBHDF5IO(nwbfile_path, "r") as io:
             nwbfile = io.read()
             assert nwbfile.intervals is None or "markers" not in nwbfile.intervals
+
+    def test_markers_outside_the_data_are_skipped_with_a_warning(self, tmp_path, int16_data):
+        markers = ["Stimulus,zero,0,1,0", "Stimulus,inside,11,1,0", f"Stimulus,past,{NUMBER_OF_SAMPLES + 1},1,0"]
+        path = write_brainvision(tmp_path, int16_data, markers=markers)
+        interface = BrainVisionRecordingInterface(file_path=path)
+        nwbfile = mock_NWBFile()
+        with pytest.warns(UserWarning, match="Skipping 2 marker"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+
+        assert list(nwbfile.intervals["markers"]["label"][:]) == ["inside"]
+
+    def test_markers_are_written_in_time_order(self, tmp_path, int16_data):
+        """Mk numbers follow the order markers were set, not the order they occur in."""
+        path = write_brainvision(tmp_path, int16_data, markers=["Comment,later,201,1,0", "Comment,earlier,11,1,0"])
+        interface = BrainVisionRecordingInterface(file_path=path)
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+
+        assert list(nwbfile.intervals["markers"]["label"][:]) == ["earlier", "later"]
+
+    def test_two_recordings_in_one_converter_keep_both_sets_of_markers(self, tmp_path, int16_data):
+        first_folder, second_folder = tmp_path / "first", tmp_path / "second"
+        first_folder.mkdir()
+        second_folder.mkdir()
+        paused = ["New Segment,,1,1,0", "Stimulus,A,11,1,0", "New Segment,,101,1,0"]
+        first = write_brainvision(first_folder, int16_data, stem="run1", markers=paused)
+        second = write_brainvision(second_folder, int16_data, stem="run2", markers=paused[:1] + ["Stimulus,B,21,1,0"])
+
+        first_interface = BrainVisionRecordingInterface(file_path=first)
+        second_interface = BrainVisionRecordingInterface(file_path=second, metadata_key="run2")
+        second_interface.set_aligned_starting_time(aligned_starting_time=100.0)
+        converter = ConverterPipe(data_interfaces=dict(run1=first_interface, run2=second_interface))
+        metadata = converter.get_metadata()
+        metadata["NWBFile"]["session_start_time"] = datetime(2021, 1, 1)
+        metadata["Ecephys"]["ElectricalSeries"]["run2"]["name"] = "ElectricalSeriesRun2"
+        nwbfile_path = tmp_path / "out.nwb"
+        converter.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata)
+
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            assert "ElectricalSeriesRun2" in nwbfile.acquisition
+            markers = nwbfile.intervals["markers"].to_dataframe()
+            assert list(markers["label"]) == ["A", "B"]
+            assert list(markers["source_file"]) == ["run1.vhdr", "run2.vhdr"]
+            np.testing.assert_allclose(markers["start_time"], [0.01, 100.02])
+            # Only the first recording was paused, so only it has segments to list.
+            segments = nwbfile.intervals["segments"].to_dataframe()
+            assert list(segments["source_file"]) == ["run1.vhdr", "run1.vhdr"]
+
+    def test_a_foreign_markers_table_is_left_alone_with_a_warning(self, tmp_path, int16_data):
+        path = write_brainvision(tmp_path, int16_data, markers=["Stimulus,S  1,11,1,0"])
+        interface = BrainVisionRecordingInterface(file_path=path)
+        nwbfile = mock_NWBFile()
+        nwbfile.add_time_intervals(TimeIntervals(name="markers", description="Written by something else."))
+        with pytest.warns(UserWarning, match="already has an intervals table named 'markers'"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+
+        assert len(nwbfile.intervals["markers"]) == 0
+
+    def test_conversion_options_reach_the_writer(self, tmp_path, int16_data):
+        path = write_brainvision(tmp_path, int16_data)
+        interface = BrainVisionRecordingInterface(file_path=path, channels_to_skip=["C2"])
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(
+            nwbfile=nwbfile, metadata=interface.get_metadata(), stub_test=True, parent_container="processing/LFP"
+        )
+
+        series = nwbfile.processing["ecephys"]["LFP"].electrical_series["ElectricalSeries"]
+        assert list(nwbfile.electrodes["channel_name"][:]) == ["C1", "C3"]
+        assert series.data.shape[1] == 2
+        assert series.data.shape[0] < NUMBER_OF_SAMPLES
+
+    def test_deprecated_write_as(self, tmp_path, int16_data):
+        path = write_brainvision(tmp_path, int16_data)
+        interface = BrainVisionRecordingInterface(file_path=path)
+        nwbfile = mock_NWBFile()
+        with pytest.warns(FutureWarning):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata(), write_as="lfp")
+        assert "ElectricalSeries" in nwbfile.processing["ecephys"]["LFP"].electrical_series
+
+
+# The mixins take their source files as class attributes, so these are written once, at import.
+_MIXIN_FOLDER = Path(tempfile.mkdtemp())
+_MIXIN_DATA = np.random.default_rng(seed=1).integers(-2000, 2000, size=(NUMBER_OF_SAMPLES, 4)).astype("int16")
+
+
+def _write_mixin_recording(stem, markers):
+    folder = _MIXIN_FOLDER / stem
+    folder.mkdir()
+    channels = [f"C{index + 1},,0.5,µV" for index in range(_MIXIN_DATA.shape[1])]
+    return write_brainvision(folder, _MIXIN_DATA, stem=stem, channels=channels, markers=markers)
+
+
+class TestBrainVisionRecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):
+    data_interface_cls = BrainVisionRecordingInterface
+    interface_kwargs = dict(
+        file_path=str(
+            _write_mixin_recording("continuous", ["New Segment,,1,1,0,20210602161337000000", "Stimulus,S  1,11,1,0"])
+        )
+    )
+    save_directory = _MIXIN_FOLDER
+
+    def check_extracted_metadata(self, metadata: dict):
+        assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 6, 2, 16, 13, 37)
+        assert "brainvision_recording" in metadata["Ecephys"]["ElectricalSeries"]
+
+
+class TestPausedBrainVisionRecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):
+    data_interface_cls = BrainVisionRecordingInterface
+    interface_kwargs = dict(
+        file_path=str(
+            _write_mixin_recording(
+                "paused",
+                [
+                    "New Segment,,1,1,0,20210101120000000000",
+                    "Stimulus,S  1,151,1,0",
+                    "New Segment,,101,1,0,20210101120100000000",
+                ],
+            )
+        )
+    )
+    save_directory = _MIXIN_FOLDER
+
+    def check_extracted_metadata(self, metadata: dict):
+        assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 1, 1, 12, 0, 0)

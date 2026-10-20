@@ -1,28 +1,16 @@
 import numpy as np
 from pydantic import FilePath
 
+from .._voltage_units import unit_to_microvolts
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....tools import get_package
 from ....utils import DeepDict
 
-# Physical-dimension string -> factor converting that unit to microvolts.
-_UNIT_TO_MICROVOLTS = {
-    "uv": 1.0,
-    "µv": 1.0,
-    "microvolt": 1.0,
-    "microvolts": 1.0,
-    "mv": 1e3,
-    "millivolt": 1e3,
-    "millivolts": 1e3,
-    "v": 1e6,
-    "volt": 1e6,
-    "volts": 1e6,
-}
-
 
 def _unit_to_microvolts(unit: str) -> float:
     """Factor to convert a channel's physical unit to microvolts (assume µV if unrecognized)."""
-    return _UNIT_TO_MICROVOLTS.get(str(unit).strip().lower(), 1.0)
+    factor = unit_to_microvolts(unit)
+    return 1.0 if factor is None else factor
 
 
 def _read_bdf_recording(file_path: FilePath, channels_to_skip: list | None = None):

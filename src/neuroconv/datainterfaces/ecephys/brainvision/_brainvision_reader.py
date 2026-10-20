@@ -23,12 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
+from .._voltage_units import unit_to_microvolts
+
 # The binary formats of the core specification, little-endian.
 _BINARY_FORMAT_TO_DTYPE = {"INT_16": "<i2", "INT_32": "<i4", "IEEE_FLOAT_32": "<f4"}
-
-# Units are given per channel. Anything that is not a voltage is still read (as microvolts, with a
-# warning), since dropping it is the caller's decision.
-_VOLTAGE_UNIT_TO_MICROVOLTS = {"V": 1e6, "MV": 1e3, "UV": 1.0, "NV": 1e-3}
 
 # Writers that anonymise a recording replace the New Segment date with the earliest date the field can
 # hold rather than removing it (Wonambi writes 19000101000000000000). It is not a recording time.
@@ -47,6 +45,11 @@ class BrainVisionMarker:
     size: int
     channel_number: int
     date: datetime | None = None
+
+    @property
+    def is_new_segment(self) -> bool:
+        """Whether the marker records a resumption of recording, rather than an event in the data."""
+        return self.marker_type == _NEW_SEGMENT
 
 
 @dataclass(frozen=True)
@@ -82,36 +85,42 @@ class BrainVisionHeader:
 
     @property
     def recording_start(self) -> datetime | None:
-        """Wall-clock time of the first sample, when the marker file states one."""
+        """
+        Wall-clock time of the first sample, when the ``New Segment`` marker at the first sample states one.
+
+        A date on a later segment is not carried back to the first, since the pauses before it are unknown.
+        """
         return self.segments[0].date if self.segments else None
 
 
-def _decode_text(raw: bytes, file_path: Path) -> str:
+def _decode_text(raw: bytes) -> str:
     """
-    Decode a header or marker file using its declared ``Codepage``.
+    Decode a header or marker file, as UTF-8 when it is valid UTF-8 and by its declared ``Codepage`` otherwise.
 
     Files written before the format adopted UTF-8 declare ``ANSI`` (Windows-1252) or nothing at all;
     AnyWave's exporter, for one, writes the micro sign as the single Latin-1 byte 0xB5 with no
-    ``Codepage`` line. Absent a declaration UTF-8 is tried first, since it fails loudly on such a byte,
-    and Windows-1252 second.
+    ``Codepage`` line. UTF-8 is tried first whatever the declaration says, because writers also declare
+    ``ANSI`` over UTF-8 text, and because UTF-8 fails loudly on the lone high bytes of a single-byte
+    encoding while Windows-1252 accepts almost any byte sequence and would turn UTF-8 into mojibake.
+    Latin-1, which accepts every byte, is the last resort.
     """
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
 
     # The key itself is ASCII in every encoding, so it can be found before the encoding is known.
     declared = re.search(rb"^\s*Codepage\s*=\s*([^\r\n;]+)", raw, re.IGNORECASE | re.MULTILINE)
-    candidates = []
+    candidates = ["utf-8"]
     if declared:
         codepage = declared.group(1).decode("ascii", "replace").strip()
         candidates.append("cp1252" if codepage.upper() == "ANSI" else codepage)
-    candidates += ["utf-8", "cp1252", "latin-1"]
+    candidates.append("cp1252")
 
     for encoding in candidates:
         try:
             return raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-    raise AssertionError("latin-1 decodes any byte sequence")  # pragma: no cover
+    return raw.decode("latin-1")
 
 
 def _parse_ini(text: str) -> dict[str, dict[str, str]]:
@@ -141,7 +150,7 @@ def _parse_ini(text: str) -> dict[str, dict[str, str]]:
 
 
 def _read_ini(file_path: Path) -> dict[str, dict[str, str]]:
-    return _parse_ini(_decode_text(file_path.read_bytes(), file_path=file_path))
+    return _parse_ini(_decode_text(file_path.read_bytes()))
 
 
 def _resolve_companion(header_path: Path, named: str | None, suffix: str, role: str) -> Path | None:
@@ -170,21 +179,23 @@ def _resolve_companion(header_path: Path, named: str | None, suffix: str, role: 
 
 def _parse_unit(unit: str) -> str:
     """Normalise a declared unit, defaulting to microvolts as the format does when none is given."""
-    unit = unit.strip()
-    # A UTF-8 micro sign decoded as Windows-1252 reads "Âµ"; a file that declares ANSI but was written as
-    # UTF-8 produces exactly that.
-    unit = unit.replace("Âµ", "µ")
-    return unit or "µV"
+    return unit.strip() or "µV"
 
 
-def _unit_to_microvolts(unit: str) -> float | None:
-    normalized = unit.replace("µ", "u").replace("μ", "u").upper()
-    return _VOLTAGE_UNIT_TO_MICROVOLTS.get(normalized)
+def _parse_number(value: str, kind: type, header_path: Path, field: str):
+    """Parse a numeric header field, naming the file and the field when it is not a number."""
+    try:
+        return kind(value.strip())
+    except ValueError:
+        description = "an integer" if kind is int else "a number"
+        raise ValueError(
+            f"The BrainVision header '{header_path.name}' gives {field} as {value!r}, which is not {description}."
+        ) from None
 
 
 def _parse_channels(channel_infos: dict[str, str], number_of_channels: int, header_path: Path):
     names, references, resolutions, units = [], [], [], []
-    blank_resolutions = []
+    blank_resolutions, zero_resolutions = [], []
     for index in range(1, number_of_channels + 1):
         entry = channel_infos.get(f"ch{index}")
         if entry is None:
@@ -201,7 +212,9 @@ def _parse_channels(channel_infos: dict[str, str], number_of_channels: int, head
         if resolution == "":
             blank_resolutions.append(name)
             resolution = "1"
-        resolutions.append(float(resolution))
+        resolutions.append(_parse_number(resolution, float, header_path, f"the resolution of Ch{index}"))
+        if resolutions[-1] == 0:
+            zero_resolutions.append(f"Ch{index}={entry}")
         units.append(_parse_unit(unit))
 
     if blank_resolutions:
@@ -212,6 +225,14 @@ def _parse_channels(channel_infos: dict[str, str], number_of_channels: int, head
             UserWarning,
             stacklevel=4,
         )
+    if zero_resolutions:
+        warnings.warn(
+            f"The BrainVision header '{header_path.name}' gives a resolution of 0 for {len(zero_resolutions)} "
+            f"channel(s) ({', '.join(repr(line) for line in zero_resolutions[:5])}), so every sample of them "
+            "scales to 0. A decimal comma, as in '0,1' for 0.1, is read as a field separator and produces this.",
+            UserWarning,
+            stacklevel=4,
+        )
     return names, references, np.asarray(resolutions, dtype="float64"), units
 
 
@@ -219,7 +240,9 @@ def _gains_to_microvolts(resolutions: np.ndarray, units: list[str], names: list[
     gains = np.empty(len(units), dtype="float64")
     non_voltage: dict[str, list[str]] = {}
     for index, unit in enumerate(units):
-        factor = _unit_to_microvolts(unit)
+        # A unit that is not a voltage is still read, as microvolts with a warning, since dropping the
+        # channel is the caller's decision.
+        factor = unit_to_microvolts(unit)
         if factor is None:
             non_voltage.setdefault(unit, []).append(names[index])
             factor = 1.0
@@ -336,18 +359,21 @@ def _build_segments(
     Split the samples at ``New Segment`` markers and place each run at its real time.
 
     A New Segment marker is written whenever recording resumes after a pause; the samples stay
-    back-to-back in the file, and only the marker's date says how much time passed. A segment is placed
-    at its own date relative to the first segment's when both are known, and directly after the
-    previous segment otherwise.
+    back-to-back in the file, and only the marker's date says how much time passed. A dated segment is
+    placed at its date relative to the latest dated segment before it, and any other segment directly
+    after the previous one. A date with no dated segment before it to measure from cannot be placed, so
+    the pause before it is lost; that is warned about.
     """
     boundaries = {0: None}
     for marker in markers:
-        if marker.marker_type == _NEW_SEGMENT and 0 <= marker.sample_index < number_of_samples:
+        if marker.is_new_segment and 0 <= marker.sample_index < number_of_samples:
             if marker.sample_index not in boundaries or boundaries[marker.sample_index] is None:
                 boundaries[marker.sample_index] = marker.date
 
     starts = sorted(boundaries)
     segments = []
+    anchor = None  # the latest segment so far with a date, which later dates are measured from
+    unanchored = []  # first samples of dated segments with no dated segment before them
     for index, first_sample in enumerate(starts):
         end = starts[index + 1] if index + 1 < len(starts) else number_of_samples
         date = boundaries[first_sample]
@@ -357,8 +383,10 @@ def _build_segments(
             previous = segments[-1]
             contiguous = previous.start_time + previous.number_of_samples / sampling_frequency
             start_time = contiguous
-            if date is not None and segments[0].date is not None:
-                dated = segments[0].start_time + (date - segments[0].date).total_seconds()
+            if date is not None and anchor is None:
+                unanchored.append(first_sample)
+            elif date is not None:
+                dated = anchor.start_time + (date - anchor.date).total_seconds()
                 # A clock that steps backwards would make segments overlap on the timeline, which no
                 # consumer can index; such a segment is kept in file order instead.
                 if dated < contiguous - 0.5 / sampling_frequency:
@@ -371,10 +399,22 @@ def _build_segments(
                     )
                 else:
                     start_time = dated
-        segments.append(
-            BrainVisionSegment(
-                first_sample=first_sample, number_of_samples=end - first_sample, start_time=start_time, date=date
-            )
+        segment = BrainVisionSegment(
+            first_sample=first_sample, number_of_samples=end - first_sample, start_time=start_time, date=date
+        )
+        segments.append(segment)
+        if date is not None:
+            anchor = segment
+
+    if unanchored:
+        shown = ", ".join(str(first_sample + 1) for first_sample in unanchored[:5])
+        warnings.warn(
+            f"In '{marker_path.name}', the New Segment marker at the first sample has no date, but the one(s) at "
+            f"sample(s) {shown} do. With nothing to measure those dates from, the length of the pause before "
+            "each is unknown, so each is placed directly after the segment before it, and the recording has no "
+            "start time.",
+            UserWarning,
+            stacklevel=3,
         )
     return segments
 
@@ -432,8 +472,19 @@ def read_brainvision_header(file_path) -> BrainVisionHeader:
         )
     dtype = _BINARY_FORMAT_TO_DTYPE[binary_format]
 
-    number_of_channels = int(_required("numberofchannels"))
-    sampling_frequency = 1e6 / float(_required("samplinginterval"))
+    number_of_channels = _parse_number(_required("numberofchannels"), int, header_path, "NumberOfChannels")
+    if number_of_channels < 1:
+        raise ValueError(
+            f"The BrainVision header '{header_path.name}' gives NumberOfChannels={number_of_channels}; a recording "
+            "needs at least one channel."
+        )
+    sampling_interval = _parse_number(_required("samplinginterval"), float, header_path, "SamplingInterval")
+    if not sampling_interval > 0:
+        raise ValueError(
+            f"The BrainVision header '{header_path.name}' gives SamplingInterval={sampling_interval}; the interval "
+            "between samples, in microseconds, must be positive."
+        )
+    sampling_frequency = 1e6 / sampling_interval
 
     data_path = _resolve_companion(header_path, common.get("datafile"), ".eeg", "data")
     if data_path is None:

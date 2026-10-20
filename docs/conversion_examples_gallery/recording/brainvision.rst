@@ -53,12 +53,20 @@ Markers and segments
 
 The markers in the ``.vmrk`` file are written to a ``TimeIntervals`` table named ``"markers"``, with
 the marker's type, its description (in the ``label`` column), its size in samples, and the channel it
-refers to. Pass ``write_markers=False`` as a conversion option to leave them out.
+refers to. Pass ``write_markers=False`` as a conversion option to leave them out. A marker positioned
+outside the recorded samples has no time in the recording and is left out, with a warning. When several
+BrainVision recordings are written into one NWB file, as through a ``ConverterPipe``, they share the
+table, and its ``source_file`` column names the ``.vhdr`` each marker came from.
 
 A recording that was paused and resumed carries a ``New Segment`` marker at each resumption. Each run
 of samples between them is written as its own ``ElectricalSeries``, placed at the time its marker
 states and sharing one electrodes table, and the runs are listed in a ``TimeIntervals`` table named
 ``"segments"``. A recording that was never paused is written as a single ``ElectricalSeries``.
+
+The recording's start time, ``session_start_time``, is the date on the ``New Segment`` marker at the first
+sample. A later segment's date places that segment relative to the dated segment before it; if the first
+segment has no date, later dates have nothing to be measured from, so those pauses cannot be recovered and
+a warning says so.
 
 Only binary, continuous (unsegmented) time-domain data is supported. ASCII data and data segmented
 by BrainVision Analyzer are refused with an error.
