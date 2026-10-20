@@ -4,8 +4,11 @@ from typing import Literal
 from pydantic import FilePath
 from pynwb import NWBFile
 
+from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....utils import DeepDict
+
+_SOURCE_FILE_DESCRIPTION = "Name of the BrainVision .vhdr header the row was read from."
 
 
 class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
@@ -24,7 +27,8 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
 
     Markers are written to a ``TimeIntervals`` table named ``"markers"``. Several BrainVision recordings
     written into one NWB file share that table, and the ``"segments"`` table, with a ``source_file``
-    column saying which recording each row came from.
+    column saying which recording each row came from. Interfaces over one recording, such as an EEG interface
+    beside an auxiliary one with the complementary ``channels_to_skip``, write its rows once.
     """
 
     display_name = "BrainVision Recording"
@@ -209,38 +213,6 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
         start_time = float(self.recording_extractor.get_start_time(segment_index=segment_index))
         return start_time + (sample_index - segment.first_sample) / self.brainvision_header.sampling_frequency
 
-    def _get_or_create_table(self, nwbfile: NWBFile, name: str, description: str, columns: dict):
-        """
-        Return the ``TimeIntervals`` table ``name`` to add rows to, creating it if the file has none.
-
-        A table of that name already in the file is extended when it was written by another BrainVision
-        interface (as when two recordings go into one file through a ``ConverterPipe``), so neither
-        recording's rows are lost. A table of that name with other columns came from something else and is
-        left alone, with a warning; None is returned.
-        """
-        from pynwb.epoch import TimeIntervals
-
-        columns = dict(columns, source_file="Name of the BrainVision .vhdr header the row was read from.")
-        if nwbfile.intervals is not None and name in nwbfile.intervals:
-            table = nwbfile.intervals[name]
-            expected = {"start_time", "stop_time", *columns}
-            if set(table.colnames) != expected:
-                warnings.warn(
-                    f"The NWB file already has an intervals table named {name!r}, with columns "
-                    f"{sorted(table.colnames)} rather than a BrainVision {name} table's {sorted(expected)}. "
-                    f"The {name} of '{self.brainvision_header.header_path.name}' are not written.",
-                    UserWarning,
-                    stacklevel=3,
-                )
-                return None
-            return table
-
-        table = TimeIntervals(name=name, description=description)
-        for column_name, column_description in columns.items():
-            table.add_column(name=column_name, description=column_description)
-        nwbfile.add_time_intervals(table)
-        return table
-
     def _add_markers_to_nwbfile(self, nwbfile: NWBFile):
         header = self.brainvision_header
         markers = [marker for marker in header.markers if not marker.is_new_segment]
@@ -262,8 +234,29 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
         if not markers:
             return
 
-        table = self._get_or_create_table(
+        channel_names = header.channel_names
+        rows = []
+        for marker in markers:
+            start_time = self._time_of_sample(marker.sample_index)
+            channel = ""
+            if 1 <= marker.channel_number <= len(channel_names):
+                channel = channel_names[marker.channel_number - 1]
+            rows.append(
+                dict(
+                    start_time=start_time,
+                    stop_time=start_time + max(marker.size, 1) / header.sampling_frequency,
+                    marker_type=marker.marker_type,
+                    label=marker.description,
+                    size_in_samples=marker.size,
+                    channel=channel,
+                )
+            )
+        # .vmrk files are numbered in the order markers were set, which need not be the order they occur in.
+        rows.sort(key=lambda row: row["start_time"])
+
+        add_rows_to_intervals_table(
             nwbfile=nwbfile,
+            file_path=header.header_path,
             name="markers",
             description="Markers imported from BrainVision .vmrk files.",
             columns={
@@ -277,35 +270,28 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
                 ),
                 "channel": "Name of the channel the marker refers to, or an empty string for all channels.",
             },
+            rows=rows,
+            kind="BrainVision",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
         )
-        if table is None:
-            return
-
-        channel_names = header.channel_names
-        source_file = header.header_path.name
-        rows = []
-        for marker in markers:
-            start_time = self._time_of_sample(marker.sample_index)
-            channel = ""
-            if 1 <= marker.channel_number <= len(channel_names):
-                channel = channel_names[marker.channel_number - 1]
-            rows.append((start_time, marker, channel))
-        # .vmrk files are numbered in the order markers were set, which need not be the order they occur in.
-        rows.sort(key=lambda row: row[0])
-        for start_time, marker, channel in rows:
-            table.add_row(
-                start_time=start_time,
-                stop_time=start_time + max(marker.size, 1) / header.sampling_frequency,
-                marker_type=marker.marker_type,
-                label=marker.description,
-                size_in_samples=marker.size,
-                channel=channel,
-                source_file=source_file,
-            )
 
     def _add_segments_to_nwbfile(self, nwbfile: NWBFile):
-        table = self._get_or_create_table(
+        header = self.brainvision_header
+        rows = []
+        for segment_index, segment in enumerate(header.segments):
+            start_time = float(self.recording_extractor.get_start_time(segment_index=segment_index))
+            rows.append(
+                dict(
+                    start_time=start_time,
+                    stop_time=start_time + segment.number_of_samples / header.sampling_frequency,
+                    segment_index=segment_index,
+                    is_epoch=header.is_epoched,
+                )
+            )
+
+        add_rows_to_intervals_table(
             nwbfile=nwbfile,
+            file_path=header.header_path,
             name="segments",
             description=(
                 "Runs of samples in BrainVision recordings, each opened by a 'New Segment' marker: a resumption "
@@ -317,17 +303,7 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
                 "segment_index": "0-based index of the run of samples within its recording.",
                 "is_epoch": "True for an epoch of an epoched export, False for a run of a continuous recording.",
             },
+            rows=rows,
+            kind="BrainVision",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
         )
-        if table is None:
-            return
-
-        header = self.brainvision_header
-        for segment_index, segment in enumerate(header.segments):
-            start_time = float(self.recording_extractor.get_start_time(segment_index=segment_index))
-            table.add_row(
-                start_time=start_time,
-                stop_time=start_time + segment.number_of_samples / header.sampling_frequency,
-                segment_index=segment_index,
-                is_epoch=header.is_epoched,
-                source_file=header.header_path.name,
-            )

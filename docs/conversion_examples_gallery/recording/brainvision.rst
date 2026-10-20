@@ -58,7 +58,9 @@ the marker's type, its description (in the ``label`` column), its size in sample
 refers to. Pass ``write_markers=False`` as a conversion option to leave them out. A marker positioned
 outside the recorded samples has no time in the recording and is left out, with a warning. When several
 BrainVision recordings are written into one NWB file, as through a ``ConverterPipe``, they share the
-table, and its ``source_file`` column names the ``.vhdr`` each marker came from.
+table, and its ``source_file`` column names the ``.vhdr`` each marker came from. Interfaces over the
+same recording, such as one per channel type built with complementary ``channels_to_skip``, write its
+markers only once.
 
 A recording that was paused and resumed carries a ``New Segment`` marker at each resumption. Each run
 of samples between them is written as its own ``ElectricalSeries``, placed at the time its marker

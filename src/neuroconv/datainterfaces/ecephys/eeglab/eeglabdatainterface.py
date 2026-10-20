@@ -5,9 +5,12 @@ import numpy as np
 from pydantic import FilePath
 from pynwb import NWBFile
 
+from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....tools import get_package
 from ....utils import DeepDict
+
+_SOURCE_FILE_DESCRIPTION = "Name of the EEGLAB .set file the row was read from."
 
 
 def _load_eeg_struct(file_path: FilePath) -> dict:
@@ -432,7 +435,9 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
     recording (recovered from ``EEG.urevent``) so they share one session timeline. The per-epoch
     boundaries and time-locking event types are written to the NWB ``epochs`` table. In both cases
     ``EEG.event`` markers are written to a ``TimeIntervals`` table named ``"events"`` (disable with
-    ``write_events=False``; disable the epochs table with ``write_epochs=False``).
+    ``write_events=False``; disable the epochs table with ``write_epochs=False``). Several EEGLAB datasets
+    written into one NWB file share both tables, with a ``source_file`` column saying which ``.set`` file each
+    row came from; interfaces over one ``.set`` file write its rows once.
 
     ``subject_id`` is taken from ``EEG.subject``. Subject demographics from the in-struct
     ``EEG.BIDS.pInfo`` (a copy of ``participants.tsv``) are read only when
@@ -562,10 +567,12 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
             Metadata dictionary for constructing the NWBFile.
         write_events : bool, default: True
             If True, the EEGLAB ``EEG.event`` markers are written to a ``TimeIntervals`` table named
-            ``"events"``.
+            ``"events"``, with a ``source_file`` column. If another EEGLAB interface has already written that
+            table to the file, the rows are added to it.
         write_epochs : bool, default: True
             If True and the dataset is epoched, the per-epoch boundaries (and time-locking event types)
-            are written to the NWB ``epochs`` table.
+            are written to the NWB ``epochs`` table, or added to it as for the events. An ``epochs`` table
+            with other columns, written by something else, is left alone with a warning.
         **conversion_options
             Additional keyword arguments forwarded to the recording ``add_to_nwbfile`` method.
         """
@@ -594,26 +601,48 @@ class EEGLABRecordingInterface(BaseRecordingExtractorInterface):
             self._add_epochs_to_nwbfile(nwbfile=nwbfile)
 
     def _add_events_to_nwbfile(self, nwbfile: NWBFile):
-        from pynwb.epoch import TimeIntervals
-
-        events_table = TimeIntervals(
+        add_rows_to_intervals_table(
+            nwbfile=nwbfile,
+            file_path=self.source_data["file_path"],
             name="events",
             description="Events imported from the EEGLAB EEG.event structure.",
+            columns={"label": "The EEGLAB event type."},
+            rows=[
+                dict(start_time=event["start_time"], stop_time=event["stop_time"], label=event["label"])
+                for event in self._eeglab_events
+            ],
+            kind="EEGLAB",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
         )
-        events_table.add_column(name="label", description="The EEGLAB event type.")
-        for event in self._eeglab_events:
-            events_table.add_row(start_time=event["start_time"], stop_time=event["stop_time"], label=event["label"])
-        nwbfile.add_time_intervals(events_table)
 
     def _add_epochs_to_nwbfile(self, nwbfile: NWBFile):
-        """Write per-epoch boundaries (real session times) and locking-event types to the epochs table."""
-        if nwbfile.epochs is None or "epoch_index" not in nwbfile.epochs.colnames:
-            nwbfile.add_epoch_column(name="epoch_index", description="0-based index of the epoch (EEGLAB trial).")
-            nwbfile.add_epoch_column(name="label", description="Type of the time-locking event for the epoch.")
-        for epoch in self._eeglab_epochs:
-            nwbfile.add_epoch(
-                start_time=epoch["start_time"],
-                stop_time=epoch["stop_time"],
-                epoch_index=epoch["epoch_index"],
-                label=epoch["label"],
-            )
+        """
+        Write per-epoch boundaries (real session times) and locking-event types to the epochs table.
+
+        ``add_epoch_column`` is not used: it cannot extend an epochs table that already has rows, which another
+        interface in the same ``ConverterPipe``, or the caller of a pre-built ``NWBFile``, may have written.
+        """
+        add_rows_to_intervals_table(
+            nwbfile=nwbfile,
+            file_path=self.source_data["file_path"],
+            name="epochs",
+            description=(
+                "Epochs of EEGLAB datasets, at their real times on the session timeline. Each epoch is written "
+                "as its own ElectricalSeries."
+            ),
+            columns={
+                "epoch_index": "0-based index of the epoch (EEGLAB trial).",
+                "label": "Type of the time-locking event for the epoch.",
+            },
+            rows=[
+                dict(
+                    start_time=epoch["start_time"],
+                    stop_time=epoch["stop_time"],
+                    epoch_index=epoch["epoch_index"],
+                    label=epoch["label"],
+                )
+                for epoch in self._eeglab_epochs
+            ],
+            kind="EEGLAB",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
+        )

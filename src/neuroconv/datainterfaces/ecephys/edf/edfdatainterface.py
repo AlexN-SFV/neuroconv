@@ -1,13 +1,12 @@
 import re
 import warnings
-import weakref
 from datetime import date, datetime
-from pathlib import Path
 from typing import Literal
 
 from pydantic import FilePath
 from pynwb import NWBFile
 
+from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....tools import get_package
 from ....utils import DeepDict
@@ -17,12 +16,7 @@ from ....utils import DeepDict
 # locale — dropping the birthdate on machines that are configured differently.
 _MONTH_ABBREVIATIONS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
-# For each NWB file, the (resolved EDF path, table name) pairs whose rows have been written to it. Every
-# interface over one EDF file carries the same annotations and runs, whether it is a split_by_offset
-# partition or was built separately (an EEG interface beside an auxiliary one with the complementary
-# channels_to_skip), so the file is what is recorded, not the interface. Keyed weakly by the NWBFile itself,
-# not by id(), which Python reuses once a file is discarded.
-_INTERVALS_WRITTEN = weakref.WeakKeyDictionary()
+_SOURCE_FILE_DESCRIPTION = "Name of the EDF file the row was read from."
 
 
 def _warn_unreadable(field: str, value) -> None:
@@ -605,55 +599,6 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         if write_runs and len(getattr(self, "_edf_runs", [])) > 1:
             self._add_runs_to_nwbfile(nwbfile=nwbfile)
 
-    def _add_rows_to_table(self, nwbfile: NWBFile, name: str, description: str, columns: dict, rows: list[dict]):
-        """
-        Add ``rows`` to the ``TimeIntervals`` table ``name``, creating the table if the file has none.
-
-        Several EDF files written into one NWB file through a ``ConverterPipe`` share the table, with a
-        ``source_file`` column saying which file each row came from, so no file's rows are lost. Every
-        interface over one EDF file carries the same rows, so only the first of them to reach this NWB file
-        writes them. A table of that name with other columns came from something else and is left alone,
-        with a warning.
-
-        Which files have been written is known only for the NWB file in memory. Appending on disk to a
-        file that already holds this EDF file's rows writes them again.
-        """
-        from pynwb.epoch import TimeIntervals
-
-        # The EDF file is recognised by its resolved path, not by comparing rows: two recordings with the
-        # same file name and the same record layout have identical runs rows, and both must be kept.
-        written = _INTERVALS_WRITTEN.setdefault(nwbfile, set())
-        key = (str(Path(self.source_data["file_path"]).resolve()), name)
-        if key in written:
-            return
-        # Marked before writing, so a clash with a foreign table warns once per EDF file, not once per interface.
-        written.add(key)
-
-        source_file = Path(self.source_data["file_path"]).name
-        columns = dict(columns, source_file="Name of the EDF file the row was read from.")
-        rows = [dict(row, source_file=source_file) for row in rows]
-
-        if nwbfile.intervals is None or name not in nwbfile.intervals:
-            table = TimeIntervals(name=name, description=description)
-            for column_name, column_description in columns.items():
-                table.add_column(name=column_name, description=column_description)
-            nwbfile.add_time_intervals(table)
-        else:
-            table = nwbfile.intervals[name]
-            expected = {"start_time", "stop_time", *columns}
-            if set(table.colnames) != expected:
-                warnings.warn(
-                    f"The NWB file already has an intervals table named {name!r}, with columns "
-                    f"{sorted(table.colnames)} rather than an EDF {name} table's {sorted(expected)}. "
-                    f"The {name} of '{source_file}' are not written.",
-                    UserWarning,
-                    stacklevel=4,
-                )
-                return
-
-        for row in rows:
-            table.add_row(**row)
-
     def _add_annotations_to_nwbfile(self, nwbfile: NWBFile):
         """Write the EDF+ annotations to a TimeIntervals table, on the session timeline."""
         rows = []
@@ -662,12 +607,15 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             onset = float(annotation["onset"])
             start_time = onset + self._shift_for_time(onset)
             rows.append(dict(start_time=start_time, stop_time=start_time + float(duration), label=annotation["text"]))
-        self._add_rows_to_table(
+        add_rows_to_intervals_table(
             nwbfile=nwbfile,
+            file_path=self.source_data["file_path"],
             name="annotations",
             description="Annotations imported from the 'EDF Annotations' signals of EDF+ files.",
             columns={"label": "The EDF+ annotation text."},
             rows=rows,
+            kind="EDF",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
         )
 
     def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
@@ -692,8 +640,9 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
                     run_index=run_index,
                 )
             )
-        self._add_rows_to_table(
+        add_rows_to_intervals_table(
             nwbfile=nwbfile,
+            file_path=self.source_data["file_path"],
             name="runs",
             description=(
                 "Contiguous runs of data records in discontinuous EDF+ (EDF+D) files. Each run is "
@@ -701,6 +650,8 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             ),
             columns={"run_index": "0-based index of the contiguous run of data records within its EDF file."},
             rows=rows,
+            kind="EDF",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
         )
 
     @property
