@@ -1447,6 +1447,26 @@ class TestEDFDRecordingInterface:
         assert list(annotations["source_file"]) == ["first.edf", "first.edf", "second.edf"]
         assert list(runs["source_file"]) == ["first.edf"] * 3 + ["second.edf"] * 2
 
+    def test_separately_built_interfaces_over_one_file_write_its_rows_once(self, tmp_path, digital_data):
+        """
+        An EEG interface and an auxiliary one over the same file share its rows, as split partitions do.
+
+        They are not copies of one another, so state kept on the interface does not tell them apart from two
+        different files; what they have in common is the file.
+        """
+        path = write_edf(
+            tmp_path / "d.edf", record_onsets=GAPPED_ONSETS, data=digital_data, annotations=[(2.5, None, "x")]
+        )
+        interfaces = [
+            EDFRecordingInterface(file_path=path, metadata_key="eeg", channels_to_skip=["ch2"]),
+            EDFRecordingInterface(file_path=path, metadata_key="aux", channels_to_skip=["ch0", "ch1"]),
+        ]
+        annotations, runs = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(annotations["label"]) == ["x"]
+        assert list(runs["run_index"]) == [0, 1, 2]
+        assert list(runs["source_file"]) == ["d.edf"] * 3
+
     def test_same_name_and_layout_in_two_directories_keeps_both_files_rows(self, tmp_path, digital_data):
         """
         Two recordings that differ only in their data keep both files' rows.
