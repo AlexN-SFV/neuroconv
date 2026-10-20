@@ -21,6 +21,7 @@ Recording
     BioSemi Data Format (BDF) <recording/bdf>
     Biocam <recording/biocam>
     Blackrock <recording/blackrock>
+    BrainVision <recording/brainvision>
     European Data Format (EDF) <recording/edf>
     EEGLAB <recording/eeglab>
     Intan <recording/intan>

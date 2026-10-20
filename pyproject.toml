@@ -222,6 +222,9 @@ bdf = [
     "pyedflib>=0.1.36",
     "neuroconv[ecephys_minimal]",
 ]
+brainvision = [  # Read by neuroconv's own reader; nothing beyond the ecephys basics
+    "neuroconv[ecephys_minimal]",
+]
 edf = [
     "pyedflib>=0.1.36",
     "neuroconv[ecephys_minimal]",
@@ -302,6 +305,7 @@ ecephys = [  # Note that these are the requirements of the extractors as they ar
     "neuroconv[biocam]",
     "neuroconv[bdf]",
     "neuroconv[blackrock]",
+    "neuroconv[brainvision]",
     "neuroconv[cellexplorer]",
     "neuroconv[edf]",
     "neuroconv[eeglab]",

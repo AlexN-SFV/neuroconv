@@ -33,6 +33,10 @@ Blackrock Recording
 -------------------
 .. automodule:: neuroconv.datainterfaces.ecephys.blackrock.blackrockdatainterface
 
+BrainVision Recording
+---------------------
+.. automodule:: neuroconv.datainterfaces.ecephys.brainvision.brainvisiondatainterface
+
 CellExplorer Sorting
 --------------------
 .. automodule:: neuroconv.datainterfaces.ecephys.cellexplorer.cellexplorerdatainterface
