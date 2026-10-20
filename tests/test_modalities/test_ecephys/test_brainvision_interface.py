@@ -484,11 +484,17 @@ class TestEpochedExports:
         with pytest.raises(NotImplementedError, match=match):
             read_brainvision_header(path)
 
-    def test_missing_segment_length_names_the_field(self, tmp_path, int16_data):
+    def test_missing_segment_length_says_the_line_is_missing(self, tmp_path, int16_data):
         path = write_brainvision(
             tmp_path, int16_data, markers=["New Segment,,1,1,0"], extra_common="SegmentationType=MARKERBASED\n"
         )
-        with pytest.raises(ValueError, match="SegmentDataPoints"):
+        with pytest.raises(ValueError, match="has no SegmentDataPoints in \\[Common Infos\\]"):
+            read_brainvision_header(path)
+
+    def test_blank_segment_length_names_the_value(self, tmp_path, int16_data):
+        extra_common = "SegmentationType=MARKERBASED\nSegmentDataPoints=\n"
+        path = write_brainvision(tmp_path, int16_data, markers=["New Segment,,1,1,0"], extra_common=extra_common)
+        with pytest.raises(ValueError, match="gives SegmentDataPoints as '', which is not an integer"):
             read_brainvision_header(path)
 
     def test_epochs_are_written_as_series_and_listed(self, tmp_path, int16_data):

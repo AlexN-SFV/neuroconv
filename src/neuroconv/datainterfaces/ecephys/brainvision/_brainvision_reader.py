@@ -447,7 +447,12 @@ def _check_epochs(common: dict[str, str], markers: list[BrainVisionMarker], numb
     opened by a dated ``New Segment`` marker; that is the structure :func:`_build_segments` reads. A file
     whose markers do not partition the samples that way is refused rather than split at the wrong places.
     """
-    epoch_length = _parse_number(common.get("segmentdatapoints", ""), int, header_path, "SegmentDataPoints")
+    if "segmentdatapoints" not in common:
+        raise ValueError(
+            f"The BrainVision header '{header_path.name}' is an epoched export (SegmentationType=MARKERBASED) but "
+            "has no SegmentDataPoints in [Common Infos], so the length of its epochs is unknown."
+        )
+    epoch_length = _parse_number(common["segmentdatapoints"], int, header_path, "SegmentDataPoints")
     if epoch_length < 1 or number_of_samples % epoch_length:
         raise NotImplementedError(
             f"'{header_path.name}' is an epoched export of {number_of_samples} samples, which is not a whole number "

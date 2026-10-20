@@ -20,9 +20,11 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
     epoched export from BrainVision Analyzer (``SegmentationType=MARKERBASED``) one per epoch. Each run
     of samples between them is written as its own ``ElectricalSeries``, sharing one electrodes table, as
     discontinuous EDF+ is. A run is placed at the time its marker's date gives when an earlier dated run
-    gives that date something to be measured from, and directly after the run before it otherwise. Markers are written to a ``TimeIntervals``
-    table named ``"markers"``. Several BrainVision recordings written into one NWB file share that table,
-    and the ``"segments"`` table, with a ``source_file`` column saying which recording each row came from.
+    gives that date something to be measured from, and directly after the run before it otherwise.
+
+    Markers are written to a ``TimeIntervals`` table named ``"markers"``. Several BrainVision recordings
+    written into one NWB file share that table, and the ``"segments"`` table, with a ``source_file``
+    column saying which recording each row came from.
     """
 
     display_name = "BrainVision Recording"
