@@ -11,6 +11,8 @@ its import path in ``to_dict()``, so classes built inside a factory function can
 reloaded, which breaks ``recording.save()`` and every ``n_jobs > 1`` path.
 """
 
+from pathlib import Path
+
 import numpy as np
 from pydantic import FilePath
 from spikeinterface.core import BaseRecording, BaseRecordingSegment
@@ -22,6 +24,7 @@ from ._edfd_reader import (
     read_edf_header,
     read_record_onsets_and_annotations,
 )
+from .._channel_ids import set_original_channel_names, warn_about_renamed_channels
 
 
 class EDFDRecordingSegment(BaseRecordingSegment):
@@ -119,8 +122,10 @@ class EDFDRecordingExtractor(BaseRecording):
     file_path : FilePath
         Path to the ``.edf`` file.
     channels_to_skip : list, optional
-        Labels of channels to leave out of the recording. Applied while reading, so channels sampled at
-        a rate differing from the rest can be dropped before the uniform-rate check rejects the file.
+        Channels to leave out of the recording, by label or by id. Applied while reading, so channels
+        sampled at a rate differing from the rest can be dropped before the uniform-rate check rejects
+        the file. A label the file repeats skips every channel carrying it; the id a repeat was renamed
+        to skips that channel alone.
     """
 
     extractor_name = "EDFDRecording"
@@ -147,6 +152,11 @@ class EDFDRecordingExtractor(BaseRecording):
                 annotations = []
 
         layout = _build_channel_layout(header=header, channels_to_skip=channels_to_skip)
+        warn_about_renamed_channels(
+            labels=layout["channel_labels"],
+            ids=layout["channel_names"],
+            source=f"The EDF file '{Path(file_path).name}'",
+        )
         sampling_frequency = layout["sampling_frequency"]
 
         runs = group_records_into_runs(
@@ -181,6 +191,7 @@ class EDFDRecordingExtractor(BaseRecording):
         self.set_channel_gains(gains=layout["gains_to_microvolts"])
         self.set_channel_offsets(offsets=layout["offsets_to_microvolts"])
         self.set_property(key="channel_name", values=np.asarray(layout["channel_names"]))
+        set_original_channel_names(recording=self, labels=layout["channel_labels"], ids=layout["channel_names"])
         # SpikeInterface treats these as reserved properties — they describe the series rather than
         # becoming electrodes columns — and the neo-backed path sets them, so the two readers would
         # otherwise disagree about whether a caller can ask what unit the header declared. The
@@ -193,7 +204,7 @@ class EDFDRecordingExtractor(BaseRecording):
         self.edf_header = header
         self.annotations_from_file = annotations
         self.runs = runs
-        # Keyed by channel label, matching what the SpikeInterface path reports, so the interface's
+        # Keyed by channel id, matching what the SpikeInterface path reports, so the interface's
         # log_transformed_channels means the same thing whichever reader produced the recording.
         self.log_transforms = {
             layout["channel_names"][position]: transform for position, transform in layout["log_transforms"].items()

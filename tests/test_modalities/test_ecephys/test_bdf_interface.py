@@ -3,6 +3,7 @@
 Builds a small valid BioSemi BDF (24-bit) with pyedflib so the tests run without external data.
 """
 
+import warnings
 from datetime import datetime, timezone
 
 import numpy as np
@@ -150,3 +151,61 @@ class TestBDFRecordingInterface:
         # The gain in the declared unit is the physical range over the digital range.
         gain_in_dimension = (PHYSICAL_MAX - PHYSICAL_MIN) / (BDF_DIGITAL_MAX - BDF_DIGITAL_MIN)
         assert gain == pytest.approx(gain_in_dimension * to_microvolts)
+
+
+class TestRepeatedLabels:
+    @pytest.fixture
+    def repeated_path(self, tmp_path):
+        """Two channels labelled EXG1, as a BioSemi montage that lists one input twice can leave behind."""
+        pyedflib = pytest.importorskip("pyedflib")
+        path = tmp_path / "repeated.bdf"
+        labels = ["EXG1", "EXG1", "Cz"]
+        number_of_samples = int(SAMPLING_FREQUENCY * DURATION_SECONDS)
+        signals = [np.full(number_of_samples, 10.0 * (index + 1)) for index in range(len(labels))]
+        writer = pyedflib.EdfWriter(str(path), len(labels), file_type=pyedflib.FILETYPE_BDFPLUS)
+        writer.setSignalHeaders(
+            [
+                dict(
+                    label=label,
+                    dimension="uV",
+                    sample_frequency=SAMPLING_FREQUENCY,
+                    physical_min=PHYSICAL_MIN,
+                    physical_max=PHYSICAL_MAX,
+                    digital_min=BDF_DIGITAL_MIN,
+                    digital_max=BDF_DIGITAL_MAX,
+                    transducer="",
+                    prefilter="",
+                )
+                for label in labels
+            ]
+        )
+        writer.setStartdatetime(datetime(2023, 5, 1, 9, 30, 0))
+        writer.writeSamples(signals)
+        writer.close()
+        return path
+
+    def test_a_repeat_is_renamed_and_written(self, repeated_path, tmp_path):
+        assert BDFRecordingInterface.get_available_channel_ids(repeated_path) == ["EXG1", "EXG1_2", "Cz"]
+        with pytest.warns(UserWarning, match="'EXG1' -> 'EXG1_2'"):
+            interface = BDFRecordingInterface(file_path=repeated_path)
+        recording = interface.recording_extractor
+        assert list(recording.get_channel_ids()) == ["EXG1", "EXG1_2", "Cz"]
+        # The second EXG1 reads its own signal (20 uV), not the first's.
+        assert recording.get_traces(channel_ids=["EXG1_2"], return_in_uV=True)[0, 0] == pytest.approx(20.0, abs=1e-3)
+
+        metadata = interface.get_metadata()
+        metadata["NWBFile"]["session_start_time"] = datetime(2023, 5, 1, 9, 30, tzinfo=timezone.utc)
+        nwbfile_path = tmp_path / "repeated.nwb"
+        interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            electrodes = io.read().electrodes.to_dataframe()
+        assert list(electrodes["channel_name"]) == ["EXG1", "EXG1_2", "Cz"]
+        assert list(electrodes["original_channel_name"]) == ["EXG1", "EXG1", "Cz"]
+
+    def test_skipping_by_label_or_by_renamed_id(self, repeated_path):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            by_id = BDFRecordingInterface(file_path=repeated_path, channels_to_skip=["EXG1_2"])
+            by_label = BDFRecordingInterface(file_path=repeated_path, channels_to_skip=["EXG1"])
+        assert list(by_id.recording_extractor.get_channel_ids()) == ["EXG1", "Cz"]
+        assert list(by_label.recording_extractor.get_channel_ids()) == ["Cz"]

@@ -14,6 +14,12 @@ from pydantic import FilePath
 from spikeinterface.core import BaseRecording, BaseRecordingSegment
 
 from ._brainvision_reader import BrainVisionHeader, memmap_samples, read_brainvision_header
+from .._channel_ids import (
+    indices_to_keep,
+    set_original_channel_names,
+    unknown_channels_to_skip,
+    warn_about_renamed_channels,
+)
 
 
 class BrainVisionRecordingSegment(BaseRecordingSegment):
@@ -64,7 +70,8 @@ class BrainVisionRecordingExtractor(BaseRecording):
     file_path : FilePath
         Path to the ``.vhdr`` header file.
     channels_to_skip : list, optional
-        Names of channels to leave out of the recording.
+        Channels to leave out of the recording, by id or by name. A name the header gives more than one
+        channel leaves out all of them; the id a repeat was renamed to leaves out that channel alone.
     """
 
     extractor_name = "BrainVisionRecording"
@@ -74,23 +81,22 @@ class BrainVisionRecordingExtractor(BaseRecording):
     def __init__(self, file_path: FilePath, channels_to_skip: list | None = None):
         header = read_brainvision_header(file_path)
 
-        skip = set(channels_to_skip or [])
-        unknown = skip - set(header.channel_names)
+        labels = header.channel_names
+        ids = header.channel_ids
+        unknown = unknown_channels_to_skip(labels=labels, ids=ids, channels_to_skip=channels_to_skip)
         if unknown:
             raise ValueError(
-                f"channels_to_skip names channels that are not in the recording: {sorted(unknown)}. "
-                f"Available channels: {header.channel_names}."
+                f"channels_to_skip names channels that are not in the recording: {unknown}. "
+                f"Available channels: {ids}."
             )
-        channel_indices = np.array([index for index, name in enumerate(header.channel_names) if name not in skip])
+        channel_indices = np.array(indices_to_keep(labels=labels, ids=ids, channels_to_skip=channels_to_skip))
         if len(channel_indices) == 0:
             raise ValueError("channels_to_skip leaves no channels in the recording.")
-        channel_names = [header.channel_names[index] for index in channel_indices]
-        if len(set(channel_names)) != len(channel_names):
-            duplicates = sorted({name for name in channel_names if channel_names.count(name) > 1})
-            raise ValueError(
-                f"The BrainVision header '{header.header_path.name}' names more than one channel {duplicates}; "
-                "channel names must be unique to be used as channel IDs."
-            )
+        channel_names = [ids[index] for index in channel_indices]
+        kept_labels = [labels[index] for index in channel_indices]
+        warn_about_renamed_channels(
+            labels=kept_labels, ids=channel_names, source=f"The BrainVision header '{header.header_path.name}'"
+        )
 
         super().__init__(
             sampling_frequency=header.sampling_frequency,
@@ -113,6 +119,7 @@ class BrainVisionRecordingExtractor(BaseRecording):
         self.set_channel_gains(gains=header.gains_to_microvolts[channel_indices])
         self.set_channel_offsets(offsets=np.zeros(len(channel_indices)))
         self.set_property(key="channel_name", values=np.asarray(channel_names))
+        set_original_channel_names(recording=self, labels=kept_labels, ids=channel_names)
         # The unit the header declares, and the scaling into it rather than into microvolts, so a caller can
         # check the header against an external source such as a BIDS channels.tsv, as on the EDF readers.
         self.set_property(key="physical_unit", values=np.asarray([header.units[index] for index in channel_indices]))

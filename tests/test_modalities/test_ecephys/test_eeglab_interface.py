@@ -446,3 +446,26 @@ class TestEEGLABInterfacesSharingOneNWBFile:
         assert list(nwbfile.epochs.to_dataframe()["tags"]) == [["baseline"]]
         assert list(nwbfile.intervals["events"].to_dataframe()["label"]) == ["go", "go"]
         assert len(nwbfile.acquisition) == 2
+
+
+class TestRepeatedChannelLabels:
+    def test_a_repeat_is_renamed_and_written(self, tmp_path, microvolt_traces):
+        eeg = _make_eeg_struct(microvolt_traces, with_events=False)
+        eeg["chanlocs"]["labels"] = ["Fz", "Cz", "Fz", "Oz"]
+        set_path = tmp_path / "repeated.set"
+        savemat(str(set_path), {"EEG": eeg}, do_compression=True)
+
+        with pytest.warns(UserWarning, match="'Fz' -> 'Fz_2'") as caught:
+            interface = EEGLABRecordingInterface(file_path=set_path)
+        # EEGLAB takes no channels_to_skip, so the warning does not offer it.
+        assert not any("channels_to_skip" in str(warning.message) for warning in caught)
+        recording = interface.recording_extractor
+        assert list(recording.get_channel_ids()) == ["Fz", "Cz", "Fz_2", "Oz"]
+        np.testing.assert_allclose(recording.get_traces(channel_ids=["Fz_2"])[:, 0], microvolt_traces[2])
+
+        nwbfile_path = tmp_path / "repeated.nwb"
+        interface.run_conversion(nwbfile_path=nwbfile_path, metadata=_session_metadata(interface), overwrite=True)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            electrodes = io.read().electrodes.to_dataframe()
+        assert list(electrodes["channel_name"]) == ["Fz", "Cz", "Fz_2", "Oz"]
+        assert list(electrodes["original_channel_name"]) == ["Fz", "Cz", "Fz", "Oz"]

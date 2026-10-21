@@ -54,6 +54,17 @@ streams and is read one stream at a time: list them with
     nwbfile_path = f"{path_to_save_nwbfile}"
     interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
 
+Repeated channel labels
+^^^^^^^^^^^^^^^^^^^^^^^
+
+The channel labels become the channel ids and the electrodes table's ``channel_name``, which must be
+unique, but EDF does not require labels to be. When a file gives two channels sampled at the same rate
+the same label, the first keeps it and the later ones are renamed ``C3_2``, ``C3_3`` and so on, with a
+warning. ``get_available_channel_ids`` lists the renamed ids, and the labels as the file gives them are
+written to an ``original_channel_name`` electrodes column. In ``channels_to_skip``, a renamed id such as
+``C3_2`` skips that channel alone, and a repeated label such as ``C3`` skips every channel carrying it.
+The BDF, BrainVision and EEGLAB interfaces handle repeated labels the same way.
+
 Handling Channels with Heterogeneous Offsets
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
