@@ -396,6 +396,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         files converted before the annotations were read, and must keep converting.
         """
         from ._edfd_reader import read_continuous_annotations
+        from .._channel_ids import _stacklevel_outside_neuroconv
 
         try:
             return read_continuous_annotations(file_path=file_path)
@@ -404,7 +405,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
                 f"The annotations of the EDF file '{Path(file_path).name}' could not be read, so it is converted "
                 f"without them: {error}",
                 UserWarning,
-                stacklevel=4,
+                stacklevel=_stacklevel_outside_neuroconv(),
             )
             return []
 

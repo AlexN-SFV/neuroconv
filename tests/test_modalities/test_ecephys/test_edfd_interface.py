@@ -1234,8 +1234,10 @@ class TestEDFDRecordingInterface:
             reserved="EDF+C",
             annotations=[(2.5, None, "Marker: 601")],
         )
-        with pytest.warns(UserWarning, match="could not be read.*malformed header"):
+        with pytest.warns(UserWarning, match="could not be read.*malformed header") as records:
             interface = EDFRecordingInterface(file_path=path)
+        # Attributed to the caller's line, not to the base interface's constructor inside neuroconv.
+        assert [Path(record.filename).name for record in records] == [Path(__file__).name]
         nwbfile = interface.create_nwbfile(metadata=_metadata(interface))
         assert "annotations" not in nwbfile.intervals
 
