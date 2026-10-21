@@ -45,7 +45,10 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
     @staticmethod
     def get_available_channel_ids(file_path: FilePath) -> list:
         """
-        Get the names of all channels in a BrainVision recording, from its header alone.
+        Get the ids of all channels in a BrainVision recording, from its header alone.
+
+        The ids are the channel names, except that a name the header repeats is renamed after its first
+        occurrence (``Fp1``, ``Fp1_2``, ...), because ids must be unique.
 
         Parameters
         ----------
@@ -55,11 +58,11 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
         Returns
         -------
         list
-            The channel names, in file order.
+            The channel ids, in file order.
         """
         from ._brainvision_reader import read_brainvision_header
 
-        return list(read_brainvision_header(file_path).channel_names)
+        return read_brainvision_header(file_path).channel_ids
 
     @classmethod
     def get_extractor_class(cls):
@@ -99,7 +102,8 @@ class BrainVisionRecordingInterface(BaseRecordingExtractorInterface):
             Key that indexes this interface's entries in the dict-based metadata. Defaults to
             ``"brainvision_recording"``.
         channels_to_skip : list, default: None
-            Names of channels to leave out, such as auxiliary channels that are not neural data.
+            Channels to leave out, such as auxiliary channels that are not neural data, by id or by name.
+            A name the header gives more than one channel leaves out all of them.
         """
         super().__init__(
             file_path=file_path,

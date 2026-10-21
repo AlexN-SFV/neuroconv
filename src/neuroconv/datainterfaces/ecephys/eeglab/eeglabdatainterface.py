@@ -5,6 +5,7 @@ import numpy as np
 from pydantic import FilePath
 from pynwb import NWBFile
 
+from .._channel_ids import set_original_channel_names, unique_channel_ids, warn_about_renamed_channels
 from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....tools import get_package
@@ -387,7 +388,14 @@ def _read_eeglab_recording(file_path: FilePath):
     traces_per_segment = [traces[:, :, trial_index].T.astype("float32") for trial_index in range(number_of_trials)]
     t_starts = epoch_onsets if is_epoched else None
 
-    channel_names, locations = _extract_channel_info(eeg_struct=eeg_struct, number_of_channels=number_of_channels)
+    channel_labels, locations = _extract_channel_info(eeg_struct=eeg_struct, number_of_channels=number_of_channels)
+    channel_names = unique_channel_ids(channel_labels)
+    warn_about_renamed_channels(
+        labels=channel_labels,
+        ids=channel_names,
+        source=f"The EEGLAB dataset '{file_path.name}'",
+        accepts_channels_to_skip=False,
+    )
     events = _extract_events(
         eeg_struct=eeg_struct,
         sampling_frequency=sampling_frequency,
@@ -413,6 +421,7 @@ def _read_eeglab_recording(file_path: FilePath):
     recording.set_channel_gains(gains=np.ones(number_of_channels))
     recording.set_channel_offsets(offsets=np.zeros(number_of_channels))
     recording.set_property(key="channel_name", values=np.asarray(channel_names))
+    set_original_channel_names(recording=recording, labels=channel_labels, ids=channel_names)
     if locations is not None:
         recording.set_property(key="location", values=np.asarray(locations, dtype="float64"))
 

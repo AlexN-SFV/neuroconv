@@ -56,9 +56,11 @@ class EDFAnalogInterface(BaseRecordingAsTimeSeriesInterface):
     @staticmethod
     def get_available_channel_ids(file_path: FilePath) -> list:
         """
-        Get all available channel names from an EDF file.
+        Get all available channel ids from an EDF file.
 
-        The names span the whole file. A file that sampled some of its signals at a different rate
+        The ids are the channel labels, except that a label repeated among the signals sampled at one rate
+        is renamed after its first occurrence (``C3``, ``C3_2``, ...), because ids must be unique. They
+        span the whole file. A file that sampled some of its signals at a different rate
         than the rest holds them in separate streams, and an interface reads one stream at a time, so
         the channels of the stream it holds are a subset of these. They are read from the file's
         header, so this works on a file with more than one stream.
@@ -71,19 +73,11 @@ class EDFAnalogInterface(BaseRecordingAsTimeSeriesInterface):
         Returns
         -------
         list
-            List of all channel names in the EDF file
+            List of all channel ids in the EDF file
         """
-        from pyedflib import EdfReader
+        from ._edf_channel_ids import available_channel_ids
 
-        edf_reader = EdfReader(str(file_path))
-        try:
-            channel_names = edf_reader.getSignalLabels()
-        finally:
-            # EDFlib refuses to open a file it already has open, so the handle is released here
-            # rather than left to garbage collection.
-            edf_reader.close()
-
-        return channel_names
+        return available_channel_ids(file_path=file_path)
 
     def __init__(
         self,
@@ -102,7 +96,7 @@ class EDFAnalogInterface(BaseRecordingAsTimeSeriesInterface):
         file_path : FilePath
             Path to the EDF file
         channels_to_include : list of str, optional
-            Specific channel IDs to include.
+            Specific channel IDs to include, as ``get_available_channel_ids`` gives them.
         verbose : bool, default: False
             Verbose output
         metadata_key : str, default: "edf_analog"
@@ -120,9 +114,20 @@ class EDFAnalogInterface(BaseRecordingAsTimeSeriesInterface):
         self._file_path = Path(file_path)
         self.metadata_key = metadata_key
 
+        from ._edf_channel_ids import has_repeated_labels, rename_to_unique_channel_ids
+        from .._channel_ids import report_renamed_channels
+
+        # SpikeInterface refuses labels repeated within a stream as ids, so such a file is read with neo's
+        # positional ids and renamed to the labels made unique.
+        repeated_labels = has_repeated_labels(file_path=self._file_path)
         full_recording = read_edf(
-            file_path=self._file_path, stream_name=stream_name, all_annotations=True, use_names_as_ids=True
+            file_path=self._file_path,
+            stream_name=stream_name,
+            all_annotations=True,
+            use_names_as_ids=not repeated_labels,
         )
+        if repeated_labels:
+            full_recording = rename_to_unique_channel_ids(recording=full_recording)
 
         # Validate that the requested channels exist
         self._channels_to_include = channels_to_include or full_recording.get_channel_ids().tolist()
@@ -137,6 +142,11 @@ class EDFAnalogInterface(BaseRecordingAsTimeSeriesInterface):
 
         # Extract only the analog channels
         self.recording_extractor = full_recording.select_channels(channel_ids=self._channels_to_include)
+        report_renamed_channels(
+            recording=self.recording_extractor,
+            source=f"The EDF file '{self._file_path.name}'",
+            accepts_channels_to_skip=False,
+        )
 
         super().__init__(
             file_path=self._file_path,

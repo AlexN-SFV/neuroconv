@@ -809,3 +809,56 @@ class TestPausedBrainVisionRecordingInterfaceContract(
 
     def check_extracted_metadata(self, metadata: dict):
         assert metadata["NWBFile"]["session_start_time"] == datetime(2021, 1, 1, 12, 0, 0)
+
+
+class TestRepeatedChannelNames:
+    CHANNELS = ["Fp1,,1,µV", "Fp1,,1,µV", "Fp1_2,,1,µV"]
+
+    def test_a_repeat_is_renamed_around_an_existing_name(self, tmp_path, int16_data):
+        """The second Fp1 cannot become Fp1_2, which a real channel already has, so it becomes Fp1_3."""
+        path = write_brainvision(tmp_path, int16_data, channels=self.CHANNELS)
+        assert BrainVisionRecordingInterface.get_available_channel_ids(path) == ["Fp1", "Fp1_3", "Fp1_2"]
+        with pytest.warns(UserWarning, match="'Fp1' -> 'Fp1_3'"):
+            recording = BrainVisionRecordingExtractor(path)
+
+        assert list(recording.get_channel_ids()) == ["Fp1", "Fp1_3", "Fp1_2"]
+        assert list(recording.get_property("original_channel_name")) == ["Fp1", "Fp1", "Fp1_2"]
+        np.testing.assert_array_equal(recording.get_traces(channel_ids=["Fp1_3"])[:, 0], int16_data[:, 1])
+
+    def test_skipping_by_name_or_by_renamed_id(self, tmp_path, int16_data):
+        path = write_brainvision(tmp_path, int16_data, channels=self.CHANNELS)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            by_id = BrainVisionRecordingExtractor(path, channels_to_skip=["Fp1_3"])
+            by_name = BrainVisionRecordingExtractor(path, channels_to_skip=["Fp1"])
+        assert list(by_id.get_channel_ids()) == ["Fp1", "Fp1_2"]
+        assert "original_channel_name" not in by_id.get_property_keys()
+        assert list(by_name.get_channel_ids()) == ["Fp1_2"]
+
+    def test_electrodes_table_keeps_both_channels(self, tmp_path, int16_data):
+        path = write_brainvision(tmp_path, int16_data, channels=self.CHANNELS)
+        with pytest.warns(UserWarning, match="renamed"):
+            interface = BrainVisionRecordingInterface(file_path=path)
+        metadata = interface.get_metadata()
+        metadata["NWBFile"]["session_start_time"] = datetime(2021, 1, 1)
+        nwbfile_path = tmp_path / "out.nwb"
+        interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata)
+
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            electrodes = io.read().electrodes.to_dataframe()
+        assert list(electrodes["channel_name"]) == ["Fp1", "Fp1_3", "Fp1_2"]
+        assert list(electrodes["original_channel_name"]) == ["Fp1", "Fp1", "Fp1_2"]
+
+    def test_rename_warning_names_the_callers_line(self, tmp_path, int16_data):
+        from pathlib import Path
+
+        path = write_brainvision(tmp_path, int16_data, channels=self.CHANNELS)
+        for build in (
+            lambda: BrainVisionRecordingExtractor(path),
+            lambda: BrainVisionRecordingInterface(file_path=path),
+        ):
+            with pytest.warns(UserWarning, match="renamed") as caught:
+                build()
+            assert [Path(warning.filename) for warning in caught if "renamed" in str(warning.message)] == [
+                Path(__file__)
+            ]

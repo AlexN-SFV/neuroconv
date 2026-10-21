@@ -946,13 +946,7 @@ class TestEDFDReader:
         with pytest.raises(ValueError, match="header size"):
             EDFDRecordingExtractor(file_path=path)
 
-    def test_duplicate_and_blank_labels_are_rejected(self, tmp_path, digital_data):
-        duplicate = write_edf(
-            tmp_path / "dup.edf", record_onsets=GAPPED_ONSETS, data=digital_data, channel_names=["a", "a", "b"]
-        )
-        with pytest.raises(ValueError, match="duplicate channel labels"):
-            EDFDRecordingExtractor(file_path=duplicate)
-
+    def test_blank_labels_are_rejected(self, tmp_path, digital_data):
         blank = write_edf(
             tmp_path / "blank.edf", record_onsets=GAPPED_ONSETS, data=digital_data, channel_names=["a", "", "b"]
         )
@@ -1599,3 +1593,271 @@ def _metadata(interface) -> dict:
     metadata = interface.get_metadata()
     metadata["NWBFile"].update(session_start_time=datetime(2021, 9, 16, 12, 35, 13))
     return metadata
+
+
+class TestRepeatedLabels:
+    """
+    EDF does not require unique labels, but channel ids must be unique, so a repeat is renamed.
+
+    Run through both readers: EDF+D is read by neuroconv's own, EDF+C by SpikeInterface's.
+    """
+
+    @pytest.fixture(params=["EDF+D", "EDF+C"])
+    def reserved(self, request):
+        return request.param
+
+    def _write(self, tmp_path, digital_data, reserved, channel_names=("a", "a", "b")):
+        onsets = GAPPED_ONSETS if reserved == "EDF+D" else CONTIGUOUS_ONSETS
+        return write_edf(
+            tmp_path / "repeated.edf",
+            record_onsets=onsets,
+            data=digital_data,
+            reserved=reserved,
+            channel_names=channel_names,
+        )
+
+    def test_a_repeat_is_renamed_after_its_first_occurrence(self, tmp_path, digital_data, reserved):
+        path = self._write(tmp_path, digital_data, reserved)
+        with pytest.warns(UserWarning, match="'a' -> 'a_2'"):
+            interface = EDFRecordingInterface(file_path=path)
+        recording = interface.recording_extractor
+
+        assert list(recording.get_channel_ids()) == ["a", "a_2", "b"]
+        assert list(recording.get_property("channel_name")) == ["a", "a_2", "b"]
+        assert list(recording.get_property("original_channel_name")) == ["a", "a", "b"]
+        assert EDFRecordingInterface.get_available_channel_ids(path) == ["a", "a_2", "b"]
+        # Each id still reads its own signal, not the first one carrying the label.
+        traces = recording.get_traces(segment_index=0, channel_ids=["a_2"])
+        np.testing.assert_array_equal(traces[:SAMPLES_PER_RECORD, 0], digital_data[0, 1])
+
+    def test_unique_labels_add_no_column(self, tmp_path, digital_data, reserved):
+        path = self._write(tmp_path, digital_data, reserved, channel_names=CHANNEL_NAMES)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            interface = EDFRecordingInterface(file_path=path)
+        assert list(interface.recording_extractor.get_channel_ids()) == CHANNEL_NAMES
+        assert "original_channel_name" not in interface.recording_extractor.get_property_keys()
+
+    def test_skipping_the_renamed_id_drops_that_channel_alone(self, tmp_path, digital_data, reserved):
+        """With the repeat dropped nothing left was renamed, so both readers stay silent and add no column."""
+        path = self._write(tmp_path, digital_data, reserved)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            interface = EDFRecordingInterface(file_path=path, channels_to_skip=["a_2"])
+        recording = interface.recording_extractor
+        assert list(recording.get_channel_ids()) == ["a", "b"]
+        assert "original_channel_name" not in recording.get_property_keys()
+        np.testing.assert_array_equal(recording.get_traces(segment_index=0)[:SAMPLES_PER_RECORD, 1], digital_data[0, 2])
+
+    def test_skipping_a_repeated_label_drops_every_channel_carrying_it(self, tmp_path, digital_data, reserved):
+        """What skipping by label did before repeats were renamed, so existing skip lists keep working."""
+        path = self._write(tmp_path, digital_data, reserved)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = EDFRecordingInterface(file_path=path, channels_to_skip=["a"])
+        assert list(interface.recording_extractor.get_channel_ids()) == ["b"]
+
+    def test_unknown_channel_to_skip_is_still_rejected(self, tmp_path, digital_data, reserved):
+        path = self._write(tmp_path, digital_data, reserved)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(ValueError):
+                EDFRecordingInterface(file_path=path, channels_to_skip=["a_3"])
+
+    def test_electrodes_table_keeps_both_channels(self, tmp_path, digital_data, reserved):
+        """The electrodes table identifies a channel by channel_name, so repeats would otherwise merge."""
+        path = self._write(tmp_path, digital_data, reserved)
+        with pytest.warns(UserWarning, match="renamed"):
+            interface = EDFRecordingInterface(file_path=path)
+        nwbfile_path = tmp_path / "repeated.nwb"
+        interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(interface), overwrite=True)
+
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            electrodes = io.read().electrodes.to_dataframe()
+        assert list(electrodes["channel_name"]) == ["a", "a_2", "b"]
+        assert list(electrodes["original_channel_name"]) == ["a", "a", "b"]
+
+    def test_a_label_recurring_at_another_rate_is_left_alone(self, tmp_path):
+        """SpikeInterface reads one rate at a time and has always accepted these, so their ids must not change."""
+        from neuroconv.datainterfaces.ecephys.edf._edf_channel_ids import has_repeated_labels
+
+        data = np.zeros((4, 3, SAMPLES_PER_RECORD), dtype="int16")
+        path = write_edf(
+            tmp_path / "rates.edf",
+            record_onsets=CONTIGUOUS_ONSETS[:4],
+            data=data,
+            reserved="EDF+C",
+            channel_names=["a", "b", "a"],
+            samples_per_record=[SAMPLES_PER_RECORD, SAMPLES_PER_RECORD, SAMPLES_PER_RECORD // 2],
+        )
+        assert not has_repeated_labels(path)
+        assert EDFRecordingInterface.get_available_channel_ids(path) == ["a", "b", "a"]
+
+    def test_a_transformed_repeat_is_decoded_under_its_own_id(self, tmp_path):
+        """The transforms are keyed by id, so the second of two same-named signals is the one decoded."""
+        values = [0.0, 0.05, 1.0, 250.0, 1e4, 5e6, -0.05, -1.0, -250.0, -1e4]
+        counts = encode_log_transform(values)
+        linear = np.arange(len(counts), dtype="int16")
+        path = write_edf(
+            tmp_path / "log.edf",
+            record_onsets=[0.0],
+            data=[[linear, counts]],
+            reserved="EDF+C",
+            samples_per_record=len(counts),
+            channel_names=["x", "x"],
+            dimensions=["uV", "Filtered"],
+            prefilters=["", LOG_TRANSFORM_PREFILTER],
+            physical_min=[-1000.0, -32767.0],
+            physical_max=[1000.0, 32767.0],
+        )
+        with pytest.warns(UserWarning, match="'x' -> 'x_2'"):
+            interface = EDFRecordingInterface(file_path=path)
+
+        assert list(interface.log_transformed_channels) == ["x_2"]
+        traces = interface.recording_extractor.get_traces()
+        np.testing.assert_array_equal(traces[:, 0], linear)
+        np.testing.assert_allclose(traces[:, 1], values, rtol=LOG_TRANSFORM_A, atol=1e-12)
+
+
+class TestRepeatedLabelsOnTheAnalogInterface:
+    def test_a_repeat_is_renamed_and_selectable(self, tmp_path, digital_data):
+        from neuroconv.datainterfaces import EDFAnalogInterface
+
+        path = write_edf(
+            tmp_path / "aux.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            reserved="EDF+C",
+            channel_names=["aux", "aux", "b"],
+        )
+        assert EDFAnalogInterface.get_available_channel_ids(path) == ["aux", "aux_2", "b"]
+        with pytest.warns(UserWarning, match="'aux' -> 'aux_2'"):
+            interface = EDFAnalogInterface(file_path=path, channels_to_include=["aux", "aux_2"])
+        recording = interface.recording_extractor
+        assert list(recording.get_channel_ids()) == ["aux", "aux_2"]
+        np.testing.assert_array_equal(recording.get_traces()[:SAMPLES_PER_RECORD, 1], digital_data[0, 1])
+
+
+class TestOriginalChannelNameColumnInSharedTables:
+    """
+    Once one recording adds original_channel_name, every row of the electrodes table needs a value.
+
+    Left to the writer, rows of recordings that renamed nothing get "", although their labels are known.
+    """
+
+    def _write_pair(self, tmp_path, digital_data):
+        plain = write_edf(
+            tmp_path / "plain.edf", record_onsets=GAPPED_ONSETS, data=digital_data, channel_names=["x", "y", "z"]
+        )
+        repeated = write_edf(
+            tmp_path / "rep.edf", record_onsets=GAPPED_ONSETS, data=digital_data, channel_names=["a", "a", "b"]
+        )
+        return plain, repeated
+
+    def _electrodes_after_pipe(self, tmp_path, interfaces):
+        from neuroconv import ConverterPipe
+
+        converter = ConverterPipe(data_interfaces={interface.metadata_key: interface for interface in interfaces})
+        metadata = converter.get_metadata()
+        metadata["NWBFile"].update(session_start_time=datetime(2021, 9, 16, 12, 35, 13))
+        for interface in interfaces:
+            metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = f"{interface.metadata_key}_series"
+        nwbfile_path = tmp_path / "pipe.nwb"
+        converter.run_conversion(nwbfile_path=str(nwbfile_path), metadata=metadata, overwrite=True)
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            electrodes = io.read().electrodes
+            return electrodes.to_dataframe(), electrodes["original_channel_name"].description
+
+    @pytest.mark.parametrize("repeated_first", [False, True])
+    def test_two_files_in_one_pipe(self, tmp_path, digital_data, repeated_first):
+        plain_path, repeated_path = self._write_pair(tmp_path, digital_data)
+        plain = EDFRecordingInterface(file_path=plain_path, metadata_key="plain")
+        with pytest.warns(UserWarning, match="renamed"):
+            repeated = EDFRecordingInterface(file_path=repeated_path, metadata_key="repeated")
+        interfaces = [repeated, plain] if repeated_first else [plain, repeated]
+
+        electrodes, description = self._electrodes_after_pipe(tmp_path, interfaces)
+        rows = dict(zip(electrodes["channel_name"], electrodes["original_channel_name"]))
+        assert rows == {"x": "x", "y": "y", "z": "z", "a": "a", "a_2": "a", "b": "b"}
+        assert description != "no description"
+
+    @pytest.mark.parametrize("renamed_half_first", [False, True])
+    def test_one_file_split_between_two_interfaces(self, tmp_path, digital_data, renamed_half_first):
+        """The aux half of a file kept nothing renamed, so it has no property of its own."""
+        _, repeated_path = self._write_pair(tmp_path, digital_data)
+        with pytest.warns(UserWarning, match="renamed"):
+            eeg = EDFRecordingInterface(file_path=repeated_path, metadata_key="eeg", channels_to_skip=["b"])
+        aux = EDFRecordingInterface(file_path=repeated_path, metadata_key="aux", channels_to_skip=["a"])
+        interfaces = [eeg, aux] if renamed_half_first else [aux, eeg]
+
+        electrodes, _ = self._electrodes_after_pipe(tmp_path, interfaces)
+        rows = dict(zip(electrodes["channel_name"], electrodes["original_channel_name"]))
+        assert rows == {"a": "a", "a_2": "a", "b": "b"}
+
+    @pytest.mark.parametrize("repeated_first", [False, True])
+    def test_appending_on_disk(self, tmp_path, digital_data, repeated_first):
+        plain_path, repeated_path = self._write_pair(tmp_path, digital_data)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            plain = EDFRecordingInterface(file_path=plain_path, metadata_key="plain")
+            repeated = EDFRecordingInterface(file_path=repeated_path, metadata_key="repeated")
+        first, second = (repeated, plain) if repeated_first else (plain, repeated)
+
+        nwbfile_path = tmp_path / "appended.nwb"
+        first.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(first), overwrite=True)
+        metadata = _metadata(second)
+        metadata["Ecephys"]["ElectricalSeries"][second.metadata_key]["name"] = "second_series"
+        second.run_conversion(nwbfile_path=str(nwbfile_path), metadata=metadata, append_on_disk_nwbfile=True)
+
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            electrodes = io.read().electrodes.to_dataframe()
+        rows = dict(zip(electrodes["channel_name"], electrodes["original_channel_name"]))
+        assert rows == {"x": "x", "y": "y", "z": "z", "a": "a", "a_2": "a", "b": "b"}
+
+    def test_a_file_alone_with_unique_labels_still_gets_no_column(self, tmp_path, digital_data):
+        plain_path, _ = self._write_pair(tmp_path, digital_data)
+        interface = EDFRecordingInterface(file_path=plain_path)
+        nwbfile_path = tmp_path / "plain.nwb"
+        interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(interface), overwrite=True)
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            assert "original_channel_name" not in io.read().electrodes.colnames
+
+
+class TestRenameWarningLocation:
+    """The rename warning names the caller's line, whichever entry point reached the reader."""
+
+    @pytest.mark.parametrize("reserved", ["EDF+D", "EDF+C"])
+    def test_through_the_interface(self, tmp_path, digital_data, reserved):
+        onsets = GAPPED_ONSETS if reserved == "EDF+D" else CONTIGUOUS_ONSETS
+        path = write_edf(
+            tmp_path / "rep.edf",
+            record_onsets=onsets,
+            data=digital_data,
+            reserved=reserved,
+            channel_names=["a", "a", "b"],
+        )
+        with pytest.warns(UserWarning, match="renamed") as caught:
+            EDFRecordingInterface(file_path=path)
+        assert [Path(warning.filename) for warning in caught if "renamed" in str(warning.message)] == [Path(__file__)]
+
+    def test_through_the_extractor(self, tmp_path, digital_data):
+        path = write_edf(
+            tmp_path / "rep.edf", record_onsets=GAPPED_ONSETS, data=digital_data, channel_names=["a", "a", "b"]
+        )
+        with pytest.warns(UserWarning, match="renamed") as caught:
+            EDFDRecordingExtractor(file_path=path)
+        assert [Path(warning.filename) for warning in caught if "renamed" in str(warning.message)] == [Path(__file__)]
+
+    def test_through_the_analog_interface(self, tmp_path, digital_data):
+        from neuroconv.datainterfaces import EDFAnalogInterface
+
+        path = write_edf(
+            tmp_path / "rep.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            reserved="EDF+C",
+            channel_names=["a", "a", "b"],
+        )
+        with pytest.warns(UserWarning, match="renamed") as caught:
+            EDFAnalogInterface(file_path=path)
+        assert [Path(warning.filename) for warning in caught if "renamed" in str(warning.message)] == [Path(__file__)]

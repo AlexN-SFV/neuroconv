@@ -38,6 +38,7 @@ from ._edf_log_transform import (
     _unit_to_microvolts,
     _warn_assumed_microvolts,
 )
+from .._channel_ids import indices_to_keep, unique_channel_ids, unknown_channels_to_skip
 
 # The label EDF+ reserves for the annotations signal.
 _ANNOTATIONS_SIGNAL_LABEL = "EDF Annotations"
@@ -750,42 +751,61 @@ def edf_plus_header_fields(header: EDFHeader) -> dict:
     return fields
 
 
+def data_signal_indices_of(header: EDFHeader) -> list[int]:
+    """
+    Indices of the signals that are data channels, in file order.
+
+    Every annotations signal is excluded, not just the time-keeping one: the spec permits additional
+    ones, and a second would otherwise become a bogus data channel carrying TAL bytes.
+    """
+    annotations_indices = set(header.annotations_signal_indices)
+    return [index for index in range(header.number_of_signals) if index not in annotations_indices]
+
+
+def edf_channel_ids(header: EDFHeader) -> list[str]:
+    """
+    The channel id of every data signal, aligned with :func:`data_signal_indices_of`.
+
+    The ids are the labels, with a label repeated at one sampling rate renamed after its first occurrence.
+    A label recurring at a *different* rate is left alone: SpikeInterface reads one rate at a time and has
+    always accepted those, so this keeps the ids the two EDF readers give a file the same.
+    """
+    signal_indices = data_signal_indices_of(header)
+    return unique_channel_ids(
+        labels=[header.labels[index] for index in signal_indices],
+        groups=[header.samples_per_record[index] / header.record_duration for index in signal_indices],
+    )
+
+
 def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> dict:
     """
     Work out which signals become data channels, and their rate, byte layout and scaling.
 
     Kept separate from the extractor class so it can be exercised without SpikeInterface installed.
     """
-    # Every annotations signal is excluded, not just the time-keeping one: the spec permits additional
-    # ones, and a second would otherwise become a bogus data channel carrying TAL bytes.
-    annotations_indices = set(header.annotations_signal_indices)
-    unknown_skips = sorted(set(channels_to_skip or []) - set(header.labels))
+    signal_indices = data_signal_indices_of(header)
+    labels = [header.labels[index] for index in signal_indices]
+    # EDF does not require unique labels, but they become the NWB channel ids, so a repeat is renamed.
+    ids = edf_channel_ids(header)
+    # Naming an annotations signal is accepted, as it always was, though it is never a data channel anyway.
+    unknown_skips = unknown_channels_to_skip(labels=header.labels, ids=ids, channels_to_skip=channels_to_skip)
     if unknown_skips:
         raise ValueError(
             f"channels_to_skip names channels that are not in this file: {unknown_skips}. "
-            f"Available channels: {sorted(set(header.labels))}."
+            f"Available channels: {sorted(set(header.labels) | set(ids))}."
         )
 
-    data_signal_indices = [
-        index
-        for index in range(header.number_of_signals)
-        if index not in annotations_indices and not (channels_to_skip and header.labels[index] in channels_to_skip)
-    ]
+    kept_positions = indices_to_keep(labels=labels, ids=ids, channels_to_skip=channels_to_skip)
+    data_signal_indices = [signal_indices[position] for position in kept_positions]
     if not data_signal_indices:
         raise ValueError("No data channels remain after excluding the annotations signal and channels_to_skip.")
 
-    # EDF does not require unique or non-empty labels, but they become the NWB channel ids, so reject
-    # them up front rather than failing deep inside the electrodes-table write. The SpikeInterface path
-    # fails fast here too ("use_names_as_ids=True is not possible, channel names are not unique").
-    channel_names = [header.labels[index] for index in data_signal_indices]
-    if any(not name for name in channel_names):
+    # Labels need not be non-empty either, but a blank one would become a blank channel id, so it is
+    # rejected up front rather than failing deep inside the electrodes-table write.
+    channel_names = [ids[position] for position in kept_positions]
+    channel_labels = [labels[position] for position in kept_positions]
+    if any(not label for label in channel_labels):
         raise ValueError("This EDF file has a data channel with a blank label, which cannot be used as a channel id.")
-    duplicates = sorted({name for name in channel_names if channel_names.count(name) > 1})
-    if duplicates:
-        raise ValueError(
-            f"This EDF file has duplicate channel labels {duplicates}, which cannot be used as channel ids. "
-            "Use channels_to_skip to drop the duplicates."
-        )
 
     sampling_frequencies = {header.samples_per_record[index] / header.record_duration for index in data_signal_indices}
     if len(sampling_frequencies) != 1:
@@ -857,6 +877,8 @@ def _build_channel_layout(header: EDFHeader, channels_to_skip: list | None) -> d
 
     return dict(
         channel_names=channel_names,
+        # The labels as the header gives them, which differ from channel_names only where a label repeats.
+        channel_labels=channel_labels,
         # The physical dimension exactly as the header spells it, ``Filtered`` included. Reported so a
         # caller can see what the file claimed and, where an external source such as a BIDS
         # channels.tsv disagrees, correct the gains themselves — some exporters drop the micro sign

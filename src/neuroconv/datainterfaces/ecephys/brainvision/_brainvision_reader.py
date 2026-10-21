@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .._channel_ids import unique_channel_ids
 from .._voltage_units import unit_to_microvolts
 
 # The binary formats of the core specification, little-endian.
@@ -83,6 +84,11 @@ class BrainVisionHeader:
     @property
     def number_of_channels(self) -> int:
         return len(self.channel_names)
+
+    @property
+    def channel_ids(self) -> list[str]:
+        """The channel names, with each repeat of a name renamed so every id is unique."""
+        return unique_channel_ids(self.channel_names)
 
     @property
     def recording_start(self) -> datetime | None:

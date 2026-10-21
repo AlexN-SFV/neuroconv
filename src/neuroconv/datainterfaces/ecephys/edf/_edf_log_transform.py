@@ -180,9 +180,11 @@ def _parse_log_transform(dimension: str, prefilter: str) -> LogTransform | None:
     )
 
 
-def read_log_transforms(file_path: FilePath, channels_to_skip: list | None = None) -> dict[str, LogTransform]:
+def read_log_transforms(
+    file_path: FilePath, channels_to_skip: list | None = None, channel_ids: list[str] | None = None
+) -> dict[str, LogTransform]:
     """
-    Map channel label to logarithmic transform for every transformed signal in a file.
+    Map channel id to logarithmic transform for every transformed signal in a file.
 
     Parameters
     ----------
@@ -191,7 +193,11 @@ def read_log_transforms(file_path: FilePath, channels_to_skip: list | None = Non
     channels_to_skip : list, optional
         Labels to leave out entirely. Applied before the parameters are parsed, so a transformed signal
         whose parameters are unreadable can be dropped rather than failing the whole conversion — the
-        caller's own channel removal happens too late for that.
+        caller's own channel removal happens too late for that. An id names a channel too.
+    channel_ids : list of str, optional
+        The id of every data signal, that is every signal but ``EDF Annotations``, in file order. Needed
+        only when the ids are not simply the labels, which is when a label repeats. Without them the
+        transforms are keyed by label.
 
     Returns
     -------
@@ -202,14 +208,25 @@ def read_log_transforms(file_path: FilePath, channels_to_skip: list | None = Non
     if not any(dimension.strip().upper() == _LOG_TRANSFORM_DIMENSION for dimension in dimensions):
         return {}
 
+    signals = [(label, dimension, prefilter) for label, dimension, prefilter in zip(labels, dimensions, prefilters)]
+    if channel_ids is None:
+        ids = labels
+    else:
+        signals = [signal for signal in signals if signal[0] != "EDF Annotations"]
+        if len(channel_ids) != len(signals):
+            raise ValueError(
+                f"Expected an id for each of the {len(signals)} data signals in '{file_path}', got {len(channel_ids)}."
+            )
+        ids = channel_ids
+
     transforms = {}
     skip = set(channels_to_skip or [])
-    for label, dimension, prefilter in zip(labels, dimensions, prefilters):
-        if label in skip:
+    for channel_id, (label, dimension, prefilter) in zip(ids, signals):
+        if label in skip or channel_id in skip:
             continue
         transform = _parse_log_transform(dimension=dimension, prefilter=prefilter)
         if transform is not None:
-            transforms[label] = transform
+            transforms[channel_id] = transform
     return transforms
 
 

@@ -1,6 +1,7 @@
 import re
 import warnings
 from datetime import date, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import FilePath
@@ -219,9 +220,11 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
     @staticmethod
     def get_available_channel_ids(file_path: FilePath) -> list:
         """
-        Get all available channel names from an EDF file.
+        Get all available channel ids from an EDF file.
 
-        The names span the whole file. A file that sampled some of its signals at a different rate
+        The ids are the channel labels, except that a label repeated among the signals sampled at one rate
+        is renamed after its first occurrence (``C3``, ``C3_2``, ...), because ids must be unique. They
+        span the whole file. A file that sampled some of its signals at a different rate
         than the rest holds them in separate streams, and an interface reads one stream at a time, so
         the channels of the stream it holds are a subset of these. They are read from the file's
         header, so this works on a file with more than one stream.
@@ -234,9 +237,9 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         Returns
         -------
         list
-            List of all channel names in the EDF file
+            List of all channel ids in the EDF file
         """
-        from ._edfd_reader import is_discontinuous_edf, read_edf_header
+        from ._edfd_reader import edf_channel_ids, is_discontinuous_edf, read_edf_header
 
         if is_discontinuous_edf(file_path=file_path):
             # pyedflib cannot open EDF+D at all; read the labels out of the header directly. The
@@ -244,20 +247,11 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             # channels, so listing them would only invite a pointless channels_to_skip entry.
             with open(file_path, "rb") as file:
                 header = read_edf_header(file)
-            annotations_indices = set(header.annotations_signal_indices)
-            return [label for index, label in enumerate(header.labels) if index not in annotations_indices]
+            return edf_channel_ids(header)
 
-        from pyedflib import EdfReader
+        from ._edf_channel_ids import available_channel_ids
 
-        edf_reader = EdfReader(str(file_path))
-        try:
-            channel_names = edf_reader.getSignalLabels()
-        finally:
-            # EDFlib refuses to open a file it already has open, so the handle is released here
-            # rather than left to garbage collection.
-            edf_reader.close()
-
-        return channel_names
+        return available_channel_ids(file_path=file_path)
 
     @classmethod
     def get_extractor_class(cls):
@@ -325,28 +319,39 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         self.extractor_kwargs.pop("metadata_key", None)
         self.extractor_kwargs.pop("channels_to_skip")
         self.extractor_kwargs["all_annotations"] = True
-        self.extractor_kwargs["use_names_as_ids"] = True
 
+        from ._edf_channel_ids import has_repeated_labels, neo_labels_and_ids, rename_to_unique_channel_ids
         from ._edf_log_transform import (
+            _LOG_TRANSFORM_DIMENSION,
             decode_log_transformed_signals,
             filtered_accounts_for_the_whole_unit_mix,
             read_log_transforms,
             read_signal_fields,
         )
 
+        # SpikeInterface refuses labels repeated within a stream as ids, so such a file is read with neo's
+        # positional ids and renamed below. Any other file takes exactly the path it always did.
+        file_path = interface_kwargs["file_path"]
+        repeated_labels = has_repeated_labels(file_path=file_path)
+        self.extractor_kwargs["use_names_as_ids"] = not repeated_labels
+
         # Read the transforms first, so the reader below can be told to expect them. A file with none —
-        # the overwhelmingly common case — takes exactly the path it always did.
+        # the overwhelmingly common case — takes exactly the path it always did. With repeated labels the
+        # transforms are keyed by id, which is only known once the file is open, so they are read then.
         channels_to_skip = interface_kwargs.get("channels_to_skip")
-        transforms = read_log_transforms(file_path=interface_kwargs["file_path"], channels_to_skip=channels_to_skip)
+        _, dimensions, _ = read_signal_fields(file_path=file_path)
+        if repeated_labels:
+            transforms = None
+            has_transforms = any(dimension.upper() == _LOG_TRANSFORM_DIMENSION for dimension in dimensions)
+        else:
+            transforms = read_log_transforms(file_path=file_path, channels_to_skip=channels_to_skip)
+            has_transforms = bool(transforms)
 
         # SpikeInterface sees the "Filtered" dimension as a non-voltage unit and warns about a mix. That
         # warning is unactionable for a transformed signal and, once decoded, untrue — but it is also the
         # only thing telling a user about a genuinely non-voltage channel, so suppress it only when
         # "Filtered" accounts for the whole mix.
-        suppress_unit_mix_warning = False
-        if transforms:
-            _, dimensions, _ = read_signal_fields(file_path=interface_kwargs["file_path"])
-            suppress_unit_mix_warning = filtered_accounts_for_the_whole_unit_mix(dimensions=dimensions)
+        suppress_unit_mix_warning = has_transforms and filtered_accounts_for_the_whole_unit_mix(dimensions=dimensions)
 
         extractor_class = self.get_extractor_class()
         if suppress_unit_mix_warning:
@@ -365,6 +370,13 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         # Captured before wrapping: the decoding recording does not forward neo_reader, and this is the
         # only place the unwrapped reader is in hand.
         self._edf_header = extractor_instance.neo_reader.edf_header
+
+        if repeated_labels:
+            _, channel_ids = neo_labels_and_ids(extractor_instance)
+            transforms = read_log_transforms(
+                file_path=file_path, channels_to_skip=channels_to_skip, channel_ids=channel_ids
+            )
+            extractor_instance = rename_to_unique_channel_ids(recording=extractor_instance)
 
         extractor_instance, self._log_transforms = decode_log_transformed_signals(
             recording=extractor_instance, transforms=transforms
@@ -399,7 +411,8 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             ``"edf_recording"``.
         channels_to_skip : list, default: None
             Channels to skip when adding the data to the nwbfile. These parameter can be used to skip non-neural
-            channels that are present in the EDF file.
+            channels that are present in the EDF file. A label the file repeats skips every channel carrying
+            it; the id a repeat was renamed to (``C3_2``) skips that channel alone.
         stream_name : str, optional
             Name of the stream to read, as returned by ``get_stream_names``. A file that sampled some
             of its signals at a different rate than the rest carries more than one stream and cannot
@@ -423,7 +436,18 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
 
         # On the EDF+D path channels_to_skip was already honored while reading.
         if channels_to_skip and not self._is_discontinuous:
-            self.recording_extractor = self.recording_extractor.remove_channels(remove_channel_ids=channels_to_skip)
+            from ._edf_channel_ids import channel_ids_to_remove
+
+            self.recording_extractor = self.recording_extractor.remove_channels(
+                remove_channel_ids=channel_ids_to_remove(
+                    recording=self.recording_extractor, channels_to_skip=channels_to_skip
+                )
+            )
+        if not self._is_discontinuous:
+            # The EDF+D reader reports renamed channels itself, after dropping channels_to_skip.
+            from .._channel_ids import report_renamed_channels
+
+            report_renamed_channels(recording=self.recording_extractor, source=f"The EDF file '{Path(file_path).name}'")
 
     def extract_nwb_file_metadata(self) -> dict:
         # The header names a single technician, while experimenter is a list of names.
@@ -657,7 +681,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
     @property
     def log_transformed_channels(self) -> dict:
         """
-        Channel label to logarithmic transform, for every signal carrying transformed data.
+        Channel id to logarithmic transform, for every signal carrying transformed data.
 
         Empty for an ordinary file. Such a signal stores logarithms rather than measurements, so its
         samples are decoded while reading and the recording holds physical values as floats.

@@ -50,6 +50,11 @@ such as a force sensor recorded alongside the EEG, can be left out by name:
     >>> len(interface.recording_extractor.get_channel_ids()) == len(channel_ids) - 1
     True
 
+A header that gives two channels the same name has the later one renamed (``Fp1_2``), with a warning,
+because channel ids must be unique; the names as the header gives them are written to an
+``original_channel_name`` electrodes column. In ``channels_to_skip``, a renamed id skips that channel
+alone, and a repeated name skips every channel carrying it.
+
 Markers and segments
 ^^^^^^^^^^^^^^^^^^^^
 

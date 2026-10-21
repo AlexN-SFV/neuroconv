@@ -1,6 +1,14 @@
+from pathlib import Path
+
 import numpy as np
 from pydantic import FilePath
 
+from .._channel_ids import (
+    indices_to_keep,
+    set_original_channel_names,
+    unique_channel_ids,
+    warn_about_renamed_channels,
+)
 from .._voltage_units import unit_to_microvolts
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
 from ....tools import get_package
@@ -38,11 +46,10 @@ def _read_bdf_recording(file_path: FilePath, channels_to_skip: list | None = Non
         number_of_signals = reader.signals_in_file
 
         channel_names = [str(reader.getLabel(index)).strip() for index in range(number_of_signals)]
+        channel_ids = unique_channel_ids(channel_names)
         sampling_frequencies = [float(reader.getSampleFrequency(index)) for index in range(number_of_signals)]
 
-        keep = [
-            index for index, name in enumerate(channel_names) if not (channels_to_skip and name in channels_to_skip)
-        ]
+        keep = indices_to_keep(labels=channel_names, ids=channel_ids, channels_to_skip=channels_to_skip)
         if not keep:
             raise ValueError("No channels remain after applying channels_to_skip.")
 
@@ -70,7 +77,9 @@ def _read_bdf_recording(file_path: FilePath, channels_to_skip: list | None = Non
     finally:
         reader._close()
 
-    kept_names = [channel_names[index] for index in keep]
+    kept_names = [channel_ids[index] for index in keep]
+    kept_labels = [channel_names[index] for index in keep]
+    warn_about_renamed_channels(labels=kept_labels, ids=kept_names, source=f"The BDF file '{Path(file_path).name}'")
     traces = np.stack(digital_traces, axis=1)  # (n_samples, n_channels), int32 24-bit digital values
 
     recording = NumpyRecording(
@@ -82,6 +91,7 @@ def _read_bdf_recording(file_path: FilePath, channels_to_skip: list | None = Non
     recording.set_channel_gains(gains=gains_to_microvolts)
     recording.set_channel_offsets(offsets=offsets_to_microvolts)
     recording.set_property(key="channel_name", values=np.asarray(kept_names))
+    set_original_channel_names(recording=recording, labels=kept_labels, ids=kept_names)
 
     header = dict(header)
     header["startdate"] = start_datetime
@@ -114,13 +124,18 @@ class BDFRecordingInterface(BaseRecordingExtractorInterface):
 
     @staticmethod
     def get_available_channel_ids(file_path: FilePath) -> list:
-        """Return all channel names in a BDF file."""
+        """
+        Return the ids of all channels in a BDF file.
+
+        The ids are the channel labels, except that a label the file repeats is renamed after its first
+        occurrence (``EXG1``, ``EXG1_2``, ...), because ids must be unique.
+        """
         get_package(package_name="pyedflib", excluded_platforms_and_python_versions=dict(darwin=dict(arm=["3.9"])))
         import pyedflib
 
         reader = pyedflib.EdfReader(str(file_path))
         try:
-            return [str(reader.getLabel(index)).strip() for index in range(reader.signals_in_file)]
+            return unique_channel_ids([str(reader.getLabel(index)).strip() for index in range(reader.signals_in_file)])
         finally:
             reader._close()
 
@@ -163,7 +178,9 @@ class BDFRecordingInterface(BaseRecordingExtractorInterface):
             ``"bdf_recording"``.
         channels_to_skip : list, default: None
             Channels to skip when adding the data to the nwbfile. Use this to drop non-neural channels
-            such as the BioSemi ``Status`` trigger channel, or channels sampled at a different rate.
+            such as the BioSemi ``Status`` trigger channel, or channels sampled at a different rate. A
+            label the file gives more than one channel skips all of them; the id a repeat was renamed to
+            (``EXG1_2``) skips that channel alone.
         """
         super().__init__(
             file_path=file_path,
