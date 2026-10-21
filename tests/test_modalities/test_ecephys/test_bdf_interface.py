@@ -209,3 +209,10 @@ class TestRepeatedLabels:
             by_label = BDFRecordingInterface(file_path=repeated_path, channels_to_skip=["EXG1"])
         assert list(by_id.recording_extractor.get_channel_ids()) == ["EXG1", "Cz"]
         assert list(by_label.recording_extractor.get_channel_ids()) == ["Cz"]
+
+    def test_rename_warning_names_the_callers_line(self, repeated_path):
+        from pathlib import Path
+
+        with pytest.warns(UserWarning, match="renamed") as caught:
+            BDFRecordingInterface(file_path=repeated_path)
+        assert [Path(warning.filename) for warning in caught if "renamed" in str(warning.message)] == [Path(__file__)]

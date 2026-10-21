@@ -459,6 +459,8 @@ class TestRepeatedChannelLabels:
             interface = EEGLABRecordingInterface(file_path=set_path)
         # EEGLAB takes no channels_to_skip, so the warning does not offer it.
         assert not any("channels_to_skip" in str(warning.message) for warning in caught)
+        # And it names this line, not a frame inside neuroconv.
+        assert {warning.filename for warning in caught if "renamed" in str(warning.message)} == {__file__}
         recording = interface.recording_extractor
         assert list(recording.get_channel_ids()) == ["Fz", "Cz", "Fz_2", "Oz"]
         np.testing.assert_allclose(recording.get_traces(channel_ids=["Fz_2"])[:, 0], microvolt_traces[2])

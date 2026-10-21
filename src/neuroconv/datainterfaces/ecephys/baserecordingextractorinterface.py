@@ -548,6 +548,12 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
 
         metadata = metadata or self._get_metadata_for_writing()
 
+        # A reader that renamed repeated channel labels records the originals in an electrodes column;
+        # keep that column filled for every row, whichever recording writes it.
+        from ._channel_ids import complete_original_channel_names
+
+        recording, metadata = complete_original_channel_names(recording=recording, nwbfile=nwbfile, metadata=metadata)
+
         # ``metadata_key`` selects the ElectricalSeries entry in the dict-based format and is mutually
         # exclusive with ``es_key`` downstream. The question is asked of this interface's own entry rather
         # than of the dictionary's overall shape: a converter can hand every interface one dictionary that

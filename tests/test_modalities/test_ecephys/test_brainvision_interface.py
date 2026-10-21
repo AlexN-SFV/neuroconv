@@ -848,3 +848,17 @@ class TestRepeatedChannelNames:
             electrodes = io.read().electrodes.to_dataframe()
         assert list(electrodes["channel_name"]) == ["Fp1", "Fp1_3", "Fp1_2"]
         assert list(electrodes["original_channel_name"]) == ["Fp1", "Fp1", "Fp1_2"]
+
+    def test_rename_warning_names_the_callers_line(self, tmp_path, int16_data):
+        from pathlib import Path
+
+        path = write_brainvision(tmp_path, int16_data, channels=self.CHANNELS)
+        for build in (
+            lambda: BrainVisionRecordingExtractor(path),
+            lambda: BrainVisionRecordingInterface(file_path=path),
+        ):
+            with pytest.warns(UserWarning, match="renamed") as caught:
+                build()
+            assert [Path(warning.filename) for warning in caught if "renamed" in str(warning.message)] == [
+                Path(__file__)
+            ]

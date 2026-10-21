@@ -11,13 +11,44 @@ keeps it, and each later one gets ``_2``, ``_3``, ... in file order, skipping an
 labels as the file gives them are kept as the ``original_channel_name`` property, which the writer turns
 into an electrodes column. A file whose labels are already unique gets ids identical to its labels and
 no extra property, so its output is unchanged.
+
+Once that column is in an electrodes table, every row needs a value: :func:`complete_original_channel_names`
+gives the rows of other recordings, whose labels were never renamed, their ``channel_name``.
 """
 
+import sys
 import warnings
+from pathlib import Path
 
 import numpy as np
+import pydantic
 
 ORIGINAL_CHANNEL_NAME_PROPERTY = "original_channel_name"
+ORIGINAL_CHANNEL_NAME_DESCRIPTION = (
+    "The channel's label as the source file gives it. It differs from channel_name only where the file "
+    "gave more than one channel the same label and the repeat was renamed to keep channel_name unique."
+)
+
+# Frames in these directories are skipped when attributing a warning, so it points at the caller's own
+# line: neuroconv itself, and pydantic, whose validate_call wraps interface constructors.
+_INTERNAL_DIRECTORIES = tuple(
+    str(Path(path).resolve()) for path in (Path(__file__).parents[2], Path(pydantic.__file__).parent)
+)
+
+
+def _stacklevel_outside_neuroconv() -> int:
+    """
+    The ``stacklevel`` that attributes a warning, raised by this function's caller, to the first frame outside neuroconv.
+
+    Computed rather than fixed because the same reader is reached at different depths: through an
+    interface's constructor, through its extractor directly, or from a sub-interface.
+    """
+    frame = sys._getframe(1)
+    level = 1
+    while frame is not None and str(Path(frame.f_code.co_filename).resolve()).startswith(_INTERNAL_DIRECTORIES):
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 def unique_channel_ids(labels: list[str], groups: list | None = None) -> list[str]:
@@ -88,7 +119,7 @@ def warn_about_renamed_channels(labels: list[str], ids: list[str], source: str, 
             " channels_to_skip accepts either a renamed id, to drop that channel alone, or a repeated label, "
             "to drop every channel carrying it."
         )
-    warnings.warn(message, UserWarning, stacklevel=3)
+    warnings.warn(message, UserWarning, stacklevel=_stacklevel_outside_neuroconv())
 
 
 def indices_to_keep(labels: list[str], ids: list[str], channels_to_skip: list | None) -> list[int]:
@@ -132,3 +163,64 @@ def report_renamed_channels(recording, source: str, accepts_channels_to_skip: bo
     warn_about_renamed_channels(
         labels=labels, ids=ids, source=source, accepts_channels_to_skip=accepts_channels_to_skip
     )
+
+
+def complete_original_channel_names(recording, nwbfile, metadata: dict):
+    """
+    Keep the ``original_channel_name`` electrodes column filled for every row, before ``recording`` is written.
+
+    Left alone, the writer fills the column with ``""`` for every row whose recording lacks the property,
+    which is every recording that renamed nothing: another file in the same pipe, or the half of a file
+    whose repeats went to a different interface. Their labels are their channel names, so:
+
+    * a recording without the property, written to a table that has the column, gets it from its channel
+      names;
+    * a recording with the property, written to a table whose rows predate the column, first has the
+      column added with those rows' channel names.
+
+    Parameters
+    ----------
+    recording : BaseRecording
+        The recording about to be written. It is not modified; a view carries the added property.
+    nwbfile : NWBFile
+    metadata : dict
+        Not modified.
+
+    Returns
+    -------
+    tuple
+        ``(recording, metadata)`` to write with. The metadata describes the column when the writer may
+        create it, so it is not left as "no description".
+    """
+    from ...tools.spikeinterface.spikeinterface import _get_channel_name
+
+    has_property = ORIGINAL_CHANNEL_NAME_PROPERTY in recording.get_property_keys()
+    electrodes = nwbfile.electrodes
+    has_column = electrodes is not None and ORIGINAL_CHANNEL_NAME_PROPERTY in electrodes.colnames
+
+    if has_column and not has_property:
+        recording = recording.select_channels(channel_ids=recording.get_channel_ids())
+        recording.set_property(key=ORIGINAL_CHANNEL_NAME_PROPERTY, values=np.asarray(_get_channel_name(recording)))
+        return recording, metadata
+
+    if not has_property:
+        return recording, metadata
+
+    if not has_column and electrodes is not None:
+        existing = len(electrodes)
+        channel_names = (
+            [str(name) for name in electrodes["channel_name"][:]] if "channel_name" in electrodes.colnames else []
+        )
+        # A row with no channel_name has no label this can recover; blank is all it can say.
+        channel_names = channel_names if len(channel_names) == existing else [""] * existing
+        nwbfile.add_electrode_column(
+            name=ORIGINAL_CHANNEL_NAME_PROPERTY, description=ORIGINAL_CHANNEL_NAME_DESCRIPTION, data=channel_names
+        )
+        return recording, metadata
+
+    ecephys = dict(metadata.get("Ecephys", {}))
+    columns = list(ecephys.get("Electrodes", []))
+    if not any(column.get("name") == ORIGINAL_CHANNEL_NAME_PROPERTY for column in columns):
+        columns.append(dict(name=ORIGINAL_CHANNEL_NAME_PROPERTY, description=ORIGINAL_CHANNEL_NAME_DESCRIPTION))
+    ecephys["Electrodes"] = columns
+    return recording, {**metadata, "Ecephys": ecephys}
