@@ -171,7 +171,10 @@ Set ``write_annotations=False`` or ``write_runs=False`` to suppress either table
     gin test data yet. The tests build them byte by byte instead; see
     ``tests/test_modalities/test_ecephys/test_edfd_interface.py``.
 
-Plain EDF and ``EDF+C`` files are unaffected by any of this and continue to be read by SpikeInterface.
+Plain EDF and ``EDF+C`` files continue to be read by SpikeInterface and are never split into runs. The
+annotations of an ``EDF+C`` file are written to the same ``annotations`` table, timed from the recording's
+first sample, and ``write_annotations=False`` suppresses it there too. The rows of the table are in time
+order whatever order the file stores them in.
 
 Floating-Point and Long-Integer Data (EDF+ "Filtered" Signals)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

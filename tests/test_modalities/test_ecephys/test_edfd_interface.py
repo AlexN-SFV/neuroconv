@@ -1138,6 +1138,107 @@ class TestEDFDRecordingInterface:
             assert "annotations" not in (nwbfile.intervals or {})
             assert "runs" not in (nwbfile.intervals or {})
 
+    def test_continuous_file_annotations_are_written(self, tmp_path, digital_data):
+        """
+        EDF+C annotations used to be dropped: SpikeInterface's reader does not expose them.
+
+        The fixture stores the second signal's annotation ahead of the first's, as real writers store TALs
+        out of time order, and the table must come out sorted.
+        """
+        pytest.importorskip("pyedflib")
+        path = write_edf(
+            tmp_path / "c.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            reserved="EDF+C",
+            annotations=[(2.7, None, "Marker: 601"), (10.25, 1.5, "seizure onset")],
+            extra_annotations_signals=1,
+            extra_annotations=[(2.3, None, "from the second signal")],
+        )
+        interface = EDFRecordingInterface(file_path=path)
+        nwbfile_path = tmp_path / "c.nwb"
+        interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(interface), overwrite=True)
+
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            nwbfile = io.read()
+            table = nwbfile.intervals["annotations"].to_dataframe()
+            assert list(table["label"]) == ["from the second signal", "Marker: 601", "seizure onset"]
+            assert list(table["start_time"]) == pytest.approx([2.3, 2.7, 10.25])
+            assert list(table["stop_time"]) == pytest.approx([2.3, 2.7, 11.75])
+            assert list(table["source_file"]) == ["c.edf"] * 3
+            # Runs stay specific to discontinuous files.
+            assert "runs" not in nwbfile.intervals
+
+    def test_continuous_file_annotations_are_timed_from_the_first_sample(self, tmp_path, digital_data):
+        """
+        SpikeInterface puts the first sample at zero whatever the first record's onset says, so the
+        annotations are moved by that onset to stay on the samples they mark, and follow alignment.
+        """
+        pytest.importorskip("pyedflib")
+        path = write_edf(
+            tmp_path / "c.edf",
+            record_onsets=[onset + 0.5 for onset in CONTIGUOUS_ONSETS],
+            data=digital_data,
+            reserved="EDF+C",
+            annotations=[(3.0, None, "Marker: 601")],
+        )
+        interface = EDFRecordingInterface(file_path=path)
+        interface.set_aligned_starting_time(aligned_starting_time=100.0)
+        nwbfile_path = tmp_path / "c.nwb"
+        interface.run_conversion(nwbfile_path=str(nwbfile_path), metadata=_metadata(interface), overwrite=True)
+
+        with NWBHDF5IO(str(nwbfile_path), "r") as io:
+            nwbfile = io.read()
+            assert nwbfile.acquisition["ElectricalSeries"].starting_time == pytest.approx(100.0)
+            assert list(nwbfile.intervals["annotations"].to_dataframe()["start_time"]) == pytest.approx([102.5])
+
+    def test_continuous_file_annotations_can_be_disabled(self, tmp_path, digital_data):
+        pytest.importorskip("pyedflib")
+        path = write_edf(
+            tmp_path / "c.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            reserved="EDF+C",
+            annotations=[(2.5, None, "Marker: 601")],
+        )
+        interface = EDFRecordingInterface(file_path=path)
+        nwbfile = interface.create_nwbfile(metadata=_metadata(interface), write_annotations=False)
+        assert "annotations" not in nwbfile.intervals
+
+    def test_plain_edf_has_no_annotations(self, tmp_path, digital_data):
+        pytest.importorskip("pyedflib")
+        path = write_edf(
+            tmp_path / "plain.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            reserved="",
+            include_annotations_signal=False,
+        )
+        interface = EDFRecordingInterface(file_path=path)
+        nwbfile = interface.create_nwbfile(metadata=_metadata(interface))
+        assert "annotations" not in nwbfile.intervals
+
+    def test_unreadable_continuous_annotations_warn_rather_than_fail(self, tmp_path, digital_data, monkeypatch):
+        """A file that converted before its annotations were read must keep converting without them."""
+        pytest.importorskip("pyedflib")
+        from neuroconv.datainterfaces.ecephys.edf import _edfd_reader
+
+        def refuse(file_path):
+            raise ValueError("malformed header")
+
+        monkeypatch.setattr(_edfd_reader, "read_continuous_annotations", refuse)
+        path = write_edf(
+            tmp_path / "c.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            reserved="EDF+C",
+            annotations=[(2.5, None, "Marker: 601")],
+        )
+        with pytest.warns(UserWarning, match="could not be read.*malformed header"):
+            interface = EDFRecordingInterface(file_path=path)
+        nwbfile = interface.create_nwbfile(metadata=_metadata(interface))
+        assert "annotations" not in nwbfile.intervals
+
     def test_conversion_options_schema_keeps_inherited_options(self):
         """A **conversion_options catch-all would erase the inherited options from the schema."""
         schema = EDFRecordingInterface.get_conversion_options_schema(EDFRecordingInterface)

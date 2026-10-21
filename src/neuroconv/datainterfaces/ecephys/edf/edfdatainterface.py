@@ -172,6 +172,10 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
     exporters label continuous recordings ``EDF+D`` as a matter of course — is written as a single
     ``ElectricalSeries`` exactly like a plain EDF.
 
+    The annotations in the ``EDF Annotations`` signals of an ``EDF+C`` or ``EDF+D`` file are read by
+    neuroconv's own parser on either path, since SpikeInterface's reader does not expose them, and are
+    written to a ``TimeIntervals`` table named ``"annotations"``.
+
     Signals carrying floating-point or long-integer data through the EDF+ logarithmic transformation
     (physical dimension ``Filtered``) are decoded either way, through one shared implementation: on the
     SpikeInterface path by wrapping its reader, which has no notion of the transformation and would
@@ -303,7 +307,7 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             return recording
 
         self._is_discontinuous = False
-        self._edf_annotations = []
+        self._edf_annotations = self._read_continuous_annotations(file_path=interface_kwargs["file_path"])
         self._edf_runs = []
 
         # Only the SpikeInterface path needs pyedflib; the EDF+D reader is pure Python and NumPy, so
@@ -382,6 +386,27 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             recording=extractor_instance, transforms=transforms
         )
         return extractor_instance
+
+    @staticmethod
+    def _read_continuous_annotations(file_path: FilePath) -> list[dict]:
+        """
+        Read a plain EDF or ``EDF+C`` file's annotations, which SpikeInterface's reader does not expose.
+
+        A header neuroconv's parser rejects, but SpikeInterface accepts, costs only the annotations: such
+        files converted before the annotations were read, and must keep converting.
+        """
+        from ._edfd_reader import read_continuous_annotations
+
+        try:
+            return read_continuous_annotations(file_path=file_path)
+        except ValueError as error:
+            warnings.warn(
+                f"The annotations of the EDF file '{Path(file_path).name}' could not be read, so it is converted "
+                f"without them: {error}",
+                UserWarning,
+                stacklevel=4,
+            )
+            return []
 
     def __init__(
         self,
@@ -526,7 +551,8 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         runs = getattr(self, "_edf_runs", None)
         shifts = self._time_shifts
         if not runs:
-            return 0.0
+            # A continuous file is one segment, and its annotations are timed from its first sample.
+            return float(self.recording_extractor.get_start_time(segment_index=0))
 
         shift = shifts[0]
         for index, run in enumerate(runs):
@@ -586,10 +612,10 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
         always_write_timestamps : bool, default: False
             If True, always write an explicit timestamps array rather than a starting time and rate.
         write_annotations : bool, default: True
-            If True and the file is ``EDF+D``, the annotations carried in the ``EDF Annotations`` signals
-            are written to a ``TimeIntervals`` table named ``"annotations"``, with a ``source_file``
-            column. If another EDF interface has already written that table to the file, the rows are
-            added to it. Has no effect on plain EDF or ``EDF+C`` files, whose handling is unchanged.
+            If True and the file is EDF+ (``EDF+C`` or ``EDF+D``), the annotations carried in the
+            ``EDF Annotations`` signals are written, in time order, to a ``TimeIntervals`` table named
+            ``"annotations"``, with a ``source_file`` column. If another EDF interface has already written
+            that table to the file, the rows are added to it. Plain EDF files carry no annotations.
         write_runs : bool, default: True
             If True and the file is discontinuous with more than one contiguous run, the run boundaries
             are written to a ``TimeIntervals`` table named ``"runs"``, or added to it as for the
@@ -612,14 +638,10 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             conversion_options.pop("parent_container")
         super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
 
-        # Both tables come from neuroconv's own reader, which is used only for discontinuous files.
-        # Files on the SpikeInterface path are untouched.
-        if not self._is_discontinuous:
-            return
-
         if write_annotations and getattr(self, "_edf_annotations", None):
             self._add_annotations_to_nwbfile(nwbfile=nwbfile)
-        # A single run is indistinguishable from a continuous recording, so there is nothing to record.
+        # Runs exist only for discontinuous files, and a single run is indistinguishable from a continuous
+        # recording, so there is nothing to record.
         if write_runs and len(getattr(self, "_edf_runs", [])) > 1:
             self._add_runs_to_nwbfile(nwbfile=nwbfile)
 
@@ -631,6 +653,10 @@ class EDFRecordingInterface(BaseRecordingExtractorInterface):
             onset = float(annotation["onset"])
             start_time = onset + self._shift_for_time(onset)
             rows.append(dict(start_time=start_time, stop_time=start_time + float(duration), label=annotation["text"]))
+        # Writers do not keep TALs in time order — one seen in practice stores each record's annotation
+        # at an unrelated onset — and a TimeIntervals table is expected to be. The sort is stable, so
+        # annotations sharing an onset keep their order in the file.
+        rows.sort(key=lambda row: row["start_time"])
         add_rows_to_intervals_table(
             nwbfile=nwbfile,
             file_path=self.source_data["file_path"],

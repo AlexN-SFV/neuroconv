@@ -642,6 +642,43 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
     return onsets, annotations
 
 
+def read_continuous_annotations(file_path: FilePath) -> list[dict]:
+    """
+    Read the annotations of a continuous EDF+ (``EDF+C``) file, timed from its first sample.
+
+    SpikeInterface's reader, which reads these files, does not expose their ``EDF Annotations`` signals,
+    so they are read here with the same parser as ``EDF+D``. A plain EDF file, a BDF file, or an EDF+
+    file without an annotations signal has none.
+
+    The onsets in the file count from the start time in the header, while SpikeInterface places the
+    first sample at zero, ignoring the onset of the first record. The annotations are given relative to
+    that first record instead, so they stay aligned with the samples they mark.
+
+    Parameters
+    ----------
+    file_path : FilePath
+        Path to the ``.edf`` file.
+
+    Returns
+    -------
+    list of dict
+        One ``dict(onset=..., duration=..., text=...)`` per annotation, in file order.
+    """
+    with open(file_path, "rb") as file:
+        # Checked before parsing the full header, whose record geometry assumes 2-byte samples and so is
+        # wrong for a BDF file handed to the EDF interface.
+        file.seek(192)
+        if not _decode_field(file.read(44)).upper().startswith("EDF+"):
+            return []
+        header = read_edf_header(file)
+        if not header.annotations_signal_indices:
+            return []
+        onsets, annotations = read_record_onsets_and_annotations(file=file, header=header)
+
+    first_record_onset = float(onsets[0])
+    return [dict(annotation, onset=annotation["onset"] - first_record_onset) for annotation in annotations]
+
+
 class EDFRun(NamedTuple):
     """One contiguous run of data records, and where it sits on the recording timeline."""
 
