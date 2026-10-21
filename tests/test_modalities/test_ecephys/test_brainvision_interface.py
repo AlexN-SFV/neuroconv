@@ -680,6 +680,55 @@ class TestBrainVisionRecordingInterface:
 
         assert len(nwbfile.intervals["markers"]) == 0
 
+    PAUSED = ["New Segment,,1,1,0", "Stimulus,A,11,1,0", "New Segment,,101,1,0", "Stimulus,B,151,1,0"]
+
+    def test_separately_built_interfaces_over_one_recording_write_its_rows_once(self, tmp_path, int16_data):
+        """An EEG interface beside an auxiliary one with the complementary channels share the recording's rows."""
+        path = write_brainvision(tmp_path, int16_data, markers=self.PAUSED)
+        interfaces = [
+            BrainVisionRecordingInterface(file_path=path, metadata_key="eeg", channels_to_skip=["C3"]),
+            BrainVisionRecordingInterface(file_path=path, metadata_key="aux", channels_to_skip=["C1", "C2"]),
+        ]
+        markers, segments = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(markers["label"]) == ["A", "B"]
+        assert list(segments["segment_index"]) == [0, 1]
+        assert list(segments["source_file"]) == ["recording.vhdr"] * 2
+
+    def test_same_name_and_markers_in_two_directories_keeps_both_recordings_rows(self, tmp_path, int16_data):
+        """BIDS gives two subjects' recordings the same file name, and a fixed protocol the same markers."""
+        interfaces = []
+        for subject in ("sub01", "sub02"):
+            (tmp_path / subject).mkdir()
+            path = write_brainvision(tmp_path / subject, int16_data, markers=self.PAUSED)
+            interfaces.append(BrainVisionRecordingInterface(file_path=path, metadata_key=subject))
+        markers, segments = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(markers["label"]) == ["A", "B"] * 2
+        assert list(segments["segment_index"]) == [0, 1] * 2
+
+    def test_split_by_offset_leaves_a_brainvision_recording_whole(self, tmp_path, int16_data):
+        """The format has no offset, so the reader sets every channel's to 0 and there is one partition."""
+        interface = BrainVisionRecordingInterface(file_path=write_brainvision(tmp_path, int16_data))
+        assert interface.split_by_offset() == [interface]
+
+    def test_split_by_offset_partitions_write_rows_once(self, tmp_path, int16_data):
+        """
+        Were a recording ever partitioned, its partitions would share its rows.
+
+        The offsets are set by hand, since the format has none to give a recording more than one.
+        """
+        interface = BrainVisionRecordingInterface(
+            file_path=write_brainvision(tmp_path, int16_data, markers=self.PAUSED)
+        )
+        interface.recording_extractor.set_channel_offsets(offsets=[0.0, 0.0, 5.0])
+        sub_interfaces = interface.split_by_offset()
+        assert len(sub_interfaces) == 2
+        markers, segments = _convert_through_pipe(tmp_path, sub_interfaces)
+
+        assert list(markers["label"]) == ["A", "B"]
+        assert list(segments["segment_index"]) == [0, 1]
+
     def test_conversion_options_reach_the_writer(self, tmp_path, int16_data):
         path = write_brainvision(tmp_path, int16_data)
         interface = BrainVisionRecordingInterface(file_path=path, channels_to_skip=["C2"])
@@ -700,6 +749,23 @@ class TestBrainVisionRecordingInterface:
         with pytest.warns(FutureWarning):
             interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata(), write_as="lfp")
         assert "ElectricalSeries" in nwbfile.processing["ecephys"]["LFP"].electrical_series
+
+
+def _convert_through_pipe(tmp_path, interfaces):
+    """Write the interfaces into one NWB file through a ConverterPipe; return its markers and segments tables."""
+    converter = ConverterPipe(data_interfaces={interface.metadata_key: interface for interface in interfaces})
+    metadata = converter.get_metadata()
+    metadata["NWBFile"]["session_start_time"] = datetime(2021, 1, 1)
+    for interface in interfaces:
+        metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = f"{interface.metadata_key}_series"
+
+    nwbfile_path = tmp_path / "pipe.nwb"
+    converter.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
+    with NWBHDF5IO(nwbfile_path, "r") as io:
+        nwbfile = io.read()
+        # Every segment of every interface reaches the file as its own series, whatever happens to the tables.
+        assert len(nwbfile.acquisition) == sum(interface.number_of_segments for interface in interfaces)
+        return nwbfile.intervals["markers"].to_dataframe(), nwbfile.intervals["segments"].to_dataframe()
 
 
 class _SyntheticRecordingForMixin:

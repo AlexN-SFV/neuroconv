@@ -295,3 +295,154 @@ class TestEEGLABRecordingInterface:
         savemat(str(set_path), {"EEG": _make_eeg_struct("does_not_exist.fdt")}, do_compression=True)
         with pytest.raises(FileNotFoundError, match="does_not_exist.fdt"):
             EEGLABRecordingInterface(file_path=set_path)
+
+
+def _write_epoched_set(path, *, seed, label, urevent_latencies=(129.0, 2000.0)):
+    """An epoched .set whose time-locking events all have type ``label``."""
+    rng = np.random.default_rng(seed=seed)
+    traces = (rng.standard_normal((NUMBER_OF_CHANNELS, NUMBER_OF_POINTS, len(urevent_latencies))) * 20.0).astype(
+        "float32"
+    )
+    eeg = _make_epoched_eeg_struct(traces, list(urevent_latencies), -1.0)
+    eeg["event"]["type"] = [label] * len(urevent_latencies)
+    eeg["urevent"]["type"] = [label] * len(urevent_latencies)
+    savemat(str(path), {"EEG": eeg}, do_compression=True)
+    return path
+
+
+def _convert_through_pipe(tmp_path, interfaces):
+    """Write the interfaces into one NWB file through a ConverterPipe; return its events and epochs tables."""
+    from neuroconv import ConverterPipe
+
+    converter = ConverterPipe(data_interfaces={interface.metadata_key: interface for interface in interfaces})
+    metadata = converter.get_metadata()
+    metadata["NWBFile"]["session_start_time"] = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    for interface in interfaces:
+        metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = f"{interface.metadata_key}_series"
+
+    nwbfile_path = tmp_path / "pipe.nwb"
+    converter.run_conversion(nwbfile_path=str(nwbfile_path), metadata=metadata, overwrite=True)
+    with NWBHDF5IO(str(nwbfile_path), "r") as io:
+        nwbfile = io.read()
+        # Every epoch of every interface reaches the file as its own series, whatever happens to the tables.
+        assert len(nwbfile.acquisition) == sum(
+            interface.recording_extractor.get_num_segments() for interface in interfaces
+        )
+        epochs = nwbfile.epochs.to_dataframe() if nwbfile.epochs is not None else None
+        return nwbfile.intervals["events"].to_dataframe(), epochs
+
+
+class TestEEGLABInterfacesSharingOneNWBFile:
+    def test_two_continuous_files_in_one_converter_pipe_keep_both_files_events(self, tmp_path, microvolt_traces):
+        """The second file's events table used to be added under the same name, which raised."""
+        first = tmp_path / "first.set"
+        savemat(str(first), {"EEG": _make_eeg_struct(microvolt_traces)}, do_compression=True)
+        eeg = _make_eeg_struct(microvolt_traces * 2)
+        eeg["event"] = dict(type=["blink"], latency=np.array([65.0]))
+        second = tmp_path / "second.set"
+        savemat(str(second), {"EEG": eeg}, do_compression=True)
+
+        interfaces = [
+            EEGLABRecordingInterface(file_path=first, metadata_key="first"),
+            EEGLABRecordingInterface(file_path=second, metadata_key="second"),
+        ]
+        events, epochs = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(events["label"]) == ["stim", "resp", "stim", "blink"]
+        assert list(events["source_file"]) == ["first.set"] * 3 + ["second.set"]
+        np.testing.assert_allclose(events["start_time"], [0.0, 1.0, 2.0, 0.5])
+        assert epochs is None
+
+    def test_two_epoched_files_share_the_epochs_table(self, tmp_path):
+        """Both files' epochs are kept, and source_file tells apart the two epoch 0s."""
+        interfaces = [
+            EEGLABRecordingInterface(
+                file_path=_write_epoched_set(tmp_path / "a.set", seed=1, label="go"), metadata_key="a"
+            ),
+            EEGLABRecordingInterface(
+                file_path=_write_epoched_set(
+                    tmp_path / "b.set", seed=2, label="stop", urevent_latencies=(500.0, 900.0)
+                ),
+                metadata_key="b",
+            ),
+        ]
+        events, epochs = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(epochs["epoch_index"]) == [0, 1, 0, 1]
+        assert list(epochs["label"]) == ["go", "go", "stop", "stop"]
+        assert list(epochs["source_file"]) == ["a.set", "a.set", "b.set", "b.set"]
+        np.testing.assert_allclose(
+            epochs["start_time"], [0.0, 1999.0 / 128 - 1.0, 499.0 / 128 - 1.0, 899.0 / 128 - 1.0]
+        )
+        assert list(events["source_file"]) == ["a.set", "a.set", "b.set", "b.set"]
+
+    def test_separately_built_interfaces_over_one_file_write_its_rows_once(self, tmp_path):
+        """Two interfaces over one .set file, reached by different paths, share its events and epochs."""
+        path = _write_epoched_set(tmp_path / "epoched.set", seed=1, label="go")
+        interfaces = [
+            EEGLABRecordingInterface(file_path=path, metadata_key="eeg"),
+            EEGLABRecordingInterface(file_path=tmp_path / "." / "epoched.set", metadata_key="again"),
+        ]
+        events, epochs = _convert_through_pipe(tmp_path, interfaces)
+
+        assert list(events["label"]) == ["go", "go"]
+        assert list(epochs["epoch_index"]) == [0, 1]
+        assert list(epochs["source_file"]) == ["epoched.set"] * 2
+
+    def test_split_by_offset_leaves_an_eeglab_recording_whole(self, tmp_path):
+        """The reader sets every channel offset to 0, so there is never more than one partition."""
+        interface = EEGLABRecordingInterface(file_path=_write_epoched_set(tmp_path / "e.set", seed=1, label="go"))
+        assert interface.split_by_offset() == [interface]
+
+    def test_split_by_offset_partitions_write_rows_once(self, tmp_path):
+        """
+        Were a recording ever partitioned, its partitions would share its events and epochs.
+
+        The offsets are set by hand, since the reader never gives a recording more than one.
+        """
+        interface = EEGLABRecordingInterface(file_path=_write_epoched_set(tmp_path / "e.set", seed=1, label="go"))
+        interface.recording_extractor.set_channel_offsets(offsets=[0.0, 0.0, 5.0, 5.0])
+        sub_interfaces = interface.split_by_offset()
+        assert len(sub_interfaces) == 2
+        events, epochs = _convert_through_pipe(tmp_path, sub_interfaces)
+
+        assert list(events["label"]) == ["go", "go"]
+        assert list(epochs["epoch_index"]) == [0, 1]
+
+    def test_foreign_events_table_is_left_alone_with_a_warning(self, tmp_path, inline_set_path):
+        from pynwb.epoch import TimeIntervals
+        from pynwb.testing.mock.file import mock_NWBFile
+
+        interface = EEGLABRecordingInterface(file_path=inline_set_path)
+        nwbfile = mock_NWBFile()
+        foreign = TimeIntervals(name="events", description="Someone else's events.")
+        foreign.add_column(name="note", description="A note.")
+        foreign.add_row(start_time=0.0, stop_time=1.0, note="theirs")
+        nwbfile.add_time_intervals(foreign)
+
+        with pytest.warns(UserWarning, match="already has an intervals table named 'events'"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=_session_metadata(interface))
+
+        assert list(nwbfile.intervals["events"].to_dataframe()["note"]) == ["theirs"]
+        assert "ElectricalSeries" in nwbfile.acquisition
+
+    def test_pre_existing_epochs_do_not_break_the_conversion(self, tmp_path):
+        """
+        add_epoch_column raised once the shared epochs table had rows.
+
+        Reachable from any ConverterPipe where another interface writes epochs first, or from a caller passing a
+        pre-built NWBFile.
+        """
+        from pynwb.testing.mock.file import mock_NWBFile
+
+        interface = EEGLABRecordingInterface(file_path=_write_epoched_set(tmp_path / "e.set", seed=1, label="go"))
+        nwbfile = mock_NWBFile()
+        nwbfile.add_epoch(start_time=0.0, stop_time=1.0, tags=["baseline"])
+
+        with pytest.warns(UserWarning, match="already has an intervals table named 'epochs'"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=_session_metadata(interface))
+
+        # The caller's epoch is untouched, and the events and every epoch's series are still written.
+        assert list(nwbfile.epochs.to_dataframe()["tags"]) == [["baseline"]]
+        assert list(nwbfile.intervals["events"].to_dataframe()["label"]) == ["go", "go"]
+        assert len(nwbfile.acquisition) == 2

@@ -17,6 +17,9 @@ EEGLAB datasets come in two layouts, both handled transparently by pointing at t
 
 The signal is written as an ``ElectricalSeries`` with channel names and locations in the electrodes
 table, and the ``EEG.event`` markers are written to a ``TimeIntervals`` table named ``"events"``.
+When several EEGLAB datasets are written into one NWB file, as through a ``ConverterPipe``, they share
+the ``events`` table, and the ``epochs`` table of epoched datasets (below), and a ``source_file`` column
+names the ``.set`` file each row came from.
 
 .. code-block:: python
 
