@@ -55,6 +55,7 @@ from .ecephys.maxwell.maxonedatainterface import MaxOneRecordingInterface
 from .ecephys.mda.mdadatainterface import MdaSortingInterface
 from .ecephys.mcsraw.mcsrawdatainterface import MCSRawRecordingInterface
 from .ecephys.mearec.mearecdatainterface import MEArecRecordingInterface
+from .ecephys.mef.mef3datainterface import MEF3RecordingInterface
 from .ecephys.neuralynx.neuralynxdatainterface import (
     NeuralynxRecordingInterface,
     NeuralynxSortingInterface,
@@ -207,6 +208,7 @@ interface_list = [
     AlphaOmegaRecordingInterface,
     AxonRecordingInterface,
     MEArecRecordingInterface,
+    MEF3RecordingInterface,
     MCSRawRecordingInterface,
     MaxOneRecordingInterface,
     WhiteMatterRecordingInterface,

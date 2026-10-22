@@ -254,6 +254,10 @@ mearec = [
     "MEArec>=1.8.0",
     "setuptools; python_version >= '3.12'"
 ]
+mef = [  # Read by neuroconv's own reader; numba compiles its decoder, which falls back to NumPy where numba has no wheels
+    "neuroconv[ecephys_minimal]",
+    "numba; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
 neuralynx = [
     "neuroconv[ecephys_minimal]",
     "natsort>=7.1.1",
@@ -315,6 +319,7 @@ ecephys = [  # Note that these are the requirements of the extractors as they ar
     "neuroconv[mcsraw]",
     "neuroconv[mda]",
     "neuroconv[mearec]",
+    "neuroconv[mef]",
     "neuroconv[neuralynx]",
     "neuroconv[neuroscope]",
     "neuroconv[openephys]",

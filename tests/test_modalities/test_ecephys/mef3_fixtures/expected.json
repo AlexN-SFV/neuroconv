@@ -1,0 +1,349 @@
+{
+  "gapped.mefd": {
+    "channels": {
+      "Cz": {
+        "number_of_samples": 3000,
+        "sha256": "aec3db8b5c4e9e4de1204555b86cab2a8c9c2453a21b51527d985b81aed4be1f",
+        "first_samples": [
+          14,
+          31,
+          8,
+          -32,
+          -55
+        ],
+        "last_samples": [
+          375728,
+          601104,
+          601130,
+          601111,
+          601110
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false
+        ],
+        "block_samples": [
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250
+        ],
+        "block_start_times": [
+          946684800000000,
+          946684800250000,
+          946684800500000,
+          946684800750000,
+          946684801000000,
+          946684801250000,
+          946684801500000,
+          946684801750000,
+          946684804000000,
+          946684804250000,
+          946684804500000,
+          946684804750000
+        ],
+        "units_conversion_factor": 0.5
+      },
+      "EKG": {
+        "number_of_samples": 3000,
+        "sha256": "07206f32637b05ab83df36aae77ef5f527197c1748e8a772ea02ec2b78e795b5",
+        "first_samples": [
+          17,
+          -3,
+          -26,
+          -1,
+          -13
+        ],
+        "last_samples": [
+          558635,
+          558649,
+          558688,
+          558692,
+          558654
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false
+        ],
+        "block_samples": [
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250
+        ],
+        "block_start_times": [
+          946684800000000,
+          946684800250000,
+          946684800500000,
+          946684800750000,
+          946684801000000,
+          946684801250000,
+          946684801500000,
+          946684801750000,
+          946684804000000,
+          946684804250000,
+          946684804500000,
+          946684804750000
+        ],
+        "units_conversion_factor": 0.001
+      },
+      "Fp1": {
+        "number_of_samples": 3000,
+        "sha256": "ad199580b27ff5fe5e95b707fe9efe0ae213fffab0684e4e94b5fdd3c791a2db",
+        "first_samples": [
+          24,
+          -10,
+          -36,
+          -58,
+          -84
+        ],
+        "last_samples": [
+          -88819,
+          -88781,
+          -88819,
+          -88789,
+          -88789
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false
+        ],
+        "block_samples": [
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250
+        ],
+        "block_start_times": [
+          946684800000000,
+          946684800250000,
+          946684800500000,
+          946684800750000,
+          946684801000000,
+          946684801250000,
+          946684801500000,
+          946684801750000,
+          946684804000000,
+          946684804250000,
+          946684804500000,
+          946684804750000
+        ],
+        "units_conversion_factor": -0.25
+      }
+    },
+    "records": [
+      {
+        "time": 946684800100000,
+        "type": "Note",
+        "channel": "",
+        "text": "session note"
+      },
+      {
+        "time": 946684802500000,
+        "type": "EDFA",
+        "channel": "",
+        "duration": "1500000",
+        "text": "artifact"
+      },
+      {
+        "time": 946684800300000,
+        "type": "Seiz",
+        "channel": "Cz",
+        "duration": "500000",
+        "annotation": "focal onset"
+      },
+      {
+        "time": 946684801234000,
+        "type": "ESti",
+        "channel": "Cz"
+      },
+      {
+        "time": 946684801500000,
+        "type": "CSti",
+        "channel": "Cz"
+      }
+    ]
+  },
+  "lossy.mefd": {
+    "channels": {
+      "ch": {
+        "number_of_samples": 2000,
+        "sha256": "6a77ff2d89709d3b911ae2983904c1a6eb7d4a28e7ea6d465f71b9844e8ec666",
+        "first_samples": [
+          -26,
+          113,
+          308,
+          388,
+          415
+        ],
+        "last_samples": [
+          -1063,
+          -1062,
+          -1259,
+          -1060,
+          -1257
+        ],
+        "block_discontinuity": [
+          true,
+          false
+        ],
+        "block_samples": [
+          1000,
+          1000
+        ],
+        "block_start_times": [
+          946684800000000,
+          946684801000000
+        ],
+        "units_conversion_factor": 1.0
+      }
+    },
+    "records": [],
+    "original_sha256": "2e6fd5f9aab3c3fe46a1d64e09ecdd9fd13d1109ac45c127ddfdb56148e576e9"
+  },
+  "ds004696_sub-06_truncated.mefd": {
+    "channels": {
+      "C3": {
+        "number_of_samples": 61442,
+        "sha256": "5dd74194f11a7bdc1dadaa3ecdb71a569bf7484f533528325a1714191291962f",
+        "first_samples": [
+          5222,
+          4007,
+          2524,
+          1065,
+          -799
+        ],
+        "last_samples": [
+          -9519,
+          -8313,
+          -7504,
+          -6892,
+          -6116
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "block_samples": [
+          10240,
+          10240,
+          10240,
+          10242,
+          10240,
+          10240
+        ],
+        "block_start_times": [
+          50949798945,
+          50954798945,
+          50959798945,
+          50964798945,
+          50969798968,
+          50974798969
+        ],
+        "units_conversion_factor": 0.2658386864277569
+      },
+      "EKG": {
+        "number_of_samples": 61442,
+        "sha256": "2754a294c2ba63e6a86dab50917584fa59aa3bf6dec69d4cec53459f87b456e7",
+        "first_samples": [
+          797,
+          735,
+          680,
+          680,
+          694
+        ],
+        "last_samples": [
+          332,
+          276,
+          172,
+          91,
+          76
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "block_samples": [
+          10240,
+          10240,
+          10240,
+          10242,
+          10240,
+          10240
+        ],
+        "block_start_times": [
+          50949798945,
+          50954798945,
+          50959798945,
+          50964798945,
+          50969798968,
+          50974798969
+        ],
+        "units_conversion_factor": 0.2658386864277569
+      }
+    },
+    "records": []
+  }
+}
