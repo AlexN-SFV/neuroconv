@@ -3,7 +3,10 @@ Build the MEF 3 fixtures in this directory, and the values pymef reads from them
 
 Run it with pymef installed (pymef 1.4.8 ships wheels for x86_64 only), from anywhere:
 
-    python build_mef3_fixtures.py <ds004696 sub-06 .mefd directory>
+    python build_mef3_fixtures.py <ds004696 sub-06 .mefd directory> [fixture ...]
+
+Naming fixtures (``contiguous.mefd``, ...) rebuilds only those, and updates only their entries in
+``expected.json``, so the others keep their bytes.
 
 pymef is the oracle and the writer here, and nothing else: the tests compare neuroconv's reader with what
 pymef read at build time, so they need neither pymef nor the network. The sessions are written with
@@ -14,6 +17,10 @@ random UUIDs, so rebuilding them changes their bytes but not what they hold.
   first block, whatever ``discontinuity_flag`` says; the tests patch flags in copies where they need them). Records
   at session, channel and segment level; a recording time offset; a GMT offset; a negative units conversion
   factor and a channel in millivolts.
+* ``contiguous.mefd``: two channels at 1000 Hz in two segments with nothing missing between them, the
+  long-recording layout. pymef flags the second segment's first block, so the run continues across the
+  boundary only through the exception for a flagged block that starts where the previous one ended. The
+  channels' blocks are 250 and 300 samples long, so their block boundaries differ.
 * ``lossy.mefd``: one channel written with RED's lossy compression, which scales and detrends its blocks.
 * ``encrypted.mefd``: one channel written with passwords, so its metadata is encrypted.
 * ``ds004696_sub-06_truncated.mefd``: channels C3 and EKG of ds004696 sub-06 (CC0, OpenNeuro), cut to their
@@ -208,6 +215,36 @@ def build_gapped(path: Path) -> dict:
     return data
 
 
+def build_contiguous(path: Path) -> dict:
+    rng = np.random.default_rng(seed=5)
+    session = fresh(path)
+    first_segment, second_segment = 1500, 900
+    segment_1_start = START_TIME + first_segment * 1000
+    data = {}
+    for name, samples_per_block, acquisition_channel_number in (("A1", 250, 1), ("A2", 300, 2)):
+        steps = rng.integers(-60, 60, first_segment + second_segment)
+        steps[rng.integers(0, steps.size, 10)] = rng.integers(-200000, 200000, 10)
+        samples = np.cumsum(steps).astype(np.int32)
+        data[name] = samples
+        fields = dict(acquisition_channel_number=acquisition_channel_number, units_conversion_factor=0.1)
+        session.write_mef_ts_segment_metadata(
+            name, 0, None, None, START_TIME, segment_1_start, section_2(**fields), SECTION_3
+        )
+        session.write_mef_ts_segment_data(name, 0, None, None, samples_per_block, samples[:first_segment])
+        session.write_mef_ts_segment_metadata(
+            name,
+            1,
+            None,
+            None,
+            segment_1_start,
+            segment_1_start + second_segment * 1000,
+            section_2(start_sample=first_segment, **fields),
+            SECTION_3,
+        )
+        session.write_mef_ts_segment_data(name, 1, None, None, samples_per_block, samples[first_segment:])
+    return data
+
+
 def build_lossy(path: Path) -> dict:
     session = fresh(path)
     abscissa = np.arange(2000)
@@ -301,23 +338,33 @@ def read_with_pymef(path: Path) -> dict:
 
 def main():
     ds004696 = Path(sys.argv[1])
-    expected = {}
+    only = set(sys.argv[2:])
+    expected_path = HERE / "expected.json"
+    expected = json.loads(expected_path.read_text()) if only and expected_path.exists() else {}
 
-    written = build_gapped(HERE / "gapped.mefd")
-    expected["gapped.mefd"] = read_with_pymef(HERE / "gapped.mefd")
-    for name, samples in written.items():
-        assert expected["gapped.mefd"]["channels"][name]["sha256"] == digest(samples), name
+    def wanted(name: str) -> bool:
+        return not only or name in only
 
-    written = build_lossy(HERE / "lossy.mefd")
-    expected["lossy.mefd"] = read_with_pymef(HERE / "lossy.mefd")
-    expected["lossy.mefd"]["original_sha256"] = digest(written["ch"])
+    for name, build in (("gapped.mefd", build_gapped), ("contiguous.mefd", build_contiguous)):
+        if wanted(name):
+            written = build(HERE / name)
+            expected[name] = read_with_pymef(HERE / name)
+            for channel, samples in written.items():
+                assert expected[name]["channels"][channel]["sha256"] == digest(samples), (name, channel)
 
-    build_encrypted(HERE / "encrypted.mefd")
+    if wanted("lossy.mefd"):
+        written = build_lossy(HERE / "lossy.mefd")
+        expected["lossy.mefd"] = read_with_pymef(HERE / "lossy.mefd")
+        expected["lossy.mefd"]["original_sha256"] = digest(written["ch"])
 
-    build_truncated(ds004696, HERE / "ds004696_sub-06_truncated.mefd")
-    expected["ds004696_sub-06_truncated.mefd"] = read_with_pymef(HERE / "ds004696_sub-06_truncated.mefd")
+    if wanted("encrypted.mefd"):
+        build_encrypted(HERE / "encrypted.mefd")
 
-    (HERE / "expected.json").write_text(json.dumps(expected, indent=2, default=str) + "\n")
+    if wanted("ds004696_sub-06_truncated.mefd"):
+        build_truncated(ds004696, HERE / "ds004696_sub-06_truncated.mefd")
+        expected["ds004696_sub-06_truncated.mefd"] = read_with_pymef(HERE / "ds004696_sub-06_truncated.mefd")
+
+    expected_path.write_text(json.dumps(expected, indent=2, default=str) + "\n")
 
 
 if __name__ == "__main__":

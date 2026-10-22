@@ -345,5 +345,114 @@
       }
     },
     "records": []
+  },
+  "contiguous.mefd": {
+    "channels": {
+      "A1": {
+        "number_of_samples": 2400,
+        "sha256": "bce3192cdff25076f2164f90310c057791e42181900c978bc0d96f0b427eb303",
+        "first_samples": [
+          20,
+          56,
+          -2,
+          34,
+          30
+        ],
+        "last_samples": [
+          82124,
+          82171,
+          82210,
+          82199,
+          82185
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          false
+        ],
+        "block_samples": [
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          250,
+          150
+        ],
+        "block_start_times": [
+          946684800000000,
+          946684800250000,
+          946684800500000,
+          946684800750000,
+          946684801000000,
+          946684801250000,
+          946684801500000,
+          946684801750000,
+          946684802000000,
+          946684802250000
+        ],
+        "units_conversion_factor": 0.1
+      },
+      "A2": {
+        "number_of_samples": 2400,
+        "sha256": "39ab36695908a07642fd2adb3b4ecca02e6115b15e080406cac7b556d65249f2",
+        "first_samples": [
+          3,
+          48,
+          27,
+          85,
+          34
+        ],
+        "last_samples": [
+          420525,
+          420522,
+          420567,
+          420602,
+          420644
+        ],
+        "block_discontinuity": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false
+        ],
+        "block_samples": [
+          300,
+          300,
+          300,
+          300,
+          300,
+          300,
+          300,
+          300
+        ],
+        "block_start_times": [
+          946684800000000,
+          946684800300000,
+          946684800600000,
+          946684800900000,
+          946684801200000,
+          946684801500000,
+          946684801800000,
+          946684802100000
+        ],
+        "units_conversion_factor": 0.1
+      }
+    },
+    "records": []
   }
 }

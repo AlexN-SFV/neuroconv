@@ -362,7 +362,8 @@ def decode_red_blocks(
     Raises
     ------
     REDDecodeError
-        If a block's coded data runs out before its samples do, or its symbol counts are all zero.
+        If a block is shorter than its header or lies outside ``buffer``, its coded data runs out before its
+        samples do, or its symbol counts are all zero.
     """
     if use_numba is None:
         use_numba = NUMBA_AVAILABLE
@@ -387,6 +388,24 @@ def decode_red_blocks(
     out = np.empty(int(sample_counts.sum()), dtype=np.int32)
     if out.size == 0:
         return out
+
+    # Checked here rather than in the kernels: the compiled one has no bounds checks, so a block shorter than
+    # its header, or past the end of the buffer, would be read out of bounds, and the NumPy one would raise a
+    # bare IndexError. The header holds the symbol statistics, and at least one byte of coded data follows it.
+    buffer, block_starts, block_bytes = arguments[0], arguments[1], arguments[2]
+    minimum_block_bytes = layout.header_bytes + layout.dummy_bytes + 1
+    malformed = np.flatnonzero(
+        (sample_counts > 0)
+        & ((block_starts < 0) | (block_bytes < minimum_block_bytes) | (block_starts + block_bytes > buffer.size))
+    )
+    if malformed.size:
+        block = int(malformed[0])
+        raise REDDecodeError(
+            f"RED block {block} of the {len(sample_counts)} requested cannot be decoded: it is stated to be "
+            f"{block_bytes[block]} bytes at offset {block_starts[block]}, but a block holding samples is at least "
+            f"{minimum_block_bytes} bytes and must lie within the {buffer.size} bytes read. The file is corrupt."
+        )
+
     kernel = _decode_blocks_compiled if use_numba else _decode_blocks_numpy
     failed_block = kernel(*arguments, out)
     if failed_block >= 0:

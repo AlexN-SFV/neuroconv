@@ -51,9 +51,19 @@ Gaps and timing
 
 A session recorded with interruptions is written as one ``ElectricalSeries`` per uninterrupted run of
 samples, each placed at its first block's start time and sharing one electrodes table, and the runs are
-listed in a ``TimeIntervals`` table named ``"runs"``. A gap is found by comparing consecutive blocks' start
-times in whole samples, so a session split into several MEF segments with nothing missing between them is a
-single series.
+listed in a ``TimeIntervals`` table named ``"runs"``. A run breaks where the file flags a block as a
+discontinuity, as meflib, the reference implementation, defines one, with two exceptions decided in whole
+samples:
+
+* a flagged block that starts exactly where the previous block ended continues the run, since writers flag
+  the first block of every MEF segment whether or not anything is missing, so a session split into several
+  segments with nothing missing between them is a single series;
+* an unflagged block whose start time is more than a second from where the previous block ended starts a new
+  run, with a warning, since no clock drifts that far in one block.
+
+Block timestamps are not otherwise compared with sample counts: writers cut blocks on a fixed grid of times
+while the samples in them drift, so a continuous recording's timestamps disagree with its sample counts by a
+few samples at many block boundaries.
 
 Each series uses the channel's nominal sampling rate. A recording's clock drifts against it, typically by
 tens of milliseconds an hour, so a sample's time in the NWB file can differ from the block timestamps by that

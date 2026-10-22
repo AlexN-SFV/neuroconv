@@ -37,6 +37,7 @@ GAPPED = FIXTURES / "gapped.mefd"
 LOSSY = FIXTURES / "lossy.mefd"
 ENCRYPTED = FIXTURES / "encrypted.mefd"
 TRUNCATED = FIXTURES / "ds004696_sub-06_truncated.mefd"
+CONTIGUOUS = FIXTURES / "contiguous.mefd"
 START_TIME = 946684800000000  # the µUTC start of the synthetic sessions, 2000-01-01T00:00:00 UTC
 
 DECODERS = [
@@ -106,6 +107,8 @@ class TestREDDecoder:
             (LOSSY, "ch"),
             (TRUNCATED, "C3"),
             (TRUNCATED, "EKG"),
+            (CONTIGUOUS, "A1"),
+            (CONTIGUOUS, "A2"),
         ],
     )
     def test_matches_pymef(self, session_path, channel_name, use_numba):
@@ -131,15 +134,25 @@ class TestREDDecoder:
         assert EXPECTED["lossy.mefd"]["original_sha256"] != EXPECTED["lossy.mefd"]["channels"]["ch"]["sha256"]
 
     @pytest.mark.parametrize("use_numba", DECODERS)
-    def test_a_block_cut_short_raises(self, use_numba):
+    @pytest.mark.parametrize(
+        "start_shift, block_bytes",
+        [
+            pytest.param(0, 100, id="shorter-than-header"),
+            pytest.param(0, 304, id="no-coded-data"),
+            pytest.param(0, 10**9, id="past-the-buffer"),
+            pytest.param(-(10**9), None, id="negative-start"),
+        ],
+    )
+    def test_block_geometry_is_checked_before_decoding(self, use_numba, start_shift, block_bytes):
+        """Both decoders refuse the same way, before reading; numba would otherwise read out of bounds."""
         session = read_mef3_session(GAPPED)
         blocks = session.channels[0].blocks[:1]
         data = np.fromfile(session.channels[0].data_paths[0], dtype=np.uint8)
-        with pytest.raises(REDDecodeError, match="cannot be decoded"):
+        with pytest.raises(REDDecodeError, match="must lie within"):
             decode_red_blocks(
                 data,
-                block_starts=blocks["file_offset"],
-                block_bytes=np.array([304]),  # the header alone: no coded data for the samples it claims
+                block_starts=blocks["file_offset"] + start_shift,
+                block_bytes=blocks["block_bytes"] if block_bytes is None else np.array([block_bytes]),
                 difference_counts=blocks["difference_bytes"],
                 sample_counts=blocks["number_of_samples"],
                 scale_factors=blocks["scale_factor"],
@@ -148,6 +161,35 @@ class TestREDDecoder:
                 layout=MEF3_RED_LAYOUT,
                 use_numba=use_numba,
             )
+
+    @pytest.mark.parametrize("use_numba", DECODERS)
+    def test_a_block_whose_index_and_header_agree_on_a_wrong_size(self, gapped_copy, use_numba, monkeypatch):
+        """
+        The review's case: the last block states 100 bytes in both its index entry and its RED header.
+
+        The two agree, so reading the session succeeds; decoding the block raises REDDecodeError on both paths
+        rather than an IndexError or an out-of-bounds read.
+        """
+        from neuroconv.datainterfaces.ecephys.mef import _mef3_reader
+
+        segment_directory = gapped_copy / "Cz.timd" / "Cz-000001.segd"
+        index_path, data_path = segment_directory / "Cz-000001.tidx", segment_directory / "Cz-000001.tdat"
+        index, data = bytearray(index_path.read_bytes()), bytearray(data_path.read_bytes())
+        entry = len(index) - 56
+        offset = int(np.frombuffer(bytes(index[entry : entry + 8]), dtype="<i8")[0])
+        index[entry + 28 : entry + 32] = np.uint32(100).tobytes()  # TIME_SERIES_INDEX_BLOCK_BYTES_OFFSET
+        data[offset + 36 : offset + 40] = np.uint32(100).tobytes()  # RED_BLOCK_BLOCK_BYTES_OFFSET
+        index_path.write_bytes(bytes(index))
+        data_path.write_bytes(bytes(data))
+
+        monkeypatch.setattr(
+            _mef3_reader,
+            "decode_red_blocks",
+            lambda *args, **kwargs: decode_red_blocks(*args, **kwargs, use_numba=use_numba),
+        )
+        recording = MEF3RecordingExtractor(gapped_copy)
+        with pytest.raises(REDDecodeError, match="stated to be 100 bytes"):
+            recording.get_traces(segment_index=1, channel_ids=["Cz"])
 
 
 class TestReader:
@@ -169,6 +211,15 @@ class TestReader:
         for channel in session.channels:
             expected = EXPECTED["gapped.mefd"]["channels"][channel.name]["block_start_times"]
             assert channel.blocks["start_time"].tolist() == expected
+
+    def test_a_run_continues_across_contiguous_segments(self):
+        """pymef flags each segment's first block; the run continues because that block starts where the last ended."""
+        session = read_mef3_session(CONTIGUOUS)
+        for channel, boundary in zip(session.channels, (6, 5)):
+            assert channel.blocks["segment"][boundary - 1 : boundary + 1].tolist() == [0, 1]
+            assert channel.blocks["discontinuity"][boundary]
+            assert [(run.first_block, run.number_of_samples) for run in channel.runs] == [(0, 2400)]
+        assert [(run.number_of_samples, run.start_time) for run in session.runs] == [(2400, START_TIME)]
 
     def test_clock_drift_is_not_a_gap(self):
         """ds004696's block 3 holds 10242 samples though the next block starts 10240 samples later."""
@@ -255,6 +306,29 @@ class TestExtractor:
         )
         assert recording.get_traces(segment_index=0, start_frame=5, end_frame=5).shape == (0, 3)
         assert recording.get_start_time(segment_index=1) == 4.0
+
+    @pytest.mark.parametrize(
+        "start_frame, end_frame",
+        [(0, 2400), (1499, 1501), (1200, 1800), (1500, 1501), (1499, 1500), (0, 1500), (1500, 2400)],
+    )
+    def test_traces_across_a_segment_boundary(self, start_frame, end_frame):
+        """Windows within, ending at, starting at and straddling the boundary at sample 1500, against per-file decodes."""
+        recording = MEF3RecordingExtractor(CONTIGUOUS)
+        assert recording.get_num_segments() == 1
+        # Decoded one data file at a time, independently of MEF3Channel.read_blocks and its per-segment split.
+        reference = np.stack(
+            [read_all_blocks(channel, use_numba=NUMBA_AVAILABLE) for channel in recording.mef3_session.channels],
+            axis=1,
+        )
+        for column, channel in enumerate(recording.mef3_session.channels):
+            assert digest(reference[:, column]) == EXPECTED["contiguous.mefd"]["channels"][channel.name]["sha256"]
+        np.testing.assert_array_equal(
+            recording.get_traces(start_frame=start_frame, end_frame=end_frame), reference[start_frame:end_frame]
+        )
+        np.testing.assert_array_equal(
+            recording.get_traces(start_frame=start_frame, end_frame=end_frame, channel_ids=["A2"])[:, 0],
+            reference[start_frame:end_frame, 1],
+        )
 
     def test_gains_keep_their_sign_and_scale_to_microvolts(self):
         recording = MEF3RecordingExtractor(GAPPED)
