@@ -66,9 +66,10 @@ class BlackrockRecordingInterface(BaseRecordingExtractorInterface):
     neo's ``BlackrockRawIO`` parses the headers and memory-maps the samples, and neuroconv places them, so that
     every file specification lands on one consistent timeline:
 
-    * ``session_start_time`` is the ``.nsX`` header's ``TimeOrigin``, which is UTC, and the first sample is at
-      0, as BIDS ``events.tsv`` onsets assume. (FileSpec 3.0 clocks do not start with the recording, and PTP
-      clocks count Unix-epoch nanoseconds.)
+    * ``session_start_time`` is the ``.nsX`` header's ``TimeOrigin``, which is UTC, and the earliest first
+      sample among the set's ``.nsX`` files is at 0, so the streams of one set, and their ``.nev``, line up in one
+      NWB file. (FileSpec 3.0 clocks do not start with the recording, and PTP clocks count Unix-epoch
+      nanoseconds.)
     * A recording paused is written as one ``ElectricalSeries`` per run, each at its start time. A run after
       a clock reset, whose real start the file does not hold, is placed where the run before it ends.
     * PTP (Gemini) packets are read in timestamp order, and a run ends where a sample is missing.
@@ -239,16 +240,27 @@ class BlackrockRecordingInterface(BaseRecordingExtractorInterface):
         if write_runs and len(self.blackrock_stream.runs) > 1:
             self._add_runs_to_nwbfile(nwbfile=nwbfile)
 
-    def _alignment_shift(self) -> float:
-        """How far the recording has been moved from where the file places it, so the tables move with it."""
-        return (
-            float(self.recording_extractor.get_start_time(segment_index=0)) - self.blackrock_stream.runs[0].start_time
+    def _aligned(self, seconds: np.ndarray) -> np.ndarray:
+        """
+        Times the file places, moved with the run each falls in (or the run before it), so the tables follow any
+        alignment of the series, segment by segment.
+        """
+        runs = self.blackrock_stream.runs
+        file_starts = np.array([run.start_time for run in runs])
+        shifts = np.array(
+            [
+                float(self.recording_extractor.get_start_time(segment_index=index)) - run.start_time
+                for index, run in enumerate(runs)
+            ]
         )
+        # A time before the first run, or one left unplaced (NaN), takes the first run's shift.
+        indices = np.clip(np.searchsorted(file_starts, np.nan_to_num(seconds, nan=-np.inf), side="right") - 1, 0, None)
+        return seconds + shifts[indices]
 
     def _add_nev_events_to_nwbfile(self, nwbfile: NWBFile):
         nev, stream = self.blackrock_nev, self.blackrock_stream
         events = nev.events
-        seconds = stream.timeline.to_seconds(events.ticks, nev.resolution, events.epochs) + self._alignment_shift()
+        seconds = self._aligned(stream.timeline.to_seconds(events.ticks, nev.resolution, events.epochs))
         unplaced = ~np.isfinite(seconds)
         if unplaced.any():
             warnings.warn(
@@ -313,7 +325,8 @@ class BlackrockSortingInterface(BaseSortingExtractorInterface):
     Primary data interface class for converting Blackrock spiking data (``.nev``).
 
     Spike times are placed on the timeline :py:class:`BlackrockRecordingInterface` gives the ``.nsX`` stream
-    recorded with them, so the two line up in one NWB file: first sample at 0, runs after a clock reset moved
+    recorded with them, so the two line up in one NWB file: the set's earliest first sample at 0, runs after a
+    clock reset moved
     past the run before, PTP spikes on the samples they were recorded with. ``session_start_time`` is that
     stream's ``TimeOrigin``, which is UTC.
     """
@@ -352,9 +365,10 @@ class BlackrockSortingInterface(BaseSortingExtractorInterface):
             The rate spike frames are counted at. Defaults to the .nev header's sample resolution, 30 kHz.
         nsx_to_load : int | list | str, optional
             The .nsX streams of the same base name whose timeline may place the spikes: an int such as 5 for the
-            .ns5 alone, a list of them, 'max' for the highest-numbered, or 'all' or None for every one, of which
-            the one whose first sample comes first is used. Pass the stream converted with
-            :py:class:`BlackrockRecordingInterface` to place the spikes on its samples exactly. An empty list uses
+            .ns5 alone, a list of them, 'max' for the highest-numbered, or 'all' or None for every one. Every
+            stream of a set is placed from the set's earliest first sample, so any of them gives the same spike
+            times; of several, the smallest file is read. Pass the stream converted with
+            :py:class:`BlackrockRecordingInterface` to anchor PTP spikes to its own samples. An empty list uses
             none: the spikes keep the .nev's clock, its first packet at 0 for FileSpec 3.0.
         verbose : bool, default: False
             Enables verbosity

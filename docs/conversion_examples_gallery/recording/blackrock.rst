@@ -44,10 +44,17 @@ holds no scaling and no start time; both are read from its ``.nev``, and the fil
 Timing
 ^^^^^^
 
-The first sample is at 0 and ``session_start_time`` is the file's ``TimeOrigin``, so the onsets of a BIDS
-``events.tsv``, which count from a data file's first sample, line up with the data. Older files' clocks start
-with the recording, but FileSpec 3.0 clocks keep counting from when the processor started, and PTP (Gemini)
-clocks count nanoseconds of the Unix epoch, which are not UTC either; neither is written as it is.
+``session_start_time`` is the file's ``TimeOrigin``, and the earliest first sample among the set's ``.nsX``
+files is at 0, so the onsets of a BIDS ``events.tsv``, which count from a data file's first sample, line up with
+the data. Older files' clocks start with the recording, but FileSpec 3.0 clocks keep counting from when the
+processor started, and PTP (Gemini) clocks count nanoseconds of the Unix epoch, which are not UTC either;
+neither is written as it is.
+
+The streams of one set share that origin, and so do the ``.nev`` events and spikes, so several streams written
+into one NWB file line up. The streams do not start on the same tick, though: the ``.ns4`` and ``.ns6`` of the
+GIN PTP recording share their ``TimeOrigin`` to the millisecond, but the ``.ns6``'s first sample is 0.134 ms
+after the ``.ns4``'s, so the ``.ns6`` series starts at 0.134 ms. A BIDS ``events.tsv`` made from that later
+stream is off by the same amount.
 
 * A recording paused and resumed is written as one ``ElectricalSeries`` per run, each at its start time, sharing
   one electrodes table, and the runs are listed in a ``TimeIntervals`` table named ``"runs"``.

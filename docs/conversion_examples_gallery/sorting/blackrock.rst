@@ -31,7 +31,8 @@ Convert Blackrock sorting data to NWB using
 
 The spike times are placed on the timeline
 :py:class:`~neuroconv.datainterfaces.ecephys.blackrock.blackrockdatainterface.BlackrockRecordingInterface`
-gives the ``.nsX`` file of the same base name, so spikes and samples line up in one NWB file: the first sample at
-0, runs after a clock reset moved past the run before, PTP spikes on the samples they were recorded with. When
-the set holds several ``.nsX`` files, pass the one you convert as ``nsx_to_load`` (``5`` for the ``.ns5``) to
-place the spikes on its samples exactly; ``nsx_to_load=[]`` keeps the ``.nev`` file's own clock.
+gives the ``.nsX`` files of the same base name, so spikes and samples line up in one NWB file: the set's earliest
+first sample at 0, runs after a clock reset moved past the run before, PTP spikes on the samples they were
+recorded with. Every stream of a set shares that origin, so any of them gives the spikes the same times; of
+several, the smallest file is read. For a PTP set, pass the stream you convert as ``nsx_to_load`` (``6`` for the
+``.ns6``) to anchor the spikes to its own samples; ``nsx_to_load=[]`` keeps the ``.nev`` file's own clock.

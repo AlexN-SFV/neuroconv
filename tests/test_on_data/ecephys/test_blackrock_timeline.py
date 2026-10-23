@@ -62,6 +62,17 @@ def test_ptp_packets_out_of_order_are_reordered_not_split():
     assert recording.get_num_samples() == 1000
 
 
+def test_streams_of_one_set_share_the_earliest_first_sample():
+    # The .ns4 and .ns6 share their TimeOrigin to the millisecond, but the .ns6 starts 133542 ns later.
+    folder = "blackrock_ptp_with_missing_samples"
+    first, second = (
+        recording_interface(f"{folder}/Hub1-NWBtestfile_neural_wspikes.{suffix}") for suffix in ("ns4", "ns6")
+    )
+    assert first.blackrock_stream.time_origin == second.blackrock_stream.time_origin
+    assert first.recording_extractor.get_start_time(segment_index=0) == 0.0
+    assert second.recording_extractor.get_start_time(segment_index=0) == pytest.approx(133542e-9)
+
+
 def test_pause_and_reset():
     paused = recording_interface("segment/PauseCorrect/pause_correct.ns2").recording_extractor
     assert [paused.get_start_time(segment_index=i) for i in range(2)] == pytest.approx([0.0, 31.0087])

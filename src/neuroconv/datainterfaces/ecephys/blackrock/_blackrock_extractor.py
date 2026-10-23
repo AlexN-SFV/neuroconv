@@ -22,7 +22,7 @@ from ._blackrock_file_set import (
     available_nsx_files,
     file_set_base,
     nsx_number,
-    read_nev,
+    read_nev_cached,
     read_stream,
     warn_about_stream,
 )
@@ -146,8 +146,8 @@ class BlackrockRecordingExtractor(BaseRecording):
     Lazy SpikeInterface recording for one ``.nsX`` stream of a Blackrock file set.
 
     Each uninterrupted run of samples is one segment, placed on the timeline of :mod:`._blackrock_file_set`:
-    the first sample at 0, later runs at their clock offset from it, runs after a clock reset where the run
-    before ends.
+    the earliest first sample of the file set at 0, later runs at their clock offset from it, runs after a clock
+    reset where the run before ends.
 
     Parameters
     ----------
@@ -165,7 +165,7 @@ class BlackrockRecordingExtractor(BaseRecording):
 
     def __init__(self, file_path, nsx_override=None, nev_file_path=None):
         nsx_path, nev_path = resolve_file_set(file_path, nsx_override=nsx_override, nev_file_path=nev_file_path)
-        nev = read_nev(nev_path) if nev_path is not None else None
+        nev = read_nev_cached(nev_path) if nev_path is not None else None
         stream = read_stream(nsx_path, nev=nev)
         warn_about_stream(stream)
 
@@ -228,8 +228,9 @@ def select_timeline_stream(nev, nsx_to_load=None) -> BlackrockStream | None:
     """
     The ``.nsX`` stream whose timeline places a ``.nev`` file's spikes, among those ``nsx_to_load`` allows.
 
-    The one whose first sample comes first, the highest rate of those tied, so spikes before any stream starts
-    keep their place; ``None`` when there is no ``.nsX`` to use.
+    Every stream of a set is placed from the set's earliest first sample, so any of them gives the spikes the
+    same times, up to which stream's samples a PTP spike is anchored to and where a run after a clock reset ends.
+    Of several, the smallest file is read, as the cheapest; ``None`` when there is no ``.nsX`` to use.
     """
     candidates = available_nsx_files(file_set_base(nev.path))
     if nsx_to_load is not None and nsx_to_load not in ("all", "max"):
@@ -239,11 +240,7 @@ def select_timeline_stream(nev, nsx_to_load=None) -> BlackrockStream | None:
         candidates = candidates[-1:]
     if not candidates:
         return None
-    streams = [read_stream(path, nev=nev) for path in candidates]
-    # Compare first-sample clock values in seconds, since streams of one set can count at other resolutions.
-    return min(
-        streams, key=lambda stream: (stream.runs[0].first_tick / stream.timeline.resolution, -stream.sampling_frequency)
-    )
+    return read_stream(min(candidates, key=lambda path: path.stat().st_size), nev=nev)
 
 
 class BlackrockSortingExtractor(BaseSorting):
@@ -270,7 +267,7 @@ class BlackrockSortingExtractor(BaseSorting):
 
     def __init__(self, file_path, sampling_frequency=None, nsx_to_load=None):
         nev_path = Path(file_path)
-        nev = read_nev(nev_path)
+        nev = read_nev_cached(nev_path)
         stream = select_timeline_stream(nev, nsx_to_load=nsx_to_load)
         sampling_frequency = float(sampling_frequency) if sampling_frequency else nev.sample_resolution
 

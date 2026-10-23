@@ -215,6 +215,15 @@ class TestTimeline:
         assert runs["after_clock_reset"].tolist() == [False, False]
         assert runs["source_file"].tolist() == ["paused.ns2", "paused.ns2"]
 
+    def test_tables_follow_each_segment_alignment(self, paused):
+        interface = BlackrockRecordingInterface(file_path=paused)
+        interface.set_aligned_segment_starting_times([10.0, 100.0])
+        nwbfile = interface.create_nwbfile()
+        # Each segment is moved by its own amount: the second, at 5 s in the file, to 105 s.
+        assert list(nwbfile.intervals["runs"]["start_time"][:]) == [10.0, 105.0]
+        # 1 ms into the first run and 0.5 s into the second, each moved with its own run.
+        assert list(nwbfile.intervals["nev_events"]["start_time"][:]) == pytest.approx([10.001, 105.5])
+
     def test_contiguous_blocks_are_one_run(self, tmp_path):
         write_nsx(
             tmp_path / "joined.ns2",
@@ -253,6 +262,43 @@ class TestTimeline:
 
         sorting = BlackrockSortingInterface(file_path=tmp_path / "late.nev").sorting_extractor
         assert sorting.get_unit_spike_train(0, return_times=True).tolist() == pytest.approx([3 / 30_000])
+
+
+class TestFileSetOrigin:
+    """Every stream of a set, and its .nev, is placed from the set's earliest first sample."""
+
+    @pytest.fixture
+    def two_streams(self, tmp_path):
+        # The .ns2's first sample is 2 ms after the .ns5's, as the GIN .ns6 starts 0.134 ms after its .ns4.
+        write_nsx(tmp_path / "set.ns5", channels=[channel(1, "chan1")], blocks=[(900, ramp(300, 1))], period=1)
+        write_nsx(tmp_path / "set.ns2", channels=[channel(1, "chan1")], blocks=[(960, ramp(10, 1))])
+        write_nev(tmp_path / "set.nev", packets=[spike(990, 1), digital(1020, 5)])
+        return tmp_path
+
+    def test_streams_share_the_earliest_first_sample(self, two_streams):
+        fast = BlackrockRecordingInterface(file_path=two_streams / "set.ns5")
+        slow = BlackrockRecordingInterface(file_path=two_streams / "set.ns2")
+        assert fast.recording_extractor.get_start_time(segment_index=0) == 0.0
+        assert slow.recording_extractor.get_start_time(segment_index=0) == pytest.approx(0.002)
+        for interface in (fast, slow):
+            events = interface.create_nwbfile().intervals["nev_events"].to_dataframe()
+            assert events["start_time"].tolist() == pytest.approx([0.004])
+
+    def test_sorting_gives_the_same_times_from_any_stream(self, two_streams):
+        times = [
+            BlackrockSortingInterface(file_path=two_streams / "set.nev", nsx_to_load=nsx_to_load)
+            .sorting_extractor.get_unit_spike_train(0, return_times=True)
+            .tolist()
+            for nsx_to_load in (None, 2, 5)
+        ]
+        assert times == [pytest.approx([0.003])] * 3
+
+    def test_blocks_neo_drops_do_not_set_the_origin(self, tmp_path):
+        # neo drops blocks shorter than two samples, so a lone sample before the data does not move t = 0.
+        write_nsx(tmp_path / "lone.ns2", channels=[channel(1, "chan1")], blocks=[(0, ramp(1, 1)), (300, ramp(10, 1))])
+        assert _blackrock_file_set.first_sample_tick(tmp_path / "lone.ns2") == (300, 30_000.0)
+        recording = BlackrockRecordingInterface(file_path=tmp_path / "lone.ns2").recording_extractor
+        assert recording.get_start_time(segment_index=0) == 0.0
 
 
 class TestPTP:
@@ -462,7 +508,9 @@ class TestNevEvents:
 
 class TestSorting:
     def test_spikes_are_on_the_recording_timeline(self, reset):
-        with pytest.warns(UserWarning, match="was reset"):
+        with warnings.catch_warnings():
+            # The stream may already have warned, read by an earlier test's interface over the same file.
+            warnings.simplefilter("ignore")
             sorting = BlackrockSortingInterface(file_path=reset.with_suffix(".nev")).sorting_extractor
         # 30 ms from the start; 4 ms after the reset, placed at the end of the first run (0.1 s + 2 ms + 2 ms).
         assert sorting.get_unit_spike_train(0, return_times=True).tolist() == pytest.approx([0.03, 0.104])
@@ -484,6 +532,14 @@ class TestSorting:
         times = interface.sorting_extractor.get_unit_spike_train(0, return_times=True)
         assert times.tolist() == pytest.approx([0.002, 5.55])
 
+    def test_a_stream_read_by_both_interfaces_warns_once(self, reset):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            recording = BlackrockRecordingInterface(file_path=reset)
+            sorting = BlackrockSortingInterface(file_path=reset.with_suffix(".nev"))
+        assert sum("was reset" in str(warning.message) for warning in caught) == 1
+        assert sorting.blackrock_stream is recording.blackrock_stream
+
     def test_recording_and_sorting_in_one_file(self, paused, tmp_path):
         recording = BlackrockRecordingInterface(file_path=paused)
         sorting = BlackrockSortingInterface(file_path=paused.with_suffix(".nev"), nsx_to_load=2)
@@ -495,7 +551,7 @@ class TestSorting:
             assert nwbfile.session_start_time == TIME_ORIGIN_DATETIME
             assert nwbfile.units["spike_times"][0].tolist() == pytest.approx([0.002, 5.55])
             assert nwbfile.acquisition["ElectricalSeries1"].starting_time == 5.0
-            assert nwbfile.intervals["nev_events"]["start_time"][:].tolist() == pytest.approx([0.001, 5.5])
+            assert list(nwbfile.intervals["nev_events"]["start_time"][:]) == pytest.approx([0.001, 5.5])
 
 
 class TestBlackrockRecordingInterfaceMixin(RecordingExtractorInterfaceTestMixin):

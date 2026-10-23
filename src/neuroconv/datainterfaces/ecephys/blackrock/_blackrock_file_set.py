@@ -5,11 +5,14 @@ neo's ``BlackrockRawIO`` parses the headers and memory-maps the samples. This mo
 split into runs and where each run and each ``.nev`` packet is placed, because what neo and SpikeInterface
 do with the clock values cannot be written as they are:
 
-* **t = 0 is the stream's first sample.** ``TimeOrigin`` is the UTC wall time the file was opened, and
-  BIDS ``events.tsv`` onsets count from a data file's first sample. The clock, though, starts at the
-  recording only in older files: a FileSpec 3.0 file's first sample is at 893.7 s of the Neural Signal
-  Processor's clock, and a PTP (Gemini) file's at its Unix-epoch nanoseconds (1.69e9 s), which are not even
-  UTC (24 to 118 days off ``TimeOrigin`` in the test files).
+* **t = 0 is the file set's earliest first sample.** ``TimeOrigin`` is the UTC wall time the recording was
+  started, the same to the millisecond in every ``.nsX`` file of a set, and BIDS ``events.tsv`` onsets count
+  from a data file's first sample. The clock, though, starts at the recording only in older files: a FileSpec
+  3.0 file's first sample is at 893.7 s of the Neural Signal Processor's clock, and a PTP (Gemini) file's at
+  its Unix-epoch nanoseconds (1.69e9 s), which are not even UTC (24 to 118 days off ``TimeOrigin`` in the
+  test files). The streams of one set do not start on the same tick (the GIN ``.ns4`` and ``.ns6`` of one
+  recording are 0.134 ms apart), so all of them, and the ``.nev``, share the earliest one as their origin;
+  a stream that starts later starts that much after 0.
 * **A clock reset does not overlap.** A ResetCorrect file restarts its clock near zero mid-file. The real
   start of what follows is unknown, but it cannot be before the end of what came before, so each run after a
   reset is placed at that end plus its own clock value since the reset, and flagged.
@@ -27,7 +30,9 @@ drift from the nominal rate, so an event stays on the sample it was recorded at.
 
 import datetime
 import re
+import struct
 import warnings
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,7 +64,6 @@ class BlackrockRun:
     number_of_samples: int = 0
     start_time: float = 0.0
     first_tick: int = 0
-    reset_epoch: int = 0
     after_clock_reset: bool = False
 
 
@@ -124,13 +128,15 @@ class BlackrockTimeline:
         runs = np.searchsorted(self._run_firsts, positions, side="right") - 1
         sample_seconds = self._run_starts[runs] + (positions - self._run_firsts[runs]) / self.sampling_frequency
         seconds = sample_seconds + (ticks - np.asarray(sorted_ticks[positions], dtype=np.int64)) / self.resolution
-        # Before the first sample there is nothing to anchor to but the first sample itself, at 0.
-        seconds[before_first] = (ticks[before_first] - int(sorted_ticks[0])) / self.resolution
+        # Before the first sample there is nothing to anchor to but the clock itself, from the set's origin.
+        seconds[before_first] = (ticks[before_first] - self.epochs[0].reference) / self.resolution
         return seconds
 
 
-# PTP timestamps are scanned and searched this many at a time, so a long recording's eight bytes per sample are
-# never all in memory at once (a day at 30 kHz is 21 GB of them).
+# PTP timestamps are scanned and searched this many at a time, so the eight bytes per sample of a long recording
+# stored in order (a day at 30 kHz is 21 GB of them) are never all in memory at once. A file with packets out of
+# order is the exception: putting them back in order holds every timestamp and the order, 16 bytes per sample,
+# which neo's own parse of the file, about 25 bytes per sample, already exceeds.
 _CHUNK = 1 << 22
 
 
@@ -169,6 +175,7 @@ class BlackrockStream:
     time_origin: datetime.datetime | None
     comment: str
     out_of_order_packets: int = 0
+    warned: bool = False
 
     @property
     def runs(self) -> list[BlackrockRun]:
@@ -370,17 +377,47 @@ def _read_events(reader, spec: str) -> BlackrockEvents:
     )
 
 
+# Streams and .nev files already read, so a recording and a sorting interface over one set in a ConverterPipe
+# parse each file once, and warn about it once. Weak values: an entry goes with the last extractor holding it.
+_STREAMS = weakref.WeakValueDictionary()
+_NEVS = weakref.WeakValueDictionary()
+
+
+def _file_key(path: Path | None):
+    if path is None:
+        return None
+    stat = Path(path).stat()
+    return str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns
+
+
+def read_nev_cached(nev_path: Path) -> BlackrockNev:
+    """:func:`read_nev`, reusing what was read from an unchanged file."""
+    key = _file_key(nev_path)
+    nev = _NEVS.get(key)
+    if nev is None:
+        nev = _NEVS[key] = read_nev(nev_path)
+    return nev
+
+
 def read_stream(nsx_path: Path, nev: BlackrockNev | None = None) -> BlackrockStream:
     """
-    Read one ``.nsX`` file's channels and lay its samples out in runs.
+    Read one ``.nsX`` file's channels and lay its samples out in runs, reusing what was read from an unchanged file.
 
     ``nev`` is needed for a FileSpec 2.1 stream, whose own header carries neither the scaling of its samples
     nor a start time; both are in the ``.nev``.
     """
     nsx_path = Path(nsx_path)
-    number = nsx_number(nsx_path)
-    if number is None:
+    if nsx_number(nsx_path) is None:
         raise ValueError(f"'{nsx_path}' is not a Blackrock continuous data file: its suffix is not .ns1 to .ns6.")
+    key = (_file_key(nsx_path), None if nev is None else _file_key(nev.path))
+    stream = _STREAMS.get(key)
+    if stream is None:
+        stream = _STREAMS[key] = _read_stream(nsx_path, nev)
+    return stream
+
+
+def _read_stream(nsx_path: Path, nev: BlackrockNev | None) -> BlackrockStream:
+    number = nsx_number(nsx_path)
     reader = _neo_reader(
         filename=str(file_set_base(nsx_path)),
         nsx_to_load=number,
@@ -421,11 +458,13 @@ def read_stream(nsx_path: Path, nev: BlackrockNev | None = None) -> BlackrockStr
     ticks_per_sample = resolution / sampling_frequency
     is_ptp = len(blocks) == 1 and isinstance(blocks[0][1], np.ndarray) and blocks[0][1].size == len(blocks[0][0])
 
+    # The origin of every stream of the set; a FileSpec 2.1 clock is not stored, and starts with the recording.
+    origin = None if spec == "2.1" else set_origin(nsx_path, resolution)
     out_of_order = 0
     if is_ptp:
-        timeline, out_of_order = _ptp_timeline(blocks[0], resolution, sampling_frequency, ticks_per_sample)
+        timeline, out_of_order = _ptp_timeline(blocks[0], resolution, sampling_frequency, ticks_per_sample, origin)
     else:
-        timeline = _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample)
+        timeline = _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample, origin)
 
     comment = bytes(basic["comment"]).split(b"\x00")[0].decode("latin-1") if "comment" in basic.dtype.names else ""
     return BlackrockStream(
@@ -476,12 +515,71 @@ def _gains_from_nev(channel_ids: list, nev: BlackrockNev, nsx_path: Path):
     return np.asarray(gains), ["uV"] * len(channel_ids)
 
 
-def _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample) -> BlackrockTimeline:
+def first_sample_tick(nsx_path: Path) -> tuple[int, float] | None:
+    """
+    The clock value of a ``.nsX`` file's first sample and the clock's resolution, read from its headers alone.
+
+    Blocks shorter than two samples are skipped, as neo drops them. A PTP file's earliest timestamp is taken from
+    its first chunk of packets, since packets stored out of order are out of order only locally. ``None`` for a
+    file whose data cannot be read this way.
+    """
+    nsx_path = Path(nsx_path)
+    size = nsx_path.stat().st_size
+    with open(nsx_path, "rb") as file:
+        basic = file.read(314)
+        if basic[:8] == b"NEURALSG":
+            return 0, 30_000.0
+        if len(basic) < 314:
+            return None
+        major = basic[8]
+        (bytes_in_headers,) = struct.unpack_from("<I", basic, 10)
+        (resolution,) = struct.unpack_from("<I", basic, 290)
+        (channel_count,) = struct.unpack_from("<I", basic, 310)
+        if resolution == 1_000_000_000:
+            packet = np.dtype(
+                [("reserved", "u1"), ("timestamp", "<u8"), ("count", "<u4"), ("samples", "<i2", (channel_count,))]
+            )
+            number_of_packets = min((size - bytes_in_headers) // packet.itemsize, _CHUNK)
+            if number_of_packets > 0:
+                packets = np.memmap(
+                    nsx_path, dtype=packet, mode="r", offset=bytes_in_headers, shape=(number_of_packets,)
+                )
+                if np.all(packets["count"] == 1):
+                    return int(packets["timestamp"].min()), float(resolution)
+        header = struct.Struct("<BQI" if major >= 3 else "<BII")
+        offset = bytes_in_headers
+        while offset + header.size <= size:
+            file.seek(offset)
+            flag, tick, number_of_samples = header.unpack(file.read(header.size))
+            if flag != 1:
+                return None
+            if number_of_samples >= 2:
+                return int(tick), float(resolution)
+            offset += header.size + number_of_samples * channel_count * 2
+    return None
+
+
+def set_origin(nsx_path: Path, resolution: float) -> int | None:
+    """
+    The earliest first sample among the ``.nsX`` files of ``nsx_path``'s set, in ticks of ``resolution``.
+
+    Every stream of a set, and its ``.nev``, is placed from this one origin, so they line up in one NWB file.
+    """
+    candidates = {Path(nsx_path), *available_nsx_files(file_set_base(nsx_path))}
+    firsts = [first for first in map(first_sample_tick, sorted(candidates)) if first is not None]
+    if not firsts:
+        return None
+    tick, tick_resolution = min(firsts, key=lambda first: first[0] / first[1])
+    return tick if tick_resolution == resolution else int(round(tick * resolution / tick_resolution))
+
+
+def _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample, origin=None) -> BlackrockTimeline:
     """
     Runs of a stream whose data blocks each carry the clock value of their first sample (or none, FileSpec 2.1).
 
     A block that starts where the last one ended continues its run; one that starts later begins a new run
-    (a pause); one that starts before the last one ended follows a clock reset.
+    (a pause); one that starts before the last one ended follows a clock reset. Before any reset, a tick is placed
+    from ``origin``, the set's earliest first sample (this stream's own when ``None``).
     """
     runs, epochs = [], []
     previous_end = None
@@ -489,8 +587,9 @@ def _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample) ->
         tick = 0 if timestamp is None else int(timestamp)
         number_of_samples = int(data.shape[0])
         if not runs:
-            epochs.append(_ClockEpoch(base=0.0, reference=tick))
-            runs.append(BlackrockRun(first_tick=tick, start_time=0.0))
+            reference = tick if origin is None else min(origin, tick)
+            epochs.append(_ClockEpoch(base=0.0, reference=reference))
+            runs.append(BlackrockRun(first_tick=tick, start_time=(tick - reference) / resolution))
         elif tick < previous_end - ticks_per_sample / 2:
             last = runs[-1]
             epochs.append(_ClockEpoch(base=last.start_time + last.number_of_samples / sampling_frequency, reference=0))
@@ -498,7 +597,6 @@ def _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample) ->
                 BlackrockRun(
                     first_tick=tick,
                     start_time=epochs[-1].base + tick / resolution,
-                    reset_epoch=len(epochs) - 1,
                     after_clock_reset=True,
                 )
             )
@@ -508,7 +606,6 @@ def _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample) ->
                 BlackrockRun(
                     first_tick=tick,
                     start_time=epoch.base + (tick - epoch.reference) / resolution,
-                    reset_epoch=len(epochs) - 1,
                 )
             )
         run = runs[-1]
@@ -520,8 +617,12 @@ def _block_timeline(blocks, resolution, sampling_frequency, ticks_per_sample) ->
     )
 
 
-def _ptp_timeline(block, resolution, sampling_frequency, ticks_per_sample):
-    """Runs of a PTP stream, one packet per sample, each with its own timestamp in nanoseconds."""
+def _ptp_timeline(block, resolution, sampling_frequency, ticks_per_sample, origin=None):
+    """
+    Runs of a PTP stream, one packet per sample, each with its own timestamp in nanoseconds.
+
+    Ticks are placed from ``origin``, the set's earliest first sample (this stream's own when ``None``).
+    """
     data, timestamps = block
     # A view, not a copy: the timestamps stay in the memory map, read a chunk at a time.
     ticks = timestamps.view(np.int64) if timestamps.dtype.itemsize == 8 else np.asarray(timestamps, dtype=np.int64)
@@ -533,11 +634,11 @@ def _ptp_timeline(block, resolution, sampling_frequency, ticks_per_sample):
         order = np.argsort(np.asarray(ticks), kind="stable")
         ticks = np.asarray(ticks)[order]
         gaps, _ = _scan_ptp_ticks(ticks, gap)
-    out_of_order = 0 if order is None else int(np.count_nonzero(order != np.arange(len(order))))
+    out_of_order = 0 if order is None else _count_moved(order)
 
     starts = np.concatenate([[0], gaps]).astype(np.int64)
     stops = np.concatenate([starts[1:], [len(ticks)]])
-    first_tick = int(ticks[0])
+    first_tick = int(ticks[0]) if origin is None else min(origin, int(ticks[0]))
     runs = []
     for start, stop in zip(starts, stops):
         if order is None:
@@ -566,6 +667,14 @@ def _ptp_timeline(block, resolution, sampling_frequency, ticks_per_sample):
     return timeline, out_of_order
 
 
+def _count_moved(order: np.ndarray) -> int:
+    """How many packets the reordering moves, compared a chunk at a time rather than against a whole arange."""
+    return sum(
+        int(np.count_nonzero(order[first : first + _CHUNK] != np.arange(first, min(first + _CHUNK, len(order)))))
+        for first in range(0, len(order), _CHUNK)
+    )
+
+
 def _scan_ptp_ticks(ticks, gap: float) -> tuple[np.ndarray, bool]:
     """Where a new run starts (the sample after a step of more than ``gap`` ticks), and whether any step is back."""
     gaps, backward = [], False
@@ -587,7 +696,10 @@ def _largest_ptp_drift(ticks, starts, stops, ticks_per_sample) -> float:
 
 
 def warn_about_stream(stream: BlackrockStream) -> None:
-    """Say what was done to place a stream's samples, where it was more than reading them in order."""
+    """Say what was done to place a stream's samples, where it was more than reading them in order, once per stream."""
+    if stream.warned:
+        return
+    stream.warned = True
     name = stream.path.name
     resets = sum(run.after_clock_reset for run in stream.runs)
     if resets:
