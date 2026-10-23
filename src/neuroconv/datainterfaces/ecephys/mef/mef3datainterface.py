@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import DirectoryPath
 from pynwb import NWBFile
 
+from ._runs_table import add_runs_to_nwbfile
 from .._channel_ids import _stacklevel_outside_neuroconv
 from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
@@ -265,26 +266,11 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         )
 
     def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
-        rows = []
-        for run_index, run in enumerate(self.mef3_session.runs):
-            start_time = self._run_start_time(run_index)
-            rows.append(
-                dict(
-                    start_time=start_time,
-                    stop_time=start_time + run.number_of_samples / self.mef3_session.sampling_frequency,
-                    run_index=run_index,
-                )
-            )
-        add_rows_to_intervals_table(
-            nwbfile=nwbfile,
+        add_runs_to_nwbfile(
+            nwbfile,
+            recording_extractor=self.recording_extractor,
+            run_samples=[run.number_of_samples for run in self.mef3_session.runs],
+            sampling_frequency=self.mef3_session.sampling_frequency,
             file_path=self.mef3_session.path,
-            name="runs",
-            description=(
-                "Uninterrupted runs of samples in recordings with gaps. Each run is written as its own "
-                "ElectricalSeries, positioned at the run's start time."
-            ),
-            columns={"run_index": "0-based index of the uninterrupted run of samples within its recording."},
-            rows=rows,
             kind="MEF 3",
-            source_file_description=_SOURCE_FILE_DESCRIPTION,
         )

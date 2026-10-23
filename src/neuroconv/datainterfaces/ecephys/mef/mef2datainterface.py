@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import DirectoryPath, FilePath
 from pynwb import NWBFile
 
+from ._runs_table import add_runs_to_nwbfile
 from .._channel_ids import _stacklevel_outside_neuroconv
 from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
@@ -142,7 +143,9 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
             neural data.
         stream_name : str, optional
             The sampling rate to convert, as ``get_stream_names`` names it, such as ``"500 Hz"``. Required when
-            the files are sampled at more than one rate; convert each stream with its own interface.
+            the files are sampled at more than one rate; convert each stream with its own interface. To write
+            several streams to one NWB file, give each interface its own ``metadata_key`` and its series its
+            own name under that key, as the MEF 2 gallery page shows.
         annotations_file_path : str or Path, optional
             An IEEG.org ``annotations.xml`` for the recording. Defaults to ``annotations.xml`` in
             ``folder_path`` when there is one.
@@ -240,7 +243,8 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         write_runs : bool, default: True
             If True and the recording has more than one uninterrupted run, the runs are written to a
             ``TimeIntervals`` table named ``"runs"``, shared with MEF 3 interfaces, or added to it as for the
-            annotations.
+            annotations. When the directory holds several streams, the rows' ``source_file`` names the stream
+            too, such as ``"recording (512 Hz)"``.
         """
         # The full signature is redeclared rather than taking **conversion_options, because
         # get_conversion_options_schema is built from it.
@@ -307,29 +311,16 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         )
 
     def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
-        rows = []
-        for run_index, run in enumerate(self.mef2_recording.runs):
-            start_time = float(self.recording_extractor.get_start_time(segment_index=run_index))
-            rows.append(
-                dict(
-                    start_time=start_time,
-                    stop_time=start_time + run.number_of_samples / self.mef2_recording.sampling_frequency,
-                    run_index=run_index,
-                )
-            )
-        # Keyed on the directory, so every interface over the recording writes its runs once. The streams of a
-        # recording sampled at several rates are converted separately; only the first to reach the NWB file
-        # writes its runs.
-        add_rows_to_intervals_table(
-            nwbfile=nwbfile,
-            file_path=self.mef2_recording.path,
-            name="runs",
-            description=(
-                "Uninterrupted runs of samples in recordings with gaps. Each run is written as its own "
-                "ElectricalSeries, positioned at the run's start time."
-            ),
-            columns={"run_index": "0-based index of the uninterrupted run of samples within its recording."},
-            rows=rows,
+        recording = self.mef2_recording
+        # The streams of a directory are converted by separate interfaces, each with runs of its own, so
+        # each writes its rows once, named after its stream.
+        source_file = f"{recording.path.name} ({recording.stream_name})" if recording.number_of_streams > 1 else None
+        add_runs_to_nwbfile(
+            nwbfile,
+            recording_extractor=self.recording_extractor,
+            run_samples=[run.number_of_samples for run in recording.runs],
+            sampling_frequency=recording.sampling_frequency,
+            file_path=recording.path,
             kind="MEF 2",
-            source_file_description=_RUNS_SOURCE_FILE_DESCRIPTION,
+            source_file=source_file,
         )

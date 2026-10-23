@@ -44,9 +44,31 @@ pure-NumPy decoder is used, which gives the same samples much more slowly.
 The samples are stored as the integer counts the files hold, with each channel's voltage conversion factor,
 in microvolts per count, as the series' gain. The factor keeps its sign: MEF 2 marks inverted counts with a
 negative factor, and PennEPI's recordings have one, so every recording comes out in microvolts with the same
-polarity. Channels sampled at different rates are converted one stream at a time, with ``stream_name``. All
-channels of a stream must share the stretches of time they were recorded over; leave the others out with
-``channels_to_skip`` and convert them separately.
+polarity. All channels of a stream must share the stretches of time they were recorded over; leave the others
+out with ``channels_to_skip`` and convert them separately.
+
+Channels sampled at different rates are converted one stream at a time, with ``stream_name``. To write
+several streams to one NWB file, give each interface its own ``metadata_key``, and give its series its own
+name under that key; otherwise the interfaces collide on the default ``ElectricalSeries`` name:
+
+.. code-block:: python
+
+    from neuroconv import ConverterPipe
+
+    interfaces = []
+    for stream_name in MEF2RecordingInterface.get_stream_names(folder_path):
+        metadata_key = "mef2_" + stream_name.replace(" ", "_")  # such as "mef2_512_Hz"
+        interfaces.append(MEF2RecordingInterface(folder_path, stream_name=stream_name, metadata_key=metadata_key))
+
+    converter = ConverterPipe(data_interfaces=interfaces)
+    metadata = converter.get_metadata()
+    for interface in interfaces:
+        series_name = "ElectricalSeries_" + interface.metadata_key.removeprefix("mef2_")
+        metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = series_name
+    converter.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
+
+The streams share the recording's timeline, and each writes its own rows to the ``runs`` table described
+below, with the stream in the ``source_file`` column, such as ``"recording (512 Hz)"``.
 
 The header's subject fields (names, ID, anonymized name), institution and comments are never read, so they
 cannot reach the NWB file; set ``metadata["Subject"]`` yourself.
@@ -73,8 +95,10 @@ Each series uses the channel's nominal sampling rate, while the block timestamps
 system's clock, which drifts against it. In one Mayo recording that clock ran 50 ppm slow, so towards the end
 of a day-long run a sample's time in the NWB file is about 4 s earlier than its block's timestamp.
 
-The one-sample block of value 0 that IEEG.org's writer puts before the first real block of every MEF 2.1 file
-is left out.
+The session starts at the header's recording start time, which IEEG.org's annotation times count from, so
+the NWB times of the series equal IEEG.org's offsets. The one-sample block of value 0 that IEEG.org's writer
+puts before the first real block of every MEF 2.1 file is left out, so in those files the first series
+starts a couple of seconds into the session.
 
 Annotations, CRCs and encryption
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

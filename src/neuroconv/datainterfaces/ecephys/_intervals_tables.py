@@ -31,6 +31,7 @@ def add_rows_to_intervals_table(
     rows: list[dict],
     kind: str,
     source_file_description: str,
+    source_file: str | None = None,
 ):
     """
     Add ``rows`` read from ``file_path`` to the ``TimeIntervals`` table ``name``, creating it if the file has none.
@@ -65,6 +66,10 @@ def add_rows_to_intervals_table(
         The format, as the warning about a foreign table names it, such as ``"EDF"``.
     source_file_description : str
         Description of the ``source_file`` column.
+    source_file : str, optional
+        What the rows' ``source_file`` column says, in place of the name of ``file_path``. For a source that
+        holds more than one set of rows for the table, such as each sampling rate of a MEF 2 recording; each
+        set is then written once.
     """
     from pynwb.epoch import TimeIntervals
 
@@ -72,13 +77,13 @@ def add_rows_to_intervals_table(
     # same file name and the same layout can have identical rows, and both must be kept.
     file_path = Path(file_path)
     written = _INTERVALS_WRITTEN.setdefault(nwbfile, set())
-    key = (str(file_path.resolve()), name)
+    source_file = file_path.name if source_file is None else source_file
+    key = (str(file_path.resolve()), name, source_file)
     if key in written:
         return
     # Marked before writing, so a clash with a foreign table warns once per source file, not once per interface.
     written.add(key)
 
-    source_file = file_path.name
     columns = dict(columns, source_file=source_file_description)
 
     table = _get_table(nwbfile=nwbfile, name=name)

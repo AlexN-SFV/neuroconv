@@ -295,9 +295,15 @@ class TestRealExcerpts:
         assert channel.dropped_placeholder_block
         assert len(channel.blocks) == len(blocks) - 1
         assert struct.unpack_from("<I", blocks[0], 20)[0] == 1
-        # The recording starts at the first real block, 2.5 s after the placeholder.
-        assert recording.start_time == struct.unpack_from("<Q", blocks[1], 8)[0]
-        assert recording.start_time - struct.unpack_from("<Q", header, 408)[0] == 2_544_921
+        # The first run starts at the first real block, 2.5 s after the placeholder, whose time is the header's
+        # start time and the recording's origin.
+        assert recording.runs[0].start_time == struct.unpack_from("<Q", blocks[1], 8)[0]
+        assert (
+            recording.start_time
+            == struct.unpack_from("<Q", header, 408)[0]
+            == struct.unpack_from("<Q", blocks[0], 8)[0]
+        )
+        assert recording.runs[0].start_time - recording.start_time == 2_544_921
 
     def test_dropouts_split_runs(self):
         """PennEPI's flagged blocks follow real dropouts of whole samples, each starting its own run."""
@@ -386,6 +392,22 @@ class TestRuns:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             assert [run.number_of_blocks for run in read_mef2_recording(copy).runs] == [5, 3]
+
+    def test_flag_of_an_empty_block_passes_to_the_next(self, tmp_path):
+        """A writer can mark a dropout with an empty flagged block; the samples after it must not join the run."""
+        copy = copy_recording(AD3, tmp_path / "copy")
+        header, blocks = read_mef2_file(copy / "AD3.mef")
+        # An empty block flagged as a discontinuity, then the rest of the run 0.3 s later than continuous.
+        marker = bytearray(blocks[1])
+        struct.pack_into("<II", marker, 16, 0, 0)
+        marker = patch_block(bytes(marker), start_time=struct.unpack_from("<Q", blocks[2], 8)[0], flag=True)
+        shifted = [
+            patch_block(block, start_time=struct.unpack_from("<Q", block, 8)[0] + 300_000) for block in blocks[2:5]
+        ]
+        write_mef2(copy / "AD3.mef", header, blocks[:2] + [marker] + shifted + blocks[5:])
+        recording = read_mef2_recording(copy)
+        assert len(recording.channels[0].blocks) == 8
+        assert [run.number_of_blocks for run in recording.runs] == [2, 3, 3]
 
     def test_flagged_block_back_in_time_overlaps(self, tmp_path):
         copy = self.shifted(tmp_path, 6, seconds=-2.0, flag=True)
@@ -708,6 +730,51 @@ class TestInterface:
         assert starts == pytest.approx([100.0 + gap_time / 1e6, 3225.664])
         np.testing.assert_allclose(nwbfile.intervals["runs"]["start_time"][:], [100.0, 3224.664])
 
+    def test_session_starts_at_the_header_start(self, tmp_path):
+        """With the placeholder dropped, the first series starts after the session, so IEEG.org offsets stay non-negative."""
+        folder = copy_recording(PENN, tmp_path / "penn")
+        (folder / "annotations.xml").write_text(annotations_xml(("Start", 0, 0, [])), encoding="utf-8")
+        interface = MEF2RecordingInterface(folder)
+        metadata = quiet(interface.get_metadata)
+        header_start = struct.unpack_from("<Q", (folder / "LI07.mef").read_bytes(), 408)[0]
+        expected_start = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=header_start)
+        assert metadata["NWBFile"]["session_start_time"] == expected_start
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
+        first_series = min(series.starting_time for series in nwbfile.acquisition.values())
+        assert first_series == pytest.approx(2.544921)
+        assert nwbfile.intervals["annotations"]["start_time"][0] == 0.0
+        assert nwbfile.intervals["runs"]["start_time"][0] == pytest.approx(2.544921)
+
+    def test_two_streams_in_one_nwb_file(self, tmp_path):
+        """The recipe of the gallery page: each stream gets its own metadata key, series name and runs rows."""
+        from neuroconv import ConverterPipe
+
+        folder = tmp_path / "recording"
+        channel_copy(PENN, folder / "LI07.mef")
+        header, blocks = read_mef2_file(AD3 / "AD3.mef")
+        write_mef2(folder / "ECG.mef", patch_header(header, channel_name="ECG", physical_channel_number=200), blocks)
+        interfaces = {}
+        for stream_name in MEF2RecordingInterface.get_stream_names(folder):
+            metadata_key = f"mef2_{stream_name.replace(' ', '_')}"
+            interfaces[metadata_key] = MEF2RecordingInterface(
+                folder, stream_name=stream_name, metadata_key=metadata_key
+            )
+        converter = ConverterPipe(data_interfaces=list(interfaces.values()))
+        metadata = quiet(converter.get_metadata)
+        for metadata_key in interfaces:
+            metadata["Ecephys"]["ElectricalSeries"][metadata_key]["name"] = f"ElectricalSeries_{metadata_key[5:]}"
+        nwbfile_path = tmp_path / "two_streams.nwb"
+        quiet(converter.run_conversion, nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            assert len(nwbfile.acquisition) == 8 + 2
+            runs = nwbfile.intervals["runs"].to_dataframe()
+            assert list(runs["source_file"].value_counts().sort_index().items()) == [
+                ("recording (1024 Hz)", 8),
+                ("recording (500 Hz)", 2),
+            ]
+
     def test_annotations_file(self):
         recording = read_mef2_recording(AD3)
         (annotation,) = read_ieeg_annotations(
@@ -766,6 +833,32 @@ class TestKoopmanCRC:
         crcs = koopman_crc32(buffer, starts + 4, ends, use_numba=use_numba)
         assert list(crcs) == [struct.unpack_from("<I", block, 0)[0] for block in blocks]
         assert crc(header[:1020]) == struct.unpack_from("<I", header, 1020)[0]
+
+
+class TestSharedRunsTable:
+    def test_mef_3_and_mef_2_runs_share_one_table(self):
+        from neuroconv.datainterfaces import MEF3RecordingInterface
+
+        mef3 = MEF3RecordingInterface(Path(__file__).parent / "mef3_fixtures" / "gapped.mefd", metadata_key="mef3")
+        mef2 = MEF2RecordingInterface(PENN, metadata_key="mef2")
+        nwbfile = mock_NWBFile()
+        for interface in (mef3, mef2):
+            metadata = quiet(interface.get_metadata)
+            metadata["Ecephys"]["ElectricalSeries"][interface.metadata_key]["name"] = interface.metadata_key
+            quiet(interface.add_to_nwbfile, nwbfile=nwbfile, metadata=metadata)
+        runs = nwbfile.intervals["runs"].to_dataframe()
+        assert list(runs["source_file"].value_counts().sort_index().items()) == [
+            ("PennEPI00082_LI07_excerpt", 8),
+            ("gapped.mefd", 2),
+        ]
+
+
+def test_crc_with_numba_requested_but_missing(monkeypatch):
+    from neuroconv.datainterfaces.ecephys.mef import _red
+
+    monkeypatch.setattr(_red, "NUMBA_AVAILABLE", False)
+    with pytest.raises(ImportError, match="requires numba"):
+        koopman_crc32(np.zeros(8, dtype=np.uint8), np.array([0]), np.array([8]), use_numba=True)
 
 
 class TestMEF2RecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):

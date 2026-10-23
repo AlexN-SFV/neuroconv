@@ -471,6 +471,8 @@ def koopman_crc32(
     """
     if use_numba is None:
         use_numba = NUMBA_AVAILABLE
+    if use_numba and not NUMBA_AVAILABLE:
+        raise ImportError("Computing CRCs with use_numba=True requires numba. Install it with `pip install numba`.")
     starts = np.ascontiguousarray(starts, dtype=np.int64)
     ends = np.ascontiguousarray(ends, dtype=np.int64)
     if starts.size and (starts.min() < 0 or ends.max() > buffer.size or (ends < starts).any()):

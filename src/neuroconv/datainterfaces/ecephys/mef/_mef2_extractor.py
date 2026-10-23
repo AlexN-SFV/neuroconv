@@ -48,7 +48,7 @@ class MEF2RecordingExtractor(BaseRecording):
     Lazy SpikeInterface recording for the channels of a MEF 2 recording directory sampled at one rate.
 
     Each uninterrupted run of blocks becomes one segment, placed on the recording's timeline at its first
-    block's start time, measured from the start of the first run.
+    block's start time, measured from the recording's header start time (see ``MEF2Recording.start_time``).
 
     Parameters
     ----------

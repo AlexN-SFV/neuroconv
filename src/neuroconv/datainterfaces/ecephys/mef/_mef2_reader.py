@@ -179,12 +179,22 @@ class MEF2Recording:
     runs: list[MEF3Run]
     sampling_frequency: float
     gmt_offset: float | None
-    recording_start_time: int  # µUTC, the earliest header start time of all the directory's files
+    # µUTC, the earliest start time the directory's headers state, whichever stream their files are in. It is
+    # what IEEG.org annotation times count from.
+    recording_start_time: int
+    stream_name: str
+    number_of_streams: int  # sampling rates among the directory's files, skipped ones included
 
     @property
     def start_time(self) -> int:
-        """Start of the first run, in µUTC."""
-        return self.runs[0].start_time
+        """
+        The origin of the recording's timeline, in µUTC: the header start time, or the first run's if earlier.
+
+        Not the first run's start, so that every stream of the directory shares one origin, and NWB times
+        equal IEEG.org's offsets. In PennEPI's files the first run starts 2.5 s after it, the header start
+        being the time of the placeholder block that is left out.
+        """
+        return min(self.recording_start_time, self.runs[0].start_time)
 
     @property
     def start_datetime(self) -> datetime:
@@ -385,6 +395,11 @@ def _read_blocks(header: dict) -> tuple[np.ndarray, bool]:
             blocks = blocks[1:]
             blocks["discontinuity"][0] = True
             dropped = True
+    # A block without samples is left out, and its flag passed to the block after it: a writer can mark a
+    # dropout with an empty flagged block, and the samples after it must not be taken to continue the run.
+    for position in np.flatnonzero(blocks["number_of_samples"] == 0):
+        if blocks["discontinuity"][position] and position + 1 < len(blocks):
+            blocks["discontinuity"][position + 1] = True
     return blocks[blocks["number_of_samples"] > 0], dropped
 
 
@@ -429,12 +444,20 @@ def _identify(path: Path) -> dict:
     with open(path, "rb") as file:
         raw = file.read(HEADER_BYTES)
     if len(raw) < HEADER_BYTES or raw[164] != 2 or raw[161]:
-        return dict(path=path, channel_name=path.stem, sampling_frequency=float("nan"), physical_channel_number=-1)
+        return dict(
+            path=path,
+            channel_name=path.stem,
+            sampling_frequency=float("nan"),
+            physical_channel_number=-1,
+            recording_start_time=0,
+        )
     return dict(
         path=path,
         channel_name=_text(raw[376:408]) or path.stem,
         sampling_frequency=_number(raw, 424, "<f8"),
         physical_channel_number=_number(raw, 752, "<i4"),
+        # 0 is the header's "no entry".
+        recording_start_time=_number(raw, 408, "<u8"),
     )
 
 
@@ -635,9 +658,12 @@ def read_mef2_recording(
             )
         )
     runs = _check_shared_layout(channels, sampling_frequency, path)
-    # IEEG.org gives annotation times as offsets from the start of the whole recording, every converted file
-    # included.
-    recording_start_time = min(header["recording_start_time"] for header in headers.values())
+    # IEEG.org gives annotation times as offsets from the start of the whole recording. Taken over every file,
+    # skipped ones and other streams included, so the streams of one directory share it.
+    stated_starts = [
+        identity["recording_start_time"] for identity in identities if identity["recording_start_time"] > 0
+    ]
+    rates = {identity["sampling_frequency"] for identity in identities}
     return MEF2Recording(
         path=path,
         channels=channels,
@@ -646,7 +672,9 @@ def read_mef2_recording(
         runs=runs,
         sampling_frequency=sampling_frequency,
         gmt_offset=channels[0].gmt_offset,
-        recording_start_time=recording_start_time,
+        recording_start_time=min(stated_starts) if stated_starts else runs[0].start_time,
+        stream_name=stream_name,
+        number_of_streams=sum(1 for rate in rates if np.isfinite(rate) and rate > 0),
     )
 
 
