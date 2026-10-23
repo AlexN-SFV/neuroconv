@@ -175,7 +175,6 @@ class BlackrockStream:
     time_origin: datetime.datetime | None
     comment: str
     out_of_order_packets: int = 0
-    warned: bool = False
 
     @property
     def runs(self) -> list[BlackrockRun]:
@@ -378,7 +377,8 @@ def _read_events(reader, spec: str) -> BlackrockEvents:
 
 
 # Streams and .nev files already read, so a recording and a sorting interface over one set in a ConverterPipe
-# parse each file once, and warn about it once. Weak values: an entry goes with the last extractor holding it.
+# parse each file once. Weak values: an entry goes with the last extractor holding it. Only the parse is shared;
+# each interface still warns about what it reads, so whether it warns does not depend on what else is alive.
 _STREAMS = weakref.WeakValueDictionary()
 _NEVS = weakref.WeakValueDictionary()
 
@@ -515,13 +515,18 @@ def _gains_from_nev(channel_ids: list, nev: BlackrockNev, nsx_path: Path):
     return np.asarray(gains), ["uV"] * len(channel_ids)
 
 
+# How many of a sibling PTP stream's first packets are searched for its earliest timestamp. The packets stored late
+# in the GIN files are out of place by under 60 packets; this is about 1 MB of a 128-channel stream.
+_ORIGIN_WINDOW = 4096
+
+
 def first_sample_tick(nsx_path: Path) -> tuple[int, float] | None:
     """
     The clock value of a ``.nsX`` file's first sample and the clock's resolution, read from its headers alone.
 
     Blocks shorter than two samples are skipped, as neo drops them. A PTP file's earliest timestamp is taken from
-    its first chunk of packets, since packets stored out of order are out of order only locally. ``None`` for a
-    file whose data cannot be read this way.
+    its first ``_ORIGIN_WINDOW`` packets, read in one contiguous piece, since packets stored out of order are out
+    of order only locally. ``None`` for a file whose data cannot be read this way.
     """
     nsx_path = Path(nsx_path)
     size = nsx_path.stat().st_size
@@ -539,11 +544,11 @@ def first_sample_tick(nsx_path: Path) -> tuple[int, float] | None:
             packet = np.dtype(
                 [("reserved", "u1"), ("timestamp", "<u8"), ("count", "<u4"), ("samples", "<i2", (channel_count,))]
             )
-            number_of_packets = min((size - bytes_in_headers) // packet.itemsize, _CHUNK)
+            number_of_packets = min((size - bytes_in_headers) // packet.itemsize, _ORIGIN_WINDOW)
             if number_of_packets > 0:
-                packets = np.memmap(
-                    nsx_path, dtype=packet, mode="r", offset=bytes_in_headers, shape=(number_of_packets,)
-                )
+                # Read whole, not as strided fields of a memory map, which page in every packet they step over.
+                file.seek(bytes_in_headers)
+                packets = np.frombuffer(file.read(number_of_packets * packet.itemsize), dtype=packet)
                 if np.all(packets["count"] == 1):
                     return int(packets["timestamp"].min()), float(resolution)
         header = struct.Struct("<BQI" if major >= 3 else "<BII")
@@ -696,10 +701,7 @@ def _largest_ptp_drift(ticks, starts, stops, ticks_per_sample) -> float:
 
 
 def warn_about_stream(stream: BlackrockStream) -> None:
-    """Say what was done to place a stream's samples, where it was more than reading them in order, once per stream."""
-    if stream.warned:
-        return
-    stream.warned = True
+    """Say what was done to place a stream's samples, where it was more than reading them in order."""
     name = stream.path.name
     resets = sum(run.after_clock_reset for run in stream.runs)
     if resets:

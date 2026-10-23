@@ -293,6 +293,14 @@ class TestFileSetOrigin:
         ]
         assert times == [pytest.approx([0.003])] * 3
 
+    def test_ptp_origin_reads_only_the_first_packets(self, tmp_path, monkeypatch):
+        # The earliest of the first _ORIGIN_WINDOW packets: a packet stored late within them counts, one after not.
+        ticks = np.r_[5_000_000, np.arange(1, 8) * 1_000_000, 0, np.arange(9, 12) * 1_000_000]
+        write_ptp_nsx(tmp_path / "late.ns2", channels=[channel(1, "chan1")], timestamps=ticks, samples=ramp(12, 1))
+        assert _blackrock_file_set.first_sample_tick(tmp_path / "late.ns2") == (0, 1e9)
+        monkeypatch.setattr(_blackrock_file_set, "_ORIGIN_WINDOW", 8)
+        assert _blackrock_file_set.first_sample_tick(tmp_path / "late.ns2") == (1_000_000, 1e9)
+
     def test_blocks_neo_drops_do_not_set_the_origin(self, tmp_path):
         # neo drops blocks shorter than two samples, so a lone sample before the data does not move t = 0.
         write_nsx(tmp_path / "lone.ns2", channels=[channel(1, "chan1")], blocks=[(0, ramp(1, 1)), (300, ramp(10, 1))])
@@ -508,9 +516,7 @@ class TestNevEvents:
 
 class TestSorting:
     def test_spikes_are_on_the_recording_timeline(self, reset):
-        with warnings.catch_warnings():
-            # The stream may already have warned, read by an earlier test's interface over the same file.
-            warnings.simplefilter("ignore")
+        with pytest.warns(UserWarning, match="was reset"):
             sorting = BlackrockSortingInterface(file_path=reset.with_suffix(".nev")).sorting_extractor
         # 30 ms from the start; 4 ms after the reset, placed at the end of the first run (0.1 s + 2 ms + 2 ms).
         assert sorting.get_unit_spike_train(0, return_times=True).tolist() == pytest.approx([0.03, 0.104])
@@ -532,13 +538,15 @@ class TestSorting:
         times = interface.sorting_extractor.get_unit_spike_train(0, return_times=True)
         assert times.tolist() == pytest.approx([0.002, 5.55])
 
-    def test_a_stream_read_by_both_interfaces_warns_once(self, reset):
+    def test_both_interfaces_share_one_parse_and_each_warns(self, reset):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             recording = BlackrockRecordingInterface(file_path=reset)
             sorting = BlackrockSortingInterface(file_path=reset.with_suffix(".nev"))
-        assert sum("was reset" in str(warning.message) for warning in caught) == 1
-        assert sorting.blackrock_stream is recording.blackrock_stream
+            # A later interface over the unchanged file warns too, while the first still holds the parsed stream.
+            again = BlackrockRecordingInterface(file_path=reset)
+        assert sum("was reset" in str(warning.message) for warning in caught) == 3
+        assert sorting.blackrock_stream is recording.blackrock_stream is again.blackrock_stream
 
     def test_recording_and_sorting_in_one_file(self, paused, tmp_path):
         recording = BlackrockRecordingInterface(file_path=paused)
