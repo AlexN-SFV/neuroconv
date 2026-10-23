@@ -28,6 +28,7 @@ Recording
     MaxOne <recording/maxwell>
     MCSRaw <recording/mcsraw>
     MEArec <recording/mearec>
+    MEF 2 <recording/mef2>
     MEF 3 <recording/mef3>
     Neuralynx <recording/neuralynx>
     NeuroScope <recording/neuroscope>

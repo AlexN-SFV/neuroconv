@@ -1,0 +1,51 @@
+{
+  "Discover13_AD3_excerpt": {
+    "source": "AD3.mef, blocks 0-7 (8 blocks)",
+    "number_of_samples": 18670,
+    "sha256": "9d2fd1475e3d932d1941e5865f8e1d6fe938be0cff79c81d9689a6b37b2b8e4e",
+    "run_samples": [
+      11170,
+      7500
+    ],
+    "run_start_times": [
+      946684800000000,
+      946686024664000
+    ]
+  },
+  "Discover13_AD3_clock_step": {
+    "source": "AD3.mef, blocks 21379-21383 (5 blocks)",
+    "number_of_samples": 11923,
+    "sha256": "75cfbac74d02b35c64309909d9260eae7edf81a279e2e3e34f425a8c703a9a35",
+    "run_samples": [
+      11923
+    ],
+    "run_start_times": [
+      946809621342000
+    ]
+  },
+  "PennEPI00082_LI07_excerpt": {
+    "source": "LI07.mef, blocks 0-142501 (11 blocks)",
+    "number_of_samples": 13657,
+    "sha256": "5c45f7f41a7ac80b7af6f8cb27e819f1e8cab13b625908810f7e43eb3552066e",
+    "run_samples": [
+      5000,
+      1088,
+      1346,
+      83,
+      25,
+      950,
+      165,
+      5000
+    ],
+    "run_start_times": [
+      946733069224943,
+      947083333875194,
+      947083334949413,
+      947083336746288,
+      947083336871288,
+      947083337453319,
+      947083338438671,
+      947083569083202
+    ]
+  }
+}

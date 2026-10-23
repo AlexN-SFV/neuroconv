@@ -1,5 +1,5 @@
 """
-Decoder for RED (Range Encoded Differences), the block compression of MEF 2.1 and MEF 3.0 time series.
+Decoder for RED (Range Encoded Differences), the block compression of MEF 2 and MEF 3.0 time series.
 
 A RED block stores the differences between consecutive samples as one byte each, range coded against a
 table of 256 symbol counts kept in the block header. A difference that does not fit in a byte is written as
@@ -7,9 +7,9 @@ a keysample instead: the reserved symbol -128 followed by the sample's full valu
 block is a keysample, so each block decodes on its own.
 
 The two formats differ only in where things sit, which :class:`REDLayout` carries: the block header is 304
-bytes in MEF 3.0 and 287 in MEF 2.1, MEF 2.1 puts one byte between the header and the coded data, and a
-keysample is 4 bytes in MEF 3.0 and 3 in MEF 2.1. The format readers parse their own block headers and pass
-the per-block fields in.
+bytes in MEF 3.0 and 287 in MEF 2, MEF 2 puts one byte between the header and the coded data, and a
+keysample is 4 bytes in MEF 3.0 and 3 in MEF 2. The format readers parse their own block headers and pass
+the per-block fields in. MEF 2.0 and 2.1 code their blocks identically.
 
 Decoding follows ``RED_decode`` in meflib (``meflib.c``, the reader pymef wraps) step for step, including the
 two transforms a writer can apply before coding to compress further: dividing a block by a scale factor
@@ -51,6 +51,11 @@ class REDLayout(NamedTuple):
 
 # RED_BLOCK_HEADER_BYTES, RED_BLOCK_STATISTICS_OFFSET (meflib.h); no dummy byte; a keysample is an si4.
 MEF3_RED_LAYOUT = REDLayout(header_bytes=304, statistics_offset=48, dummy_bytes=0, keysample_bytes=4)
+
+
+# BLOCK_HEADER_BYTES and RED_STAT_MODEL_OFFSET (mef.h, mef_lib 2.1); RED_decompress_block skips one dummy byte
+# after the header and reads a keysample as an si3.
+MEF2_RED_LAYOUT = REDLayout(header_bytes=287, statistics_offset=31, dummy_bytes=1, keysample_bytes=3)
 
 
 class REDDecodeError(ValueError):
@@ -414,3 +419,63 @@ def decode_red_blocks(
             "ends before its samples do, or its symbol counts are all zero. The file is corrupt."
         )
     return out
+
+
+# The Koopman CRC-32 both MEF versions checksum headers and blocks with: CRC_KOOPMAN32_KEY in mef.h is the
+# table of the reflected polynomial Koopman32 (0xEB31D82E), which this rebuilds.
+def _koopman_table() -> np.ndarray:
+    table = np.zeros(256, dtype=np.int64)
+    for index in range(256):
+        crc = index
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0xEB31D82E if crc & 1 else 0)
+        table[index] = crc
+    return table
+
+
+_KOOPMAN_TABLE = _koopman_table()
+
+
+def _crc_ranges_python(buffer, starts, ends, table, out):
+    """``update_crc_32`` over each ``buffer[starts[i]:ends[i]]``, from 0xFFFFFFFF and without a final XOR."""
+    for index in range(starts.shape[0]):
+        crc = np.int64(0xFFFFFFFF)
+        for position in range(starts[index], ends[index]):
+            crc = (crc >> 8) ^ table[(crc ^ buffer[position]) & 0xFF]
+        out[index] = crc
+
+
+if NUMBA_AVAILABLE:
+    _crc_ranges_compiled = numba.njit(nogil=True, cache=True)(_crc_ranges_python)
+
+
+def _crc_ranges_numpy(buffer, starts, ends, table, out):
+    """The same CRCs as :func:`_crc_ranges_python`, the ranges stepped through in lockstep."""
+    crc = np.full(starts.shape[0], 0xFFFFFFFF, dtype=np.int64)
+    lengths = ends - starts
+    for step in range(int(lengths.max(initial=0))):
+        active = np.flatnonzero(lengths > step)
+        byte = buffer[starts[active] + step].astype(np.int64)
+        crc[active] = (crc[active] >> 8) ^ table[(crc[active] ^ byte) & 0xFF]
+    out[:] = crc
+
+
+def koopman_crc32(
+    buffer: np.ndarray, starts: np.ndarray, ends: np.ndarray, use_numba: bool | None = None
+) -> np.ndarray:
+    """
+    The CRC meflib computes over each byte range ``buffer[starts[i]:ends[i]]``, as uint32.
+
+    meflib's ``update_crc_32``: table-driven, starting from 0xFFFFFFFF, with no final XOR. The ranges must lie
+    within ``buffer``.
+    """
+    if use_numba is None:
+        use_numba = NUMBA_AVAILABLE
+    starts = np.ascontiguousarray(starts, dtype=np.int64)
+    ends = np.ascontiguousarray(ends, dtype=np.int64)
+    if starts.size and (starts.min() < 0 or ends.max() > buffer.size or (ends < starts).any()):
+        raise ValueError("A CRC range lies outside the buffer.")
+    out = np.empty(starts.size, dtype=np.int64)
+    kernel = _crc_ranges_compiled if use_numba else _crc_ranges_numpy
+    kernel(np.ascontiguousarray(buffer, dtype=np.uint8), starts, ends, _KOOPMAN_TABLE, out)
+    return out.astype(np.uint32)

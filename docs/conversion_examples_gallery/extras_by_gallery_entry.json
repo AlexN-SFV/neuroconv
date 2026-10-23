@@ -166,6 +166,10 @@
     "extra": "mearec",
     "skip": "Setup tools problems and I want to discuss this with Ben"
   },
+  "recording/mef2.rst": {
+    "extra": "mef",
+    "skip": "No MEF 2 recording is on GIN ephy_testing_data yet, so the page has nothing to run on"
+  },
   "recording/mef3.rst": {
     "extra": "mef",
     "skip": "No MEF 3 session is on GIN ephy_testing_data yet, so the page has nothing to run on"
