@@ -502,6 +502,16 @@ class TestChannels:
         with pytest.raises(ValueError, match=r"not in the recording: \['LTG3'\]"):
             read_mef2_recording(folder, channels_to_skip=["LTG3"])
 
+    def test_a_file_that_cannot_be_read_can_be_skipped(self, tmp_path):
+        folder = tmp_path / "recording"
+        channel_copy(AD3, folder / "AD3.mef")
+        channel_copy(AD3, folder / "secret.mef", session_encryption_used=1, channel_name="garbled")
+        with pytest.raises(ValueError, match="is encrypted"):
+            read_mef2_recording(folder)
+        # Named by its file name, its session fields being encrypted.
+        assert MEF2RecordingInterface.get_available_channel_ids(folder) == ["AD3", "secret"]
+        assert read_mef2_recording(folder, channels_to_skip=["secret"]).channel_ids == ["AD3"]
+
     def test_empty_channel_name_falls_back_to_the_file_name(self, tmp_path):
         channel_copy(AD3, tmp_path / "recording" / "RAH4.mef", channel_name="")
         assert read_mef2_recording(tmp_path / "recording").channel_ids == ["RAH4"]

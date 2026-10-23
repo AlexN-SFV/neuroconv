@@ -418,40 +418,58 @@ def _stream_name(sampling_frequency: float) -> str:
     return f"{sampling_frequency:g} Hz"
 
 
-def _read_headers(path: Path, validate_crc: bool = False) -> list[dict]:
-    """The headers of a directory's .mef files, in channel order (see :func:`_channel_order`)."""
+def _identify(path: Path) -> dict:
+    """
+    The name, rate and physical channel number a ``.mef`` file states, read without refusing anything.
+
+    Enough to order and name the channels and to match ``channels_to_skip``, so a file that cannot be
+    converted can still be left out. A file without a readable MEF 2 header, or whose session fields are
+    encrypted, is named by its file name.
+    """
+    with open(path, "rb") as file:
+        raw = file.read(HEADER_BYTES)
+    if len(raw) < HEADER_BYTES or raw[164] != 2 or raw[161]:
+        return dict(path=path, channel_name=path.stem, sampling_frequency=float("nan"), physical_channel_number=-1)
+    return dict(
+        path=path,
+        channel_name=_text(raw[376:408]) or path.stem,
+        sampling_frequency=_number(raw, 424, "<f8"),
+        physical_channel_number=_number(raw, 752, "<i4"),
+    )
+
+
+def _identify_files(path: Path) -> list[dict]:
+    """:func:`_identify` for each of a directory's .mef files, in channel order (see :func:`_channel_order`)."""
     if not path.is_dir():
         raise ValueError(f"'{path}' is not a directory. A MEF 2 recording is a directory of .mef files.")
     files = _mef_files(path)
     if not files:
         raise ValueError(f"'{path}' holds no .mef files, so it is not a MEF 2 recording.")
-    headers = [read_mef2_header(file, validate_crc=validate_crc) for file in files]
-    for header in headers:
-        rate = header["sampling_frequency"]
-        if not (np.isfinite(rate) and rate > 0):
-            raise ValueError(f"The MEF 2 file '{header['path']}' gives a sampling frequency of {rate}.")
+    identities = [_identify(file) for file in files]
     order = _channel_order(
-        [header["channel_name"] for header in headers], [header["physical_channel_number"] for header in headers]
+        [identity["channel_name"] for identity in identities],
+        [identity["physical_channel_number"] for identity in identities],
     )
-    return [headers[index] for index in order]
+    return [identities[index] for index in order]
 
 
-def _channel_ids(headers: list[dict]) -> list[str]:
+def _channel_ids(identities: list[dict]) -> list[str]:
     """Unique ids per stream, so a label recurring at another rate keeps its name, as EDF's streams do."""
     return unique_channel_ids(
-        [header["channel_name"] for header in headers], groups=[header["sampling_frequency"] for header in headers]
+        [identity["channel_name"] for identity in identities],
+        groups=[identity["sampling_frequency"] for identity in identities],
     )
 
 
 def stream_names(folder_path) -> list[str]:
     """The streams of a MEF 2 recording: one per sampling rate, named like ``"1024 Hz"``, slowest first."""
-    headers = _read_headers(Path(folder_path))
-    return [_stream_name(rate) for rate in sorted({header["sampling_frequency"] for header in headers})]
+    rates = {identity["sampling_frequency"] for identity in _identify_files(Path(folder_path))}
+    return [_stream_name(rate) for rate in sorted(rate for rate in rates if np.isfinite(rate) and rate > 0)]
 
 
 def available_channel_names(folder_path) -> list[str]:
     """The channel ids of every ``.mef`` file in a directory, in the order :func:`read_mef2_recording` gives them."""
-    return _channel_ids(_read_headers(Path(folder_path)))
+    return _channel_ids(_identify_files(Path(folder_path)))
 
 
 def _shown_blocks(channel: MEF2Channel, indices: np.ndarray, sampling_frequency: float) -> str:
@@ -541,7 +559,8 @@ def read_mef2_recording(
     folder_path : str or Path
         The directory holding the recording's ``.mef`` files, one per channel.
     channels_to_skip : list of str, optional
-        Channels to leave out, by id or by the name the file gives them. Their indices are not read.
+        Channels to leave out, by id or by the name the file gives them. Only enough of their headers is read
+        to name them, so a file that cannot be converted, such as an encrypted one, can be left out.
     stream_name : str, optional
         The sampling rate to read, as :func:`stream_names` names it. Required when the files are sampled at
         more than one rate.
@@ -555,9 +574,9 @@ def read_mef2_recording(
         Channels are in physical channel order when every channel gives a distinct one, else by name.
     """
     path = Path(folder_path)
-    headers = _read_headers(path, validate_crc=validate_crc)
-    labels = [header["channel_name"] for header in headers]
-    ids = _channel_ids(headers)
+    identities = _identify_files(path)
+    labels = [identity["channel_name"] for identity in identities]
+    ids = _channel_ids(identities)
     unknown = unknown_channels_to_skip(labels, ids, channels_to_skip)
     if unknown:
         raise ValueError(f"channels_to_skip names channels that are not in the recording: {unknown}. Available: {ids}.")
@@ -565,9 +584,13 @@ def read_mef2_recording(
     if not keep:
         raise ValueError("channels_to_skip leaves no channels in the recording.")
 
+    headers = {index: read_mef2_header(identities[index]["path"], validate_crc=validate_crc) for index in keep}
     streams = {}
     for index in keep:
-        streams.setdefault(_stream_name(headers[index]["sampling_frequency"]), []).append(index)
+        rate = headers[index]["sampling_frequency"]
+        if not (np.isfinite(rate) and rate > 0):
+            raise ValueError(f"The MEF 2 file '{headers[index]['path']}' gives a sampling frequency of {rate}.")
+        streams.setdefault(_stream_name(rate), []).append(index)
     if stream_name is None:
         if len(streams) > 1:
             described = "; ".join(
@@ -612,8 +635,9 @@ def read_mef2_recording(
             )
         )
     runs = _check_shared_layout(channels, sampling_frequency, path)
-    # IEEG.org gives annotation times as offsets from the start of the whole recording, every file included.
-    recording_start_time = min(header["recording_start_time"] for header in headers)
+    # IEEG.org gives annotation times as offsets from the start of the whole recording, every converted file
+    # included.
+    recording_start_time = min(header["recording_start_time"] for header in headers.values())
     return MEF2Recording(
         path=path,
         channels=channels,
