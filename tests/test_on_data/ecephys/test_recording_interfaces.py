@@ -206,8 +206,29 @@ class TestBlackrockRecordingInterface(RecordingExtractorInterfaceTestMixin):
             dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "blackrock_2_1" / "l101210-001.ns5")),
             dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "FileSpec2.3001.ns5")),
             dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "blackrock_2_1" / "l101210-001.ns2")),
+            dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "blackrock_3_0" / "file_spec_3_0.ns6")),
+            dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "blackrock_3_0_ptp" / "20231027-125608-001.ns2")),
+            dict(
+                file_path=str(
+                    ECEPHY_DATA_PATH
+                    / "blackrock"
+                    / "blackrock_ptp_with_missing_samples"
+                    / "Hub1-NWBtestfile_neural_wspikes.ns6"
+                )
+            ),
+            dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "segment" / "PauseCorrect" / "pause_correct.ns2")),
+            dict(file_path=str(ECEPHY_DATA_PATH / "blackrock" / "segment" / "ResetCorrect" / "reset.ns2")),
         ],
-        ids=["multi_stream_case_ns5", "blackrock_ns5_v2", "multi_stream_case_ns2"],
+        ids=[
+            "multi_stream_case_ns5",
+            "blackrock_ns5_v2",
+            "multi_stream_case_ns2",
+            "file_spec_3_0",
+            "file_spec_3_0_ptp",
+            "ptp_out_of_order_packets",
+            "pause",
+            "clock_reset",
+        ],
     )
     def setup_interface(self, request):
         test_id = request.node.callspec.id
