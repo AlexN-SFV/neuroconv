@@ -81,6 +81,10 @@ MEArec Recording
 ----------------
 .. automodule:: neuroconv.datainterfaces.ecephys.mearec.mearecdatainterface
 
+MEF 2 Recording
+---------------
+.. automodule:: neuroconv.datainterfaces.ecephys.mef.mef2datainterface
+
 MEF 3 Recording
 ---------------
 .. automodule:: neuroconv.datainterfaces.ecephys.mef.mef3datainterface

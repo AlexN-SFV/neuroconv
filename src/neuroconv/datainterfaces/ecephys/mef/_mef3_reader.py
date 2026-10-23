@@ -402,7 +402,9 @@ def _read_channel(channel_directory: Path) -> tuple[MEF3Channel, int, int | None
     return channel, channel_metadata["recording_time_offset"], channel_metadata["gmt_offset"]
 
 
-def group_blocks_into_runs(blocks: np.ndarray, sampling_frequency: float) -> tuple[list[MEF3Run], np.ndarray]:
+def group_blocks_into_runs(
+    blocks: np.ndarray, sampling_frequency: float, *, backward_jumps_break: bool = True
+) -> tuple[list[MEF3Run], np.ndarray]:
     """
     Group consecutive blocks into uninterrupted runs, and say where unflagged gaps were found.
 
@@ -420,11 +422,16 @@ def group_blocks_into_runs(blocks: np.ndarray, sampling_frequency: float) -> tup
     * An unflagged block whose start time is more than a second from where the previous block ended starts a
       new run, since no clock drifts that far in one block; the writer left a gap unflagged.
 
+    The MEF 2 reader shares this rule with ``backward_jumps_break=False``: there an unflagged block that starts
+    more than a second *before* the previous one ended continues the run. MEF 2 writers re-synchronise block
+    times to the wall clock in steps, which can go back by a second while the samples run on without a break.
+
     Returns
     -------
     runs : list of MEF3Run
-    unflagged_gaps : numpy.ndarray of int
-        Indices of the blocks that start a run without a discontinuity flag.
+    unflagged_jumps : numpy.ndarray of int
+        Indices of the unflagged blocks that start more than a second from where the previous block ended.
+        Each starts a run, except a backward one when ``backward_jumps_break`` is False.
     """
     if len(blocks) == 0:
         return [], np.array([], dtype=np.int64)
@@ -434,8 +441,9 @@ def group_blocks_into_runs(blocks: np.ndarray, sampling_frequency: float) -> tup
     expected = counts[:-1] * (1e6 / sampling_frequency)
     contiguous = np.rint(elapsed * (sampling_frequency / 1e6)).astype(np.int64) == counts[:-1]
     flagged = blocks["discontinuity"][1:]
-    unflagged_gap = ~flagged & (np.abs(elapsed - expected) > _UNFLAGGED_GAP_MICROSECONDS)
-    breaks = np.flatnonzero((flagged & ~contiguous) | unflagged_gap) + 1
+    unflagged_jump = ~flagged & (np.abs(elapsed - expected) > _UNFLAGGED_GAP_MICROSECONDS)
+    unflagged_break = unflagged_jump if backward_jumps_break else unflagged_jump & (elapsed > expected)
+    breaks = np.flatnonzero((flagged & ~contiguous) | unflagged_break) + 1
     edges = np.concatenate([[0], breaks, [len(blocks)]])
     runs = [
         MEF3Run(
@@ -446,7 +454,7 @@ def group_blocks_into_runs(blocks: np.ndarray, sampling_frequency: float) -> tup
         )
         for first, last in zip(edges[:-1], edges[1:])
     ]
-    return runs, np.flatnonzero(unflagged_gap) + 1
+    return runs, np.flatnonzero(unflagged_jump) + 1
 
 
 def _check_shared_layout(channels: list[MEF3Channel], sampling_frequency: float, session_path: Path) -> list[MEF3Run]:
