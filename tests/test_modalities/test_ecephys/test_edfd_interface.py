@@ -16,6 +16,7 @@ from pynwb import NWBHDF5IO
 from neuroconv.datainterfaces import EDFRecordingInterface
 from neuroconv.datainterfaces.ecephys.edf._edfd_extractor import EDFDRecordingExtractor
 from neuroconv.datainterfaces.ecephys.edf._edfd_reader import (
+    _has_interior_nul,
     _parse_tals,
     _split_into_tals,
     edf_plus_header_fields,
@@ -92,6 +93,8 @@ def write_edf(
 
     ``annotation_blocks`` maps a record index to the exact bytes of that record's first annotations
     block, replacing the TALs written for it, for writers whose layout the options above cannot express.
+    A key ``(record_index, position)`` addresses the record's annotations signal at that position
+    instead, 0 being the first and 1 the first additional one.
     """
     channel_names = list(channel_names)
     number_of_channels = len(channel_names)
@@ -107,6 +110,7 @@ def write_edf(
         physical_max = [physical_max] * number_of_channels
     physical_min, physical_max = list(physical_min), list(physical_max)
     annotations = annotations or []
+    annotation_blocks = annotation_blocks or {}
 
     labels = list(channel_names)
     samples = list(samples_per_record)
@@ -174,7 +178,7 @@ def write_edf(
             if duration is not None:
                 stamp += b"\x15" + f"{duration:g}".encode("ascii")
             block += stamp + b"\x14" + text.encode("utf-8") + b"\x14" + terminator
-        block = (annotation_blocks or {}).get(record_index, block)
+        block = annotation_blocks.get(record_index, annotation_blocks.get((record_index, 0), block))
         assert len(block) <= annotation_samples * 2, "annotation block overflow in fixture"
         body += block.ljust(annotation_samples * 2, b"\x00")
         # Additional annotations signals carry no time-keeping TAL of their own, but the spec lets them
@@ -183,7 +187,8 @@ def write_edf(
             extra = b""
             for onset, duration, text in extra_annotations or []:
                 if record_index == _record_index_of(onset, record_onsets, record_duration):
-                    extra += f"+{onset:.6f}".encode("ascii") + b"\x14" + text.encode("utf-8") + b"\x14\x00"
+                    extra += f"+{onset:.6f}".encode("ascii") + b"\x14" + text.encode("utf-8") + b"\x14" + terminator
+            extra = annotation_blocks.get((record_index, extra_index + 1), extra)
             assert len(extra) <= annotation_samples * 2, "extra annotation block overflow in fixture"
             body += extra.ljust(annotation_samples * 2, b"\x00")
 
@@ -786,9 +791,9 @@ class TestEDFDReader:
         text already, and another follows — so it opens a TAL and stops being an annotation. It takes
         three texts with a signed one in the middle; the same number last is safe.
 
-        This is why the heuristics are gated on the record rather than relied on to be right in
-        isolation: a record only reaches them when the spec cannot read its time-keeping annotation,
-        so a conformant record carrying this shape never does.
+        This is why the heuristics are gated rather than relied on to be right in isolation: a file
+        whose writer terminates any TAL only has them run on the chunk holding an unreadable
+        time-keeping TAL, so a conformant TAL carrying this shape never meets them.
         """
         assert _parse_tals(b"+5.0\x14label\x14-3\x14more text\x14", split_unterminated=True) == [
             (5.0, None, ["label"]),
@@ -924,24 +929,148 @@ class TestEDFDReader:
             EDFDRecordingExtractor(file_path=path)
 
     @pytest.mark.parametrize("signed_text", ["-3", "+2.5"])
-    def test_a_trailing_signed_number_survives_a_split_record(self, tmp_path, digital_data, signed_text):
-        """A record re-read by the heuristics keeps a trailing signed-number text as a text."""
+    @pytest.mark.parametrize("writer_terminates_tals", [True, False], ids=["terminating", "unterminated"])
+    def test_a_trailing_signed_number_survives_a_split_record(
+        self, tmp_path, digital_data, signed_text, writer_terminates_tals
+    ):
+        """
+        A record re-read by the heuristics keeps a trailing signed-number text as a text, whether the
+        split is the per-record one or the whole-file one.
+        """
         stamp = signed_text.encode("ascii")
         blocks = {2: b"+2.000000\x14\x14+2.000000\x14label\x14" + stamp + b"\x14"}
+        # An ordinary annotation in record 1 is what makes the writer terminate a TAL.
+        elsewhere = [(1.5, None, "elsewhere")] if writer_terminates_tals else []
         path = write_edf(
             tmp_path / "trailing.edf",
             record_onsets=GAPPED_ONSETS,
             data=digital_data,
+            annotations=elsewhere,
             annotation_blocks=blocks,
         )
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             recording = EDFDRecordingExtractor(file_path=path)
         assert recording.runs == EXPECTED_RUNS
-        assert recording.annotations_from_file == [
+        assert recording.annotations_from_file == [dict(onset=1.5, duration=None, text="elsewhere")] * bool(
+            elsewhere
+        ) + [
             dict(onset=2.0, duration=None, text="label"),
             dict(onset=2.0, duration=None, text=signed_text),
         ]
+
+    def test_a_writer_that_never_terminates_is_split_throughout(self, tmp_path, digital_data):
+        """
+        A writer that terminates no TAL anywhere can fuse TALs in any block, so its whole file is split,
+        as it was before the per-record split existed.
+
+        Record 2's time-keeping TAL stands alone and reads by the spec, but its second annotations
+        signal holds two fused TALs. Splitting only the records whose onset is unreadable would read
+        them as one TAL, with the second onset as a text.
+        """
+        path = write_edf(
+            tmp_path / "unterminated.edf",
+            record_onsets=GAPPED_ONSETS,
+            data=digital_data,
+            annotations=[(0.5, None, "fused in record 0")],
+            extra_annotations_signals=1,
+            terminate_tals=False,
+            annotation_blocks={(2, 1): b"+2.500000\x14a\x14+2.700000\x14b\x14"},
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            recording = EDFDRecordingExtractor(file_path=path)
+        assert recording.runs == EXPECTED_RUNS
+        assert recording.annotations_from_file == [
+            dict(onset=0.5, duration=None, text="fused in record 0"),
+            dict(onset=2.5, duration=None, text="a"),
+            dict(onset=2.7, duration=None, text="b"),
+        ]
+
+    @pytest.mark.parametrize(
+        "record_index, block, expected",
+        [
+            # A comma decimal separator, then a three-text TAL with a signed number in the middle.
+            (5, b"+5,000000\x14\x14\x00+5.5\x14L\x14-3\x14M\x14\x00", [(5.5, "L"), (5.5, "-3"), (5.5, "M")]),
+            # A real annotation ahead of the time-keeping TAL, then the same three-text TAL.
+            (
+                2,
+                b"+2.5\x14Marker\x14\x00+2.000000\x14\x14\x00+3.0\x14L\x14-3\x14M\x14\x00",
+                [(2.5, "Marker"), (3.0, "L"), (3.0, "-3"), (3.0, "M")],
+            ),
+        ],
+        ids=["comma-onset", "annotation-first"],
+    )
+    def test_a_record_the_split_cannot_rescue_keeps_the_spec_reading(
+        self, tmp_path, digital_data, record_index, block, expected
+    ):
+        """
+        A record whose onset is unreadable for some reason other than fusion is read by the spec.
+
+        The split is kept only when it recovers the onset, and only touches the chunk holding the
+        time-keeping TAL. Otherwise the conformant three-text TAL here would lose its '-3', promoted to
+        the onset of 'M'. The record is still placed from its neighbours.
+        """
+        path = write_edf(
+            tmp_path / "unrescued.edf",
+            record_onsets=CONTIGUOUS_ONSETS,
+            data=digital_data,
+            annotation_blocks={record_index: block},
+        )
+        with pytest.warns(UserWarning, match="follow from their neighbours"):
+            recording = EDFDRecordingExtractor(file_path=path)
+        assert recording.runs == [(0, 12, 0.0)]
+        assert recording.annotations_from_file == [
+            dict(onset=onset, duration=None, text=text) for onset, text in expected
+        ]
+
+    def test_a_split_record_reads_everything_past_its_fused_chunk_by_the_spec(self, tmp_path, digital_data):
+        """
+        Splitting a fused time-keeping chunk leaves the rest of the record to the spec: the later,
+        terminated TALs of the time-keeping block, and every additional annotations signal.
+
+        Both of those hold a conformant three-text TAL with a signed number in the middle, which the
+        heuristics would misread.
+        """
+        path = write_edf(
+            tmp_path / "mixed_two_signals.edf",
+            record_onsets=GAPPED_ONSETS,
+            data=digital_data,
+            annotation_samples=64,
+            extra_annotations_signals=1,
+            annotation_blocks={
+                0: b"+0.000000\x14\x14+0.000000\x14Montage\x14\x00+0.25\x14P\x14+2.0\x14Q\x14\x00",
+                (0, 1): b"+0.5\x14L\x14-3\x14M\x14\x00",
+            },
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            recording = EDFDRecordingExtractor(file_path=path)
+        assert recording.runs == EXPECTED_RUNS
+        assert recording.annotations_from_file == [
+            dict(onset=0.0, duration=None, text="Montage"),
+            dict(onset=0.25, duration=None, text="P"),
+            dict(onset=0.25, duration=None, text="+2.0"),
+            dict(onset=0.25, duration=None, text="Q"),
+            dict(onset=0.5, duration=None, text="L"),
+            dict(onset=0.5, duration=None, text="-3"),
+            dict(onset=0.5, duration=None, text="M"),
+        ]
+
+    @pytest.mark.parametrize(
+        "block, terminates",
+        [
+            (b"+0.217000\x14\x14\x00\x00\x00", False),  # conformant, but only padding follows
+            (b"+0.000000\x14\x14+1.0\x14a\x14\x00\x00", False),  # packed, no terminator at all
+            (b"+0.000000\x14\x14\x00+1.0\x14a\x14\x00", True),  # a NUL with content after it
+        ],
+    )
+    def test_interior_nul_identifies_a_writer_that_terminates_tals(self, block, terminates):
+        """
+        A NUL followed by further content can only be a TAL terminator, since a block's own padding
+        runs to its end. That is what tells the reader which kind of writer produced the file.
+        """
+        assert _has_interior_nul(block) is terminates
 
     def test_onset_between_readable_neighbours_is_recovered_with_a_warning(self, tmp_path, digital_data):
         """
