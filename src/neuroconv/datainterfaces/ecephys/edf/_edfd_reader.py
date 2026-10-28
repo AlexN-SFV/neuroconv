@@ -374,10 +374,11 @@ def _split_into_tals(chunk: bytes) -> list[list[bytes]]:
     Split one NUL-delimited chunk into TALs, each returned as ``[timestamp, *annotation_fields]``.
 
     A conformant writer ends every TAL with a NUL byte, so a chunk holds exactly one TAL and this
-    returns it unchanged. Some writers only NUL-pad the tail of the block and never terminate a TAL,
-    packing a record's time-keeping annotation and its real annotations into one NUL-free run of
-    bytes; Nihon Kohden's ``EDF+D`` export does this. Splitting those apart here is what keeps the
-    time-keeping onset — and therefore the whole file — readable.
+    returns it unchanged. Some writers leave TALs unterminated, packing a record's time-keeping
+    annotation and the TAL after it into one NUL-free run of bytes. Nihon Kohden's ``EDF+D`` export
+    does this, in some files for every TAL and in others only for some, terminating the next TAL in
+    the same record. Splitting those apart here is what keeps the time-keeping onset — and therefore
+    the whole file — readable.
 
     A boundary is only recognized where a field cannot be an annotation text of the TAL in progress:
 
@@ -391,8 +392,8 @@ def _split_into_tals(chunk: bytes) -> list[list[bytes]]:
     a field promoted to an onset in error stops being an annotation, so the rules stay deliberately
     narrow and anything they do not clearly resolve is left as text.
 
-    These rules are still only rules of thumb, which is why the caller runs them on a file only after
-    establishing that its writer terminates no TALs at all. See :func:`_has_interior_nul`.
+    These rules are still only rules of thumb, which is why the caller runs them only on a record whose
+    time-keeping annotation the spec could not read. See :func:`read_record_onsets_and_annotations`.
     """
     fields = chunk.split(_TAL_TEXT_SEPARATOR)
     # Whether a non-empty field exists at or after each position, in one right-to-left pass rather
@@ -414,17 +415,6 @@ def _split_into_tals(chunk: bytes) -> list[list[bytes]]:
     return tals
 
 
-def _has_interior_nul(raw: bytes) -> bool:
-    """
-    True if a NUL in this annotations block is followed by further content.
-
-    Such a NUL can only be a TAL terminator, since the block's own padding runs to its end. One
-    anywhere in a file therefore proves the writer terminates its TALs, which is what lets
-    :func:`read_record_onsets_and_annotations` leave the unterminated-TAL heuristics switched off.
-    """
-    return _TAL_TERMINATOR in raw.rstrip(_TAL_TERMINATOR)
-
-
 def _parse_tals(raw: bytes, *, split_unterminated: bool = False) -> list[tuple[float, float | None, list[str]]]:
     """
     Parse the TALs in one record's ``EDF Annotations`` block.
@@ -435,7 +425,7 @@ def _parse_tals(raw: bytes, *, split_unterminated: bool = False) -> list[tuple[f
 
     ``split_unterminated`` additionally splits each NUL-delimited chunk on the heuristics in
     :func:`_split_into_tals`, for writers that omit the terminating ``[0]``. It defaults to off so
-    that a file which parses conformantly is never subjected to them.
+    that a record which parses conformantly is never subjected to them.
     """
     tals = []
     for chunk in raw.split(_TAL_TERMINATOR):
@@ -526,9 +516,12 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
         ``(onsets, annotations)``. ``onsets`` has one float per data record; ``annotations`` is a list
         of ``dict(onset=..., duration=..., text=...)``.
 
-    Where a record's time-keeping onset cannot be read, the records either side of it are given the
-    chance to prove that no gap hides there, in which case its onset follows from theirs and only a
-    warning is issued. See :func:`_place_records_between_known_onsets`.
+    Every record is read by the spec first. A record whose time-keeping onset that leaves unreadable is
+    read again with the unterminated-TAL heuristics of :func:`_split_into_tals`, and that reading of
+    the record — onset and annotations alike — replaces the spec's. Where the onset still cannot be
+    read, the records either side of it are given the chance to prove that no gap hides there, in
+    which case its onset follows from theirs and only a warning is issued. See
+    :func:`_place_records_between_known_onsets`.
 
     Raises
     ------
@@ -554,45 +547,61 @@ def read_record_onsets_and_annotations(file, header: EDFHeader) -> tuple[np.ndar
         for index in annotations_indices
     }
 
-    def read_pass(*, split_unterminated: bool):
-        """Read every annotations block once. Returns onsets, annotations, gaps, and what was seen."""
-        onsets = np.empty(header.number_of_records, dtype="float64")
-        annotations = []
-        records_missing_onset = []
-        writer_terminates_tals = False
-        for record_index in range(header.number_of_records):
-            record_start = header.header_size_bytes + record_index * header.record_size_bytes
-            for signal_index in annotations_indices:
-                byte_offset, block_size = layouts[signal_index]
-                file.seek(record_start + byte_offset)
-                raw = file.read(block_size)
-                writer_terminates_tals = writer_terminates_tals or _has_interior_nul(raw)
-                tals = _parse_tals(raw, split_unterminated=split_unterminated)
+    def parse_record(blocks: dict, *, split_unterminated: bool):
+        """Parse one record's annotations blocks. Returns its time-keeping onset, or None, and annotations."""
+        record_onset = None
+        record_annotations = []
+        for signal_index in annotations_indices:
+            tals = _parse_tals(blocks[signal_index], split_unterminated=split_unterminated)
+            if signal_index == time_keeping_index and tals and not tals[0][2]:
+                # Only an *empty-text* leading TAL is the time-keeping annotation. Trusting tals[0]
+                # unconditionally would silently adopt a real annotation's onset as the record start.
+                record_onset = tals[0][0]
+                tals = tals[1:]
+            for onset, duration, texts in tals:
+                for text in texts:
+                    record_annotations.append(dict(onset=onset, duration=duration, text=text))
+        return record_onset, record_annotations
 
-                if signal_index == time_keeping_index:
-                    # Only an *empty-text* leading TAL is the time-keeping annotation. Trusting tals[0]
-                    # unconditionally would silently adopt a real annotation's onset as the record start.
-                    if tals and not tals[0][2]:
-                        onsets[record_index] = tals[0][0]
-                        tals = tals[1:]
-                    else:
-                        onsets[record_index] = record_index * header.record_duration
-                        records_missing_onset.append(record_index)
+    onsets = np.empty(header.number_of_records, dtype="float64")
+    annotations = []
+    records_missing_onset = []
+    for record_index in range(header.number_of_records):
+        record_start = header.header_size_bytes + record_index * header.record_size_bytes
+        blocks = {}
+        for signal_index in annotations_indices:
+            byte_offset, block_size = layouts[signal_index]
+            file.seek(record_start + byte_offset)
+            blocks[signal_index] = file.read(block_size)
 
-                for onset, duration, texts in tals:
-                    for text in texts:
-                        annotations.append(dict(onset=onset, duration=duration, text=text))
-        return onsets, annotations, records_missing_onset, writer_terminates_tals
+        # Each record is read as the spec describes it first. Only a record whose start time that
+        # leaves unreadable is taken to come from a writer that omits TAL terminators, and read again
+        # with the heuristics in _split_into_tals switched on. The evidence is per record because
+        # writers mix the two styles within one file: Nihon Kohden's EDF+D export fuses a record's
+        # time-keeping TAL with the TAL after it, then NUL-terminates a later one in the same record.
+        # A record that parses conformantly never meets the heuristics, so no conformant file can
+        # change, and a record that does not was going to be refused or placed by its neighbours
+        # with its annotation misread either way.
+        #
+        # The split reading is taken whole, annotations included, even when it does not recover the
+        # onset either: the spec reading of such a record has already lost its leading TAL, and the
+        # split one is what reads annotations fused behind it as their own TALs.
+        #
+        # A record whose time-keeping TAL is readable is never split, even if a later TAL in it holds a
+        # signed-number text such as '+1.000000' that could be a fused onset. A TAL may carry several
+        # texts and a text may be any string, so that shape is conformant, and splitting it is exactly
+        # the case _split_into_tals gets wrong (a signed number between two texts). Nothing in such a
+        # record shows that its writer fused anything, so it is read by the spec.
+        record_onset, record_annotations = parse_record(blocks, split_unterminated=False)
+        if record_onset is None:
+            record_onset, record_annotations = parse_record(blocks, split_unterminated=True)
 
-    # Read the file as the spec describes it first. Only if that leaves a record's start time
-    # unreadable *and* nothing in the file terminates a TAL is the writer taken to be one that omits
-    # the terminators, and the file re-read with the heuristics in _split_into_tals switched on. A
-    # file that parses conformantly, or that terminates a TAL anywhere, never meets them — so they
-    # cannot cost it an annotation. The re-read costs a second pass over the annotations signal, and
-    # only for files that would otherwise be refused outright.
-    onsets, annotations, records_missing_onset, writer_terminates_tals = read_pass(split_unterminated=False)
-    if records_missing_onset and not writer_terminates_tals:
-        onsets, annotations, records_missing_onset, _ = read_pass(split_unterminated=True)
+        if record_onset is None:
+            onsets[record_index] = record_index * header.record_duration
+            records_missing_onset.append(record_index)
+        else:
+            onsets[record_index] = record_onset
+        annotations.extend(record_annotations)
 
     if records_missing_onset and header.is_discontinuous:
         unplaced = _place_records_between_known_onsets(
