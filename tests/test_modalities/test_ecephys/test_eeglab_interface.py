@@ -5,6 +5,7 @@ These tests build small synthetic EEGLAB datasets (both the self-contained ``.se
 """
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -558,18 +559,30 @@ class TestInlineDataShapes:
         from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
 
         full = np.arange(channels * points * trials, dtype="float64").reshape((channels, points, trials))
-        restored = _get_inline_data(full.squeeze(), channels, points, trials)
+        restored = _get_inline_data(Path("rec.set"), full.squeeze(), channels, points, trials)
         np.testing.assert_array_equal(restored, full)
 
     def test_a_transposed_continuous_recording_is_turned_back(self):
         from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
 
         full = np.arange(4 * 6, dtype="float64").reshape((4, 6))
-        np.testing.assert_array_equal(_get_inline_data(full.T, 4, 6, 1)[:, :, 0], full)
+        np.testing.assert_array_equal(_get_inline_data(Path("rec.set"), full.T, 4, 6, 1)[:, :, 0], full)
 
-    def test_an_unexplained_shape_is_refused_rather_than_reshaped(self):
-        """Concatenated epochs ``(n_channels, n_points * n_trials)`` were reshaped into the wrong samples."""
+    @pytest.mark.parametrize("channels", [4, 1])
+    def test_concatenated_epochs_are_restored_in_matlab_order(self, channels):
+        """EEGLAB accepts epochs stored 2-D as (nbchan, pnts*trials), column t*pnts + p being sample p of epoch t;
+        ``eeg_checkset`` makes them 3-D on load. One channel arrives squeezed to 1-D."""
         from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
 
-        with pytest.raises(ValueError, match=r"has shape \(4, 18\)"):
-            _get_inline_data(np.zeros((4, 18)), 4, 6, 3)
+        full = np.arange(channels * 6 * 3, dtype="float64").reshape((channels, 6, 3))
+        concatenated = np.concatenate([full[:, :, trial] for trial in range(3)], axis=1)
+        assert concatenated.shape == (channels, 18)
+        restored = _get_inline_data(Path("rec.set"), concatenated.squeeze(), channels, 6, 3)
+        np.testing.assert_array_equal(restored, full)
+
+    def test_an_unexplained_shape_is_refused_with_the_file_named(self):
+        """A shape no layout explains raises, naming the file, rather than being reshaped into the wrong samples."""
+        from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
+
+        with pytest.raises(ValueError, match=r"'rec\.set' has a data array of shape \(4, 19\)"):
+            _get_inline_data(Path("rec.set"), np.zeros((4, 19)), 4, 6, 3)
