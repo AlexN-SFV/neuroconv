@@ -5,6 +5,7 @@ These tests build small synthetic EEGLAB datasets (both the self-contained ``.se
 """
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -471,3 +472,117 @@ class TestRepeatedChannelLabels:
             electrodes = io.read().electrodes.to_dataframe()
         assert list(electrodes["channel_name"]) == ["Fz", "Cz", "Fz_2", "Oz"]
         assert list(electrodes["original_channel_name"]) == ["Fz", "Cz", "Fz", "Oz"]
+
+
+def _one_channel_struct(traces, *, label="F3", xmin=0.0):
+    """An EEG struct for one channel: ``traces`` is ``(n_points,)`` or ``(n_points, n_trials)`` in microvolts."""
+    traces = traces[np.newaxis] if traces.ndim == 1 else traces[np.newaxis, :, :]
+    number_of_trials = traces.shape[2] if traces.ndim == 3 else 1
+    eeg = dict(
+        setname="one-channel",
+        srate=SAMPLING_FREQUENCY,
+        nbchan=1,
+        pnts=traces.shape[1],
+        trials=number_of_trials,
+        xmin=xmin,
+        data=traces,
+        chanlocs=dict(labels=label),
+    )
+    if number_of_trials > 1:
+        # Epoched without urevent, as EEGLAB leaves it after some pipelines: epochs fall back to xmin.
+        eeg["event"] = dict(
+            type=["stim"] * number_of_trials,
+            latency=np.array([epoch * traces.shape[1] + 1.0 for epoch in range(number_of_trials)]),
+            epoch=np.arange(1, number_of_trials + 1),
+        )
+    return eeg
+
+
+class TestOneChannel:
+    """
+    pymatreader squeezes a one-channel dataset's channel axis away.
+
+    An epoched one is read back as ``(n_points, n_trials)``, which the inline-data reader took for a transposed
+    ``(n_points, n_channels)`` recording: every epoch was written with samples from other epochs. Found on
+    figshare 31359616 (human-STN-delta_data), 54 of whose 296 ``.set`` files are one channel and epoched.
+    """
+
+    @pytest.mark.parametrize("layout", ["EEG struct", "top-level variables"])
+    def test_epoched_traces_are_each_epochs_own(self, tmp_path, layout):
+        rng = np.random.default_rng(seed=3)
+        number_of_trials = 5
+        traces = (rng.standard_normal((NUMBER_OF_POINTS, number_of_trials)) * 20.0).astype("float32")
+        eeg = _one_channel_struct(traces, xmin=-1.0)
+        set_path = tmp_path / "one_channel_epoched.set"
+        # Newer EEGLAB saves the struct's members as the MAT-file's own variables, with no EEG variable.
+        savemat(str(set_path), {"EEG": eeg} if layout == "EEG struct" else eeg, do_compression=True)
+
+        interface = EEGLABRecordingInterface(file_path=set_path)
+        recording = interface.recording_extractor
+        assert recording.get_num_segments() == number_of_trials
+        assert list(recording.get_channel_ids()) == ["F3"]
+        for epoch in range(number_of_trials):
+            np.testing.assert_array_equal(recording.get_traces(segment_index=epoch)[:, 0], traces[:, epoch])
+
+        nwbfile_path = tmp_path / "one_channel_epoched.nwb"
+        interface.run_conversion(nwbfile_path=nwbfile_path, metadata=_session_metadata(interface), overwrite=True)
+        with NWBHDF5IO(path=str(nwbfile_path), mode="r") as io:
+            nwbfile = io.read()
+            assert len(nwbfile.acquisition) == number_of_trials
+            for epoch in range(number_of_trials):
+                electrical_series = nwbfile.acquisition[f"ElectricalSeriesEpoch{epoch}"]
+                assert electrical_series.data.shape == (NUMBER_OF_POINTS, 1)
+                written_microvolts = electrical_series.data[:, 0] * electrical_series.conversion * 1e6
+                np.testing.assert_allclose(written_microvolts, traces[:, epoch], atol=1e-2)
+            assert list(nwbfile.electrodes.to_dataframe()["channel_name"]) == ["F3"]
+
+    def test_continuous_trace_and_label(self, tmp_path):
+        """The continuous case read right before; its label fell back to "0" (the label's length is 2)."""
+        traces = (np.random.default_rng(seed=4).standard_normal(NUMBER_OF_POINTS) * 20.0).astype("float32")
+        set_path = tmp_path / "one_channel.set"
+        savemat(str(set_path), _one_channel_struct(traces), do_compression=True)
+
+        recording = EEGLABRecordingInterface(file_path=set_path).recording_extractor
+        assert recording.get_num_segments() == 1
+        assert list(recording.get_channel_ids()) == ["F3"]
+        np.testing.assert_array_equal(recording.get_traces()[:, 0], traces)
+
+
+class TestInlineDataShapes:
+    """``_get_inline_data`` restores the axes pymatreader squeezes away and refuses any other shape."""
+
+    @pytest.mark.parametrize(
+        "channels, points, trials",
+        [(4, 6, 1), (4, 6, 3), (1, 6, 3), (1, 6, 1), (4, 1, 3)],
+    )
+    def test_a_squeezed_array_gets_its_axes_back_in_order(self, channels, points, trials):
+        from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
+
+        full = np.arange(channels * points * trials, dtype="float64").reshape((channels, points, trials))
+        restored = _get_inline_data(Path("rec.set"), full.squeeze(), channels, points, trials)
+        np.testing.assert_array_equal(restored, full)
+
+    def test_a_transposed_continuous_recording_is_turned_back(self):
+        from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
+
+        full = np.arange(4 * 6, dtype="float64").reshape((4, 6))
+        np.testing.assert_array_equal(_get_inline_data(Path("rec.set"), full.T, 4, 6, 1)[:, :, 0], full)
+
+    @pytest.mark.parametrize("channels", [4, 1])
+    def test_concatenated_epochs_are_restored_in_matlab_order(self, channels):
+        """EEGLAB accepts epochs stored 2-D as (nbchan, pnts*trials), column t*pnts + p being sample p of epoch t;
+        ``eeg_checkset`` makes them 3-D on load. One channel arrives squeezed to 1-D."""
+        from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
+
+        full = np.arange(channels * 6 * 3, dtype="float64").reshape((channels, 6, 3))
+        concatenated = np.concatenate([full[:, :, trial] for trial in range(3)], axis=1)
+        assert concatenated.shape == (channels, 18)
+        restored = _get_inline_data(Path("rec.set"), concatenated.squeeze(), channels, 6, 3)
+        np.testing.assert_array_equal(restored, full)
+
+    def test_an_unexplained_shape_is_refused_with_the_file_named(self):
+        """A shape no layout explains raises, naming the file, rather than being reshaped into the wrong samples."""
+        from neuroconv.datainterfaces.ecephys.eeglab.eeglabdatainterface import _get_inline_data
+
+        with pytest.raises(ValueError, match=r"'rec\.set' has a data array of shape \(4, 19\)"):
+            _get_inline_data(Path("rec.set"), np.zeros((4, 19)), 4, 6, 3)
