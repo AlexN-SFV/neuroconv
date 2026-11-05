@@ -65,16 +65,29 @@ def _read_fdt_data(
 
 
 def _get_inline_data(data, number_of_channels: int, number_of_points: int, number_of_trials: int) -> np.ndarray:
-    """Normalize an inline ``EEG.data`` array to shape ``(n_channels, n_points, n_trials)``."""
+    """
+    Normalize an inline ``EEG.data`` array to shape ``(n_channels, n_points, n_trials)``.
+
+    pymatreader squeezes singleton dimensions, so a dataset with one channel or one trial arrives
+    without that axis: one-channel epoched data is ``(n_points, n_trials)``, one-channel continuous data
+    ``(n_points,)``. Putting the size-1 axes back is a reshape that moves no sample. Any other shape is
+    refused: reshaping it would reorder samples silently. The guard this replaces took one-channel
+    epoched ``(n_points, n_trials)`` for a transposed ``(n_points, n_channels)`` recording, transposed it
+    and reshaped the result, so every epoch was written with samples from other epochs.
+    """
     array = np.asarray(data, dtype="float64")
-    if array.ndim == 2:
-        # Guard against a transposed (n_points, n_channels) layout.
-        if array.shape[0] == number_of_points and array.shape[0] != number_of_channels:
-            array = array.T
-        array = array[:, :, np.newaxis]
-    if array.shape != (number_of_channels, number_of_points, number_of_trials):
-        array = array.reshape((number_of_channels, number_of_points, number_of_trials))
-    return array
+    expected = (number_of_channels, number_of_points, number_of_trials)
+    if array.shape == expected:
+        return array
+    if array.shape == tuple(size for size in expected if size != 1):
+        return array.reshape(expected)
+    if number_of_trials == 1 and array.shape == (number_of_points, number_of_channels):
+        # A continuous recording stored transposed, as (n_points, n_channels).
+        return array.T[:, :, np.newaxis]
+    raise ValueError(
+        f"The EEGLAB data array has shape {array.shape}, which is neither (nbchan, pnts, trials) = {expected} "
+        "nor that shape with its size-1 dimensions removed."
+    )
 
 
 def _extract_channel_info(eeg_struct: dict, number_of_channels: int):
@@ -83,6 +96,10 @@ def _extract_channel_info(eeg_struct: dict, number_of_channels: int):
     channel_locations = channel_locations if isinstance(channel_locations, dict) else dict()
 
     labels = channel_locations.get("labels")
+    if isinstance(labels, str):
+        # One channel: pymatreader turns the 1x1 chanlocs struct's label into a bare string, whose
+        # length is the number of characters, not of channels.
+        labels = [labels]
     if labels is not None and len(labels) == number_of_channels:
         channel_names = [str(label).strip() for label in labels]
     else:
