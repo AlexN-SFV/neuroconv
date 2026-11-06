@@ -19,6 +19,11 @@ for x86_64 alone.
 Only what is needed to place the samples on the timeline and scale them is read. In particular the subject
 name and ID fields of section 3 are never read, so they cannot reach the NWB file.
 
+A session whose metadata is encrypted is read with its password (see :mod:`._mef3_crypto`). Section 2 is
+decrypted whole. Of section 3 only its first two AES blocks are decrypted, which hold the recording time offset,
+the daylight saving times and the GMT offset, and the four bytes of ``subject_name_1`` that share the second
+block are dropped at once; the rest of section 3 stays encrypted. Encrypted RED data blocks are not supported.
+
 Times in MEF are microseconds since the Unix epoch (µUTC). A writer may store them offset by the session's
 recording time offset, marking such a time by making it negative; it is undone here as meflib undoes it on
 input (``remove_recording_time_offset``).
@@ -31,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ._mef3_crypto import AES_BLOCK_BYTES, MEF3Passwords, aes_ecb_decrypt
 from ._red import MEF3_RED_LAYOUT, decode_red_blocks
 from .._channel_ids import _stacklevel_outside_neuroconv
 
@@ -40,6 +46,15 @@ TIME_SERIES_INDEX_BYTES = 56
 RED_BLOCK_FIXED_HEADER_BYTES = 48  # the header fields before the symbol statistics
 RECORD_HEADER_BYTES = 24
 RECORD_INDEX_BYTES = 24
+
+# METADATA_SECTION_2_OFFSET and METADATA_SECTION_3_OFFSET; section 2 ends where section 3 starts.
+_SECTION_2_START = 2560
+_SECTION_3_START = 13312
+# The fields read from section 3 are in its first 28 bytes: METADATA_RECORDING_TIME_OFFSET_OFFSET (13312, si8),
+# DST start and end times (13320, 13328; not read) and METADATA_GMT_OFFSET_OFFSET (13336, si4). They span two
+# AES blocks; subject_name_1 starts at 13340.
+_SECTION_3_TIMES_BYTES = 28
+_SECTION_3_TIMES_BLOCKS = 2
 
 # UUTC_NO_ENTRY, which is also METADATA_RECORDING_TIME_OFFSET_NO_ENTRY.
 UUTC_NO_ENTRY = -(2**63)
@@ -259,27 +274,50 @@ def _only_file(directory: Path, suffix: str) -> Path:
     return matches[0]
 
 
-def _read_segment_metadata(path: Path) -> dict:
+def _read_segment_metadata(path: Path, passwords: MEF3Passwords | None = None) -> dict:
     raw = _read_exactly(path, METADATA_FILE_BYTES)
     _check_universal_header(raw, path, "tmet")
     # METADATA_SECTION_2_ENCRYPTION_OFFSET and _3_: a positive level is encrypted on disk; 0 is never
     # encrypted, and a negative level was decrypted before it was written.
-    section_2_encryption, section_3_encryption = np.frombuffer(raw, dtype="i1", count=2, offset=1024)
+    section_2_encryption, section_3_encryption = (
+        int(level) for level in np.frombuffer(raw, dtype="i1", count=2, offset=1024)
+    )
+    section_2 = raw[_SECTION_2_START:_SECTION_3_START]
+    section_3_times = raw[_SECTION_3_START : _SECTION_3_START + _SECTION_3_TIMES_BYTES]
     if section_2_encryption > 0 or section_3_encryption > 0:
-        raise ValueError(
-            f"The MEF 3 metadata file '{path}' is encrypted (section 2 at level {section_2_encryption}, section 3 at "
-            f"level {section_3_encryption}). Encrypted MEF 3 sessions are not supported; decrypt the session with "
-            "the MEF tools and its passwords first."
-        )
-    gmt_offset = _number(raw, 13336, "<i4")
+        if passwords is None:
+            raise ValueError(
+                f"The MEF 3 metadata file '{path}' is encrypted (section 2 at level {section_2_encryption}, section 3 "
+                f"at level {section_3_encryption}). Give the session's password to read it."
+            )
+        levels = {level for level in (section_2_encryption, section_3_encryption) if level > 0}
+        if not levels <= {1, 2}:
+            raise ValueError(f"The MEF 3 metadata file '{path}' gives an encryption level other than 1 or 2.")
+        keys = passwords.keys(raw[:UNIVERSAL_HEADER_BYTES], path, levels)
+        if section_2_encryption > 0:
+            section_2 = aes_ecb_decrypt(keys[section_2_encryption], section_2)
+        if section_3_encryption > 0:
+            # Only the blocks that hold the times, and of those only the times are kept.
+            encrypted_times = raw[_SECTION_3_START : _SECTION_3_START + _SECTION_3_TIMES_BLOCKS * AES_BLOCK_BYTES]
+            section_3_times = aes_ecb_decrypt(keys[section_3_encryption], encrypted_times)[:_SECTION_3_TIMES_BYTES]
+
+    def section_2_text(start: int, stop: int) -> str:
+        return _text(section_2[start - _SECTION_2_START : stop - _SECTION_2_START])
+
+    def section_2_number(offset: int, dtype: str):
+        return _number(section_2, offset - _SECTION_2_START, dtype)
+
+    # The daylight saving fields (13320, 13328) are not read. D158's writer fills them with 0x0000800000000000,
+    # a misplaced "no entry" that reads as 1974-06-17.
+    gmt_offset = _number(section_3_times, 13336 - _SECTION_3_START, "<i4")
     return dict(
         channel_name=_text(raw[52:308]),
-        reference_description=_text(raw[6664:8712]),
-        acquisition_channel_number=_number(raw, 8712, "<i8"),
-        sampling_frequency=_number(raw, 8720, "<f8"),
-        units_conversion_factor=_number(raw, 8760, "<f8"),
-        units_description=_text(raw[8768:8896]),
-        recording_time_offset=_number(raw, 13312, "<i8"),
+        reference_description=section_2_text(6664, 8712),
+        acquisition_channel_number=section_2_number(8712, "<i8"),
+        sampling_frequency=section_2_number(8720, "<f8"),
+        units_conversion_factor=section_2_number(8760, "<f8"),
+        units_description=section_2_text(8768, 8896),
+        recording_time_offset=_number(section_3_times, 0, "<i8"),
         gmt_offset=None if gmt_offset == GMT_OFFSET_NO_ENTRY or abs(gmt_offset) > 86400 else gmt_offset,
     )
 
@@ -321,8 +359,8 @@ def _read_block_index(index_path: Path, data_path: Path, recording_time_offset: 
     encrypted = np.flatnonzero((headers["flags"] | index["flags"]) & _RED_ENCRYPTION_MASK)
     if encrypted.size:
         raise ValueError(
-            f"{encrypted.size} blocks of '{data_path}' are encrypted. Encrypted MEF 3 sessions are not supported; "
-            "decrypt the session with the MEF tools and its passwords first."
+            f"{encrypted.size} blocks of '{data_path}' are encrypted. Encrypted MEF 3 data blocks are not supported, "
+            "with or without a password (encrypted metadata is); decrypt the session with the MEF tools first."
         )
 
     blocks = np.empty(
@@ -352,7 +390,9 @@ def _read_block_index(index_path: Path, data_path: Path, recording_time_offset: 
     return blocks
 
 
-def _read_channel(channel_directory: Path) -> tuple[MEF3Channel, int, int | None]:
+def _read_channel(
+    channel_directory: Path, passwords: MEF3Passwords | None = None
+) -> tuple[MEF3Channel, int, int | None]:
     """A channel, its recording time offset and its GMT offset."""
     segment_directories = _segment_directories(channel_directory)
     if not segment_directories:
@@ -361,7 +401,7 @@ def _read_channel(channel_directory: Path) -> tuple[MEF3Channel, int, int | None
     channel_metadata = None
     data_paths, all_blocks = [], []
     for segment, segment_directory in enumerate(segment_directories):
-        metadata = _read_segment_metadata(_only_file(segment_directory, ".tmet"))
+        metadata = _read_segment_metadata(_only_file(segment_directory, ".tmet"), passwords)
         if channel_metadata is None:
             channel_metadata = metadata
         elif metadata["sampling_frequency"] != channel_metadata["sampling_frequency"]:
@@ -596,7 +636,9 @@ def _read_records(directory: Path, channel: str, recording_time_offset: int) -> 
     return records, encrypted
 
 
-def read_mef3_session(folder_path, channels_to_skip: list | None = None) -> MEF3Session:
+def read_mef3_session(
+    folder_path, channels_to_skip: list | None = None, passwords: MEF3Passwords | None = None
+) -> MEF3Session:
     """
     Read the metadata and block indices of a MEF 3.0 session, without decoding any samples.
 
@@ -607,6 +649,8 @@ def read_mef3_session(folder_path, channels_to_skip: list | None = None) -> MEF3
     channels_to_skip : list of str, optional
         Names of channels to leave out. Their files are not read, so a channel sampled at another rate, or
         over other stretches of time, can be dropped before the checks that every kept channel agrees.
+    passwords : MEF3Passwords, optional
+        The session's password, needed when its metadata is encrypted, and ignored when it is not.
 
     Returns
     -------
@@ -631,7 +675,7 @@ def read_mef3_session(folder_path, channels_to_skip: list | None = None) -> MEF3
 
     channels, recording_time_offsets, gmt_offsets = [], [], []
     for directory in channel_directories:
-        channel, recording_time_offset, gmt_offset = _read_channel(directory)
+        channel, recording_time_offset, gmt_offset = _read_channel(directory, passwords)
         if channel.number_of_samples == 0:
             raise ValueError(
                 f"The MEF 3 channel '{channel.name}' of '{path.name}' holds no samples. Leave it out with "
@@ -707,11 +751,11 @@ def _channel_order(names: list[str], acquisition_channel_numbers: list[int]) -> 
     return sorted(range(len(names)), key=lambda index: names[index])
 
 
-def available_channel_names(folder_path) -> list[str]:
+def available_channel_names(folder_path, passwords: MEF3Passwords | None = None) -> list[str]:
     """
     The names of a session's time series channels, in the order :func:`read_mef3_session` gives them.
 
-    Only the first segment's metadata file of each channel is read.
+    Only the first segment's metadata file of each channel is read; ``passwords`` as for :func:`read_mef3_session`.
     """
     path = Path(folder_path)
     channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
@@ -722,6 +766,6 @@ def available_channel_names(folder_path) -> list[str]:
             raise ValueError(f"The MEF 3 channel directory '{directory}' holds no .segd segment directories.")
         names.append(directory.name[: -len(".timd")])
         numbers.append(
-            _read_segment_metadata(_only_file(segment_directories[0], ".tmet"))["acquisition_channel_number"]
+            _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)["acquisition_channel_number"]
         )
     return [names[index] for index in _channel_order(names, numbers)]

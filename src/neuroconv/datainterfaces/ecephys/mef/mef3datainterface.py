@@ -36,7 +36,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
     ``"records"``, and the runs, when there is more than one, to one named ``"runs"``. Several sessions
     written into one NWB file share those tables, with a ``source_file`` column.
 
-    Encrypted sessions are refused.
+    A session whose metadata is encrypted is read with its password: section 2 is decrypted, and of section 3
+    only the recording time offset and the GMT offset, never the subject's name, ID or recording location.
+    Encrypted data blocks are refused.
     """
 
     display_name = "MEF 3 Recording"
@@ -57,7 +59,12 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         return source_schema
 
     @staticmethod
-    def get_available_channel_ids(folder_path: DirectoryPath) -> list:
+    def get_available_channel_ids(
+        folder_path: DirectoryPath,
+        password: str | None = None,
+        level_1_password: str | None = None,
+        level_2_password: str | None = None,
+    ) -> list:
         """
         Get the names of all time series channels in a MEF 3 session, reading one metadata file per channel.
 
@@ -65,15 +72,20 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         ----------
         folder_path : DirectoryPath
             Path to the session's ``.mefd`` directory.
+        password, level_1_password, level_2_password : str, optional
+            As for the interface, when the session's metadata is encrypted.
 
         Returns
         -------
         list
             The channel names, in acquisition channel order.
         """
+        from ._mef3_crypto import MEF3Passwords
         from ._mef3_reader import available_channel_names
 
-        return available_channel_names(folder_path)
+        return available_channel_names(
+            folder_path, MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
+        )
 
     @classmethod
     def get_extractor_class(cls):
@@ -86,7 +98,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             folder_path=interface_kwargs["folder_path"],
             channels_to_skip=interface_kwargs.get("channels_to_skip"),
         )
-        return self.get_extractor_class()(**self.extractor_kwargs)
+        # The passwords go to the extractor but not into extractor_kwargs, which describe the extractor to others.
+        passwords = {key: interface_kwargs.get(key) for key in ("password", "level_1_password", "level_2_password")}
+        return self.get_extractor_class()(**self.extractor_kwargs, **passwords)
 
     def __init__(
         self,
@@ -95,6 +109,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         verbose: bool = False,
         metadata_key: str | None = None,
         channels_to_skip: list | None = None,
+        password: str | None = None,
+        level_1_password: str | None = None,
+        level_2_password: str | None = None,
     ):
         """
         Load and prepare data for MEF 3.
@@ -111,12 +128,22 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         channels_to_skip : list, default: None
             Names of channels to leave out, such as auxiliary channels that are not neural data, or channels
             sampled at a rate the others are not.
+        password : str, optional
+            The session's password, when its metadata is encrypted; its level (1 or 2) is found from the files.
+            A level 2 password opens both levels. Ignored for a session that is not encrypted. Take it from a
+            secret or an environment variable. No message or warning names it, and the extractor's kwargs leave
+            it out.
+        level_1_password, level_2_password : str, optional
+            The session's passwords by level, instead of ``password``; each is checked at its own level.
         """
         super().__init__(
             folder_path=folder_path,
             verbose=verbose,
             metadata_key=metadata_key,
             channels_to_skip=channels_to_skip,
+            password=password,
+            level_1_password=level_1_password,
+            level_2_password=level_2_password,
         )
         if metadata_key is None:
             self.metadata_key = "mef3_recording"

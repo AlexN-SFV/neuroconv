@@ -82,4 +82,21 @@ A writer can store RED blocks lossily, scaled by a factor or with a fitted line 
 decoded as meflib decodes them, with a warning saying how many there are and the largest scale factor, since
 the precision lost when the file was written cannot be recovered.
 
-Encrypted sessions are refused; decrypt them with the MEF tools first.
+A session whose metadata is encrypted is read with its password, passed as ``password``; its level (1 or 2)
+is found from the files' password validation fields, and a level 2 password opens both levels. The passwords
+can also be given by level, as ``level_1_password`` and ``level_2_password``. A password that does not
+validate raises an error naming the file and the level that failed. Take the password from a secret or an
+environment variable rather than writing it into code:
+
+.. code-block:: python
+
+    import os
+
+    interface = MEF3RecordingInterface(folder_path=folder_path, password=os.environ["MEF3_PASSWORD"])
+
+Section 2 of each metadata file (sampling rate, units conversion factor, descriptions) is decrypted. Of
+section 3 only the recording time offset and the GMT offset are decrypted and read; the subject's names, ID and
+recording location are never read. The password is left out of the extractor's kwargs, so an encrypted
+session's extractor cannot be rebuilt from ``to_dict()``. Encrypted records are left out with a warning, and
+encrypted data blocks are refused; decrypt those with the MEF tools first. Decryption needs the
+``cryptography`` package, which the ``mef`` extra installs.
