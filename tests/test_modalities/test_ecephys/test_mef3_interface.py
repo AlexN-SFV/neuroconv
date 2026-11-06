@@ -281,6 +281,13 @@ class TestReader:
         with pytest.raises(ValueError, match="2 different rates"):
             read_mef3_session(gapped_copy)
         assert len(read_mef3_session(gapped_copy, channels_to_skip=["EKG"]).channels) == 2
+        # Which channels to leave out, for each rate, without reading the indices.
+        rates = MEF3RecordingInterface.get_channel_sampling_frequencies(gapped_copy)
+        assert rates == {"Cz": 1000.0, "Fp1": 1000.0, "EKG": 500.0}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            only_ekg = read_mef3_session(gapped_copy, channels_to_skip=[name for name in rates if rates[name] != 500.0])
+        assert [channel.name for channel in only_ekg.channels] == ["EKG"] and only_ekg.sampling_frequency == 500.0
 
     def test_not_a_session(self, tmp_path):
         with pytest.raises(ValueError, match="no .timd channel directories"):
