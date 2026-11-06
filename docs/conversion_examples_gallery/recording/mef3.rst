@@ -44,7 +44,8 @@ used, which gives the same samples much more slowly.
 The samples are stored as the integer counts the file holds, with each channel's units conversion factor,
 in microvolts per count and with its sign, as the series' gain. All channels converted together must share a
 sampling rate and the stretches of time they were recorded over; leave the others out with
-``channels_to_skip`` and convert them separately.
+``channels_to_skip`` and convert them separately. ``MEF3RecordingInterface.get_channel_sampling_frequencies``
+gives each channel's rate, reading one metadata file per channel, for a session recorded at several rates.
 
 Gaps and timing
 ^^^^^^^^^^^^^^^

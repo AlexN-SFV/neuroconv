@@ -87,6 +87,39 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             folder_path, MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
         )
 
+    @staticmethod
+    def get_channel_sampling_frequencies(
+        folder_path: DirectoryPath,
+        password: str | None = None,
+        level_1_password: str | None = None,
+        level_2_password: str | None = None,
+    ) -> dict:
+        """
+        Get each channel's sampling frequency, reading one metadata file per channel.
+
+        The interface converts channels of one rate together, so a session recorded at several rates (iEEG
+        beside pupil or audio channels, say) is converted one rate at a time, leaving the other channels out
+        with ``channels_to_skip``.
+
+        Parameters
+        ----------
+        folder_path : DirectoryPath
+            Path to the session's ``.mefd`` directory.
+        password, level_1_password, level_2_password : str, optional
+            As for the interface, when the session's metadata is encrypted.
+
+        Returns
+        -------
+        dict
+            Channel name to sampling frequency in Hz, in acquisition channel order.
+        """
+        from ._mef3_crypto import MEF3Passwords
+        from ._mef3_reader import channel_sampling_frequencies
+
+        return channel_sampling_frequencies(
+            folder_path, MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
+        )
+
     @classmethod
     def get_extractor_class(cls):
         from ._mef3_extractor import MEF3RecordingExtractor

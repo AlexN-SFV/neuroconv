@@ -751,21 +751,32 @@ def _channel_order(names: list[str], acquisition_channel_numbers: list[int]) -> 
     return sorted(range(len(names)), key=lambda index: names[index])
 
 
+def channel_sampling_frequencies(folder_path, passwords: MEF3Passwords | None = None) -> dict[str, float]:
+    """
+    Each time series channel's sampling frequency, in Hz, in the order :func:`read_mef3_session` gives them.
+
+    Only the first segment's metadata file of each channel is read; ``passwords`` as for :func:`read_mef3_session`.
+    A session whose channels are sampled at several rates is converted one rate at a time, leaving the other
+    channels out with ``channels_to_skip``; this says which channels those are without reading any index.
+    """
+    path = Path(folder_path)
+    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
+    names, numbers, rates = [], [], []
+    for directory in channel_directories:
+        segment_directories = _segment_directories(directory)
+        if not segment_directories:
+            raise ValueError(f"The MEF 3 channel directory '{directory}' holds no .segd segment directories.")
+        metadata = _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)
+        names.append(directory.name[: -len(".timd")])
+        numbers.append(metadata["acquisition_channel_number"])
+        rates.append(metadata["sampling_frequency"])
+    return {names[index]: rates[index] for index in _channel_order(names, numbers)}
+
+
 def available_channel_names(folder_path, passwords: MEF3Passwords | None = None) -> list[str]:
     """
     The names of a session's time series channels, in the order :func:`read_mef3_session` gives them.
 
     Only the first segment's metadata file of each channel is read; ``passwords`` as for :func:`read_mef3_session`.
     """
-    path = Path(folder_path)
-    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
-    names, numbers = [], []
-    for directory in channel_directories:
-        segment_directories = _segment_directories(directory)
-        if not segment_directories:
-            raise ValueError(f"The MEF 3 channel directory '{directory}' holds no .segd segment directories.")
-        names.append(directory.name[: -len(".timd")])
-        numbers.append(
-            _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)["acquisition_channel_number"]
-        )
-    return [names[index] for index in _channel_order(names, numbers)]
+    return list(channel_sampling_frequencies(folder_path, passwords))

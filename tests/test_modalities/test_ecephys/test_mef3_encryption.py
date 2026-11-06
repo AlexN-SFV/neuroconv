@@ -362,3 +362,8 @@ class TestSubjectFieldsStayOut:
         ):
             assert LEVEL_2 not in description
         assert MEF3RecordingInterface.get_available_channel_ids(gapped_copy, password=LEVEL_2) == ["Cz", "Fp1", "EKG"]
+        assert MEF3RecordingInterface.get_channel_sampling_frequencies(gapped_copy, password=LEVEL_2) == {
+            "Cz": 1000.0,
+            "Fp1": 1000.0,
+            "EKG": 1000.0,
+        }
