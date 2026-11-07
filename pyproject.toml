@@ -257,6 +257,7 @@ mearec = [
 mef = [  # Read by neuroconv's own reader; numba compiles its decoder, which falls back to NumPy where numba has no wheels
     "neuroconv[ecephys_minimal]",
     "numba; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "cryptography>=42",  # AES for MEF 3 sessions whose metadata is encrypted; imported only when one is read
 ]
 neuralynx = [
     "neuroconv[ecephys_minimal]",

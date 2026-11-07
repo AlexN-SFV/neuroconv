@@ -95,7 +95,7 @@ jobs:
           else
             source env_ecephys/bin/activate
           fi
-          uv pip install ".[ecephys_minimal]"
+          uv pip install ".[ecephys_minimal,mef]"  # mef adds cryptography, which the encrypted MEF 3 tests need
           uv pip install --group test --group sorting_analyzer # we test the sorting analyzer here so we need its dependencies
           python -m pytest tests/test_modalities/test_ecephys -vv
           deactivate

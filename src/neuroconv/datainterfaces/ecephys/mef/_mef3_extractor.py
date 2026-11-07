@@ -17,6 +17,7 @@ import numpy as np
 from pydantic import DirectoryPath
 from spikeinterface.core import BaseRecording, BaseRecordingSegment
 
+from ._mef3_crypto import MEF3Passwords
 from ._mef3_reader import MEF3Channel, MEF3Session, read_mef3_session
 from ._red import NUMBA_AVAILABLE
 from .._channel_ids import _stacklevel_outside_neuroconv
@@ -163,14 +164,30 @@ class MEF3RecordingExtractor(BaseRecording):
         The session's ``.mefd`` directory.
     channels_to_skip : list of str, optional
         Names of channels to leave out.
+    password : str, optional
+        The session's password, of either level, when its metadata is encrypted.
+    level_1_password, level_2_password : str, optional
+        The session's passwords by level, instead of ``password``.
+
+    The passwords are only needed while the session is read here, and are left out of the extractor's kwargs,
+    so ``to_dict()`` and anything that serialises the extractor never carry them. An encrypted session's
+    extractor therefore cannot be rebuilt from ``to_dict()``.
     """
 
     extractor_name = "MEF3Recording"
     mode = "folder"
     name = "mef3"
 
-    def __init__(self, folder_path: DirectoryPath, channels_to_skip: list | None = None):
-        session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip)
+    def __init__(
+        self,
+        folder_path: DirectoryPath,
+        channels_to_skip: list | None = None,
+        password: str | None = None,
+        level_1_password: str | None = None,
+        level_2_password: str | None = None,
+    ):
+        passwords = MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
+        session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
         _warn_about_lossy_blocks(session)
         channel_names = [channel.name for channel in session.channels]
 
