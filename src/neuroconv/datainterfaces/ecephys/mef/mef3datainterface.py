@@ -326,11 +326,20 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         )
 
     def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
+        session = self.mef3_session
+        # A session at several rates is converted one rate at a time, whose runs differ; each rate's rows are
+        # written, labelled with the rate as MEF 2 streams are. The records are the session's, written once.
+        source_file = (
+            f"{session.path.name} ({session.sampling_frequency:g} Hz)"
+            if len(session.session_sampling_frequencies) > 1
+            else None
+        )
         add_runs_to_nwbfile(
             nwbfile,
             recording_extractor=self.recording_extractor,
-            run_samples=[run.number_of_samples for run in self.mef3_session.runs],
-            sampling_frequency=self.mef3_session.sampling_frequency,
-            file_path=self.mef3_session.path,
+            run_samples=[run.number_of_samples for run in session.runs],
+            sampling_frequency=session.sampling_frequency,
+            file_path=session.path,
             kind="MEF 3",
+            source_file=source_file,
         )
