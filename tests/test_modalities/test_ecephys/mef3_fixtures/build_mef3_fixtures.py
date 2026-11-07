@@ -23,6 +23,9 @@ random UUIDs, so rebuilding them changes their bytes but not what they hold.
   channels' blocks are 250 and 300 samples long, so their block boundaries differ.
 * ``lossy.mefd``: one channel written with RED's lossy compression, which scales and detrends its blocks.
 * ``encrypted.mefd``: one channel written with passwords, so its metadata is encrypted.
+* ``encrypted_non_ascii.mefd``: the same with passwords beyond ASCII ("Straße" at level 1, "clé-niveau-2" at
+  level 2). meflib keys a password by the low byte of each character's code point (``ß`` is 0xDF), not by the
+  last byte of its UTF-8 encoding (0x9F), which only this fixture can tell apart.
 * ``ds004696_sub-06_truncated.mefd``: channels C3 and EKG of ds004696 sub-06 (CC0, OpenNeuro), cut to their
   first six blocks. Block 3 holds 10242 samples though the next block starts 10240 samples later: the clock
   drift that makes timestamps alone the wrong test for a gap.
@@ -43,6 +46,8 @@ START_TIME = 946684800000000  # 2000-01-01T00:00:00 UTC, in µUTC
 RECORDING_TIME_OFFSET = START_TIME - 1_000_000
 SAMPLING_FREQUENCY = 1000
 SAMPLES_PER_BLOCK = 250
+NON_ASCII_LEVEL_1 = "Straße"
+NON_ASCII_LEVEL_2 = "clé-niveau-2"
 
 
 def digest(samples) -> str:
@@ -269,6 +274,15 @@ def build_encrypted(path: Path):
     session.write_mef_ts_segment_data("ch", 0, "chair", "table", SAMPLES_PER_BLOCK, samples)
 
 
+def build_encrypted_non_ascii(path: Path):
+    session = fresh(path)
+    samples = np.arange(500, dtype=np.int32)
+    session.write_mef_ts_segment_metadata(
+        "ch", 0, NON_ASCII_LEVEL_1, NON_ASCII_LEVEL_2, START_TIME, START_TIME + 500_000, section_2(), SECTION_3
+    )
+    session.write_mef_ts_segment_data("ch", 0, NON_ASCII_LEVEL_1, NON_ASCII_LEVEL_2, SAMPLES_PER_BLOCK, samples)
+
+
 def build_truncated(source: Path, path: Path, channels=("C3", "EKG"), number_of_blocks=6):
     if path.exists():
         shutil.rmtree(path)
@@ -359,6 +373,9 @@ def main():
 
     if wanted("encrypted.mefd"):
         build_encrypted(HERE / "encrypted.mefd")
+
+    if wanted("encrypted_non_ascii.mefd"):
+        build_encrypted_non_ascii(HERE / "encrypted_non_ascii.mefd")
 
     if wanted("ds004696_sub-06_truncated.mefd"):
         build_truncated(ds004696, HERE / "ds004696_sub-06_truncated.mefd")

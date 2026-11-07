@@ -6,12 +6,19 @@ factor, descriptions) and section 3 (the recording time offset, the time zone, a
 AES-128 in ECB mode, each section at the level its encryption byte gives: level 1 with the level 1 password,
 level 2 with the level 2 password. Everything here follows meflib (``meflib.c`` in pymef 1.4.8):
 
-* ``extract_terminal_password_bytes``: a password is the last UTF-8 byte of each of its first 16 characters,
-  padded with zero bytes to 16. Those bytes are the AES key.
+* ``check_password``: a password has 1 to 15 characters (``MAX_PASSWORD_CHARACTERS``); the 16th key byte is
+  always the terminating zero.
+* ``extract_terminal_password_bytes``: a password is the low byte of each character's Unicode code point
+  (``UTF8_nextchar(...) & 0xFF``; ``ß``, U+00DF, gives 0xDF, not the 0x9F that ends its UTF-8 encoding), padded
+  with zero bytes to 16. Those bytes are the AES key.
 * ``process_password_data`` and ``check_password``: the universal header holds two validation fields.
   ``level_1_password_validation_field`` is the first 16 bytes of the SHA-256 of the level 1 password, and
   ``level_2_password_validation_field`` is the first 16 bytes of the SHA-256 of the level 2 password, XORed
   with the level 1 password. So a level 2 password also yields the level 1 password, and opens both levels.
+
+A level 1 password given on its own opens level 1 here. meflib's own reader, given an unspecified password that
+validates at level 1, fills only its level 2 key and decrypts a level 1 section with a zeroed key; this follows
+what its writer does instead, which is what the files need.
 
 The passwords are held only as long as the objects that are given them; they never appear in a ``repr``, a
 message or a warning.
@@ -21,6 +28,7 @@ import hashlib
 from dataclasses import dataclass, field
 
 PASSWORD_BYTES = 16
+MAX_PASSWORD_CHARACTERS = PASSWORD_BYTES - 1
 AES_BLOCK_BYTES = 16
 # UNIVERSAL_HEADER_LEVEL_1_PASSWORD_VALIDATION_FIELD_OFFSET and _LEVEL_2_.
 _LEVEL_1_VALIDATION_FIELD = slice(868, 884)
@@ -28,9 +36,10 @@ _LEVEL_2_VALIDATION_FIELD = slice(884, 900)
 
 
 def password_bytes(password: str) -> bytes:
-    """meflib's ``extract_terminal_password_bytes``: the AES key a password stands for."""
-    terminal_bytes = bytes(character.encode("utf-8")[-1] for character in password[:PASSWORD_BYTES])
-    return terminal_bytes.ljust(PASSWORD_BYTES, b"\0")
+    """meflib's ``extract_terminal_password_bytes``: the AES key a password of at most 15 characters stands for."""
+    if len(password) > MAX_PASSWORD_CHARACTERS:
+        raise ValueError(f"A MEF 3 password has at most {MAX_PASSWORD_CHARACTERS} characters.")
+    return bytes(ord(character) & 0xFF for character in password).ljust(PASSWORD_BYTES, b"\0")
 
 
 def _sha256_16(data: bytes) -> bytes:
@@ -97,9 +106,18 @@ class MEF3Passwords:
                 "Give a MEF 3 password either as password, whose level is found from the files, or as "
                 "level_1_password and level_2_password, not both ways."
             )
-        if any(not isinstance(value, str) or not value for value in given):
+        for name in ("password", "level_1_password", "level_2_password"):
+            value = getattr(self, name)
+            if value is None:
+                continue
             # The value itself is never shown.
-            raise ValueError("A MEF 3 password must be a non-empty string.")
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"The MEF 3 {name} must be a non-empty string.")
+            if len(value) > MAX_PASSWORD_CHARACTERS:
+                raise ValueError(
+                    f"The MEF 3 {name} is longer than {MAX_PASSWORD_CHARACTERS} characters, the most meflib allows "
+                    "(its 16th key byte is always zero), so no MEF 3 file can have been written with it."
+                )
 
     @classmethod
     def from_arguments(

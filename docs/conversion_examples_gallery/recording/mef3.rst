@@ -86,8 +86,11 @@ the precision lost when the file was written cannot be recovered.
 A session whose metadata is encrypted is read with its password, passed as ``password``; its level (1 or 2)
 is found from the files' password validation fields, and a level 2 password opens both levels. The passwords
 can also be given by level, as ``level_1_password`` and ``level_2_password``. A password that does not
-validate raises an error naming the file and the level that failed. Take the password from a secret or an
-environment variable rather than writing it into code:
+validate raises an error naming the file and the level that failed. As in meflib, a password has at most 15
+characters and is keyed by the low byte of each character's code point, so non-ASCII passwords match files
+meflib wrote. A level 1 password given on its own opens level 1 sections; meflib's own reader does not do this
+for an unspecified password, but its writer encrypts level 1 sections with exactly that key. Take the password
+from a secret or an environment variable rather than writing it into code:
 
 .. code-block:: python
 

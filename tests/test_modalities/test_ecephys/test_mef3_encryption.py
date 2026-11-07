@@ -34,12 +34,15 @@ from neuroconv.datainterfaces.ecephys.mef._mef3_reader import (  # noqa: E402
 FIXTURES = Path(__file__).parent / "mef3_fixtures"
 GAPPED = FIXTURES / "gapped.mefd"
 PYMEF_ENCRYPTED = FIXTURES / "encrypted.mefd"
+# Written by meflib with "Straße" (level 1) and "clé-niveau-2" (level 2); see build_mef3_fixtures.py.
+PYMEF_NON_ASCII = FIXTURES / "encrypted_non_ascii.mefd"
 START_TIME = 946684800000000  # the µUTC start of the synthetic sessions, 2000-01-01T00:00:00 UTC
 RECORDING_TIME_OFFSET = START_TIME - 1_000_000  # what build_mef3_fixtures.py gives every session
 
-# Test passwords only. The second has characters beyond ASCII, of which meflib keeps the last UTF-8 byte.
+# Test passwords only, at most 15 characters as meflib requires. The second has a character beyond ASCII, of
+# which meflib keeps the low byte of the code point.
 LEVEL_1 = "level-one-test"
-LEVEL_2 = "zwei-Stufe-ß-test-longer-than-16"
+LEVEL_2 = "Stufe-ß-zwei"
 
 # The fields of metadata section 3 (METADATA_*_OFFSET in meflib.h).
 DST_START, DST_END = 13320, 13328
@@ -149,10 +152,22 @@ def gapped_copy(tmp_path):
 
 class TestPasswords:
     def test_password_bytes_follow_meflib(self):
-        """The last UTF-8 byte of each of the first 16 characters, zero-padded."""
+        """The low byte of each character's code point, zero-padded to 16, as extract_terminal_password_bytes keys it."""
         assert password_bytes("abc") == b"abc" + b"\0" * 13
-        assert password_bytes("ß") == bytes([0x9F]) + b"\0" * 15  # ß is C3 9F
-        assert password_bytes("x" * 20) == b"x" * 16
+        assert password_bytes("ß") == bytes([0xDF]) + b"\0" * 15  # U+00DF, not 0x9F, the last byte of C3 9F
+        assert password_bytes("é") == bytes([0xE9]) + b"\0" * 15  # U+00E9, not 0xA9
+        assert password_bytes("x" * 15) == b"x" * 15 + b"\0"
+
+    @pytest.mark.parametrize("name", ["password", "level_1_password", "level_2_password"])
+    def test_more_than_15_characters_are_refused(self, name):
+        """meflib's check_password allows MAX_PASSWORD_CHARACTERS = 15; its 16th key byte is always zero."""
+        secret = "sixteen-chars-xx"
+        with pytest.raises(ValueError, match=f"{name} is longer than 15 characters") as error:
+            MEF3Passwords(**{name: secret})
+        assert secret not in str(error.value)
+        with pytest.raises(ValueError, match="at most 15 characters"):
+            password_bytes(secret)
+        MEF3Passwords(**{name: "fifteen-chars-x"})
 
     def test_repr_hides_the_passwords(self):
         for passwords in (
@@ -198,6 +213,34 @@ class TestPymefWrittenSession:
             read_quietly(PYMEF_ENCRYPTED, passwords=MEF3Passwords(password="chair"))
 
 
+class TestPymefWrittenNonASCIIPasswords:
+    """encrypted_non_ascii.mefd: meflib keyed it by code-point low bytes, which only non-ASCII passwords show."""
+
+    @pytest.mark.parametrize(
+        "passwords",
+        [
+            pytest.param(MEF3Passwords(password="clé-niveau-2"), id="level-2-password"),
+            pytest.param(MEF3Passwords(level_1_password="Straße", level_2_password="clé-niveau-2"), id="pair"),
+        ],
+    )
+    def test_reads_as_written(self, passwords):
+        session = read_quietly(PYMEF_NON_ASCII, passwords=passwords)
+        (channel,) = session.channels
+        assert session.sampling_frequency == 1000 and channel.units_conversion_factor == 1.0
+        assert session.start_time == START_TIME and session.gmt_offset == 3600
+        np.testing.assert_array_equal(channel.read_blocks(0, len(channel.blocks)), np.arange(500, dtype=np.int32))
+
+    def test_its_level_1_password_validates_at_level_1(self):
+        with pytest.raises(ValueError, match="only good for level 1"):
+            read_quietly(PYMEF_NON_ASCII, passwords=MEF3Passwords(password="Straße"))
+
+    def test_last_utf8_byte_keys_are_refused(self):
+        """The same characters keyed by the last byte of their UTF-8 encoding: 0x9F for ß, 0xA9 for é."""
+        last_utf8_bytes = "".join(chr(character.encode("utf-8")[-1]) for character in "clé-niveau-2")
+        with pytest.raises(ValueError, match="matches neither"):
+            read_quietly(PYMEF_NON_ASCII, passwords=MEF3Passwords(password=last_utf8_bytes))
+
+
 class TestEncryptedSessions:
     def test_level_1_only(self, gapped_copy, plaintext):
         """Section 2 at level 1, section 3 in the clear: the level 1 password is enough."""
@@ -231,17 +274,17 @@ class TestEncryptedSessions:
         "passwords, message",
         [
             pytest.param(
-                MEF3Passwords(password="not-the-password"),
+                MEF3Passwords(password="wrong-password"),
                 r"does not open .*: it matches neither the file's level 1 nor its level 2 .* encrypted at level 1 and 2",
                 id="single",
             ),
             pytest.param(
-                MEF3Passwords(level_1_password="not-the-password", level_2_password=LEVEL_2),
+                MEF3Passwords(level_1_password="wrong-password", level_2_password=LEVEL_2),
                 "level 1 password does not match the level 1 password validation field",
                 id="wrong-level-1",
             ),
             pytest.param(
-                MEF3Passwords(level_1_password=LEVEL_1, level_2_password="not-the-password"),
+                MEF3Passwords(level_1_password=LEVEL_1, level_2_password="wrong-password"),
                 "level 2 password does not match the level 2 password validation field",
                 id="wrong-level-2",
             ),
@@ -256,7 +299,7 @@ class TestEncryptedSessions:
         encrypt_session(gapped_copy, level_1_password=LEVEL_1, level_2_password=LEVEL_2)
         with pytest.raises(ValueError, match=message) as error:
             read_quietly(gapped_copy, passwords=passwords)
-        for secret in (LEVEL_1, LEVEL_2, "not-the-password"):
+        for secret in (LEVEL_1, LEVEL_2, "wrong-password"):
             assert secret not in str(error.value)
 
     def test_no_password(self, gapped_copy):
@@ -266,7 +309,7 @@ class TestEncryptedSessions:
 
     def test_unencrypted_session_ignores_a_password(self, plaintext):
         assert summary(read_quietly(GAPPED, passwords=MEF3Passwords(password=LEVEL_2))) == plaintext
-        assert summary(read_quietly(GAPPED, passwords=MEF3Passwords(password="not-the-password"))) == plaintext
+        assert summary(read_quietly(GAPPED, passwords=MEF3Passwords(password="wrong-password"))) == plaintext
 
     def test_each_channel_keeps_its_own_factor(self, gapped_copy):
         """Factors can differ by channel within a session: 1000/32767, 5000/32767 and 50/32767 µV here."""
