@@ -641,6 +641,8 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
             return [self]
 
         width = int(np.ceil(np.log10(len(offset_to_channel_ids))))
+        # An interface that is itself a part (of a split stream, say) keeps its own name ahead of the index.
+        series_name = getattr(self, "_split_series_name", None) or "ElectricalSeries"
         sub_interfaces = []
         for index, offset in enumerate(sorted(offset_to_channel_ids)):
             sub_interface = copy.copy(self)
@@ -654,7 +656,7 @@ class BaseRecordingExtractorInterface(BaseExtractorInterface):
             # key, so both get the suffix: distinct keys so a ConverterPipe keeps every partition's entry,
             # and distinct names so the series do not collide in the file.
             sub_interface.metadata_key = f"{self.metadata_key}{suffix}"
-            sub_interface._split_series_name = f"ElectricalSeries{suffix}"
+            sub_interface._split_series_name = f"{series_name}{suffix}"
             sub_interfaces.append(sub_interface)
 
         return sub_interfaces

@@ -89,6 +89,27 @@ def set_discontinuity_flag(session_path: Path, segment: int, block: int, flagged
         data_path.write_bytes(bytes(data))
 
 
+def set_channel_rate(session_path: Path, channel: str, rate: float):
+    """Give every segment of a channel the sampling frequency ``rate`` in its metadata."""
+    for path in (session_path / f"{channel}.timd").rglob("*.tmet"):
+        metadata = bytearray(path.read_bytes())
+        metadata[8720:8728] = np.float64(rate).tobytes()  # TIME_SERIES_METADATA_SAMPLING_FREQUENCY_OFFSET
+        path.write_bytes(bytes(metadata))
+
+
+def rewrite_index_start_times(index_path: Path, change):
+    """
+    Replace the block start times of a .tidx by ``change(times)``, on their magnitudes: a writer stores a time
+    offset by the recording time offset as a negative number, which keeps its sign.
+    """
+    raw = bytearray(index_path.read_bytes())
+    entries = np.frombuffer(bytes(raw[1024:]), dtype="<i8").reshape(-1, 7).copy()  # 56-byte entries
+    stored = entries[:, 1]  # TIME_SERIES_INDEX_START_TIME_OFFSET
+    entries[:, 1] = np.sign(stored) * change(np.abs(stored))
+    raw[1024:] = entries.tobytes()
+    index_path.write_bytes(bytes(raw))
+
+
 @pytest.fixture
 def gapped_copy(tmp_path):
     destination = tmp_path / "gapped.mefd"
@@ -274,10 +295,7 @@ class TestReader:
             read_mef3_session(GAPPED, channels_to_skip=["Pz"])
 
     def test_channels_at_different_rates_are_grouped(self, gapped_copy):
-        for path in (gapped_copy / "EKG.timd").rglob("*.tmet"):
-            metadata = bytearray(path.read_bytes())
-            metadata[8720:8728] = np.float64(500.0).tobytes()  # TIME_SERIES_METADATA_SAMPLING_FREQUENCY_OFFSET
-            path.write_bytes(bytes(metadata))
+        set_channel_rate(gapped_copy, "EKG", 500.0)
         session = read_mef3_session(gapped_copy)
         assert [
             ([channel.name for channel in group.channels], group.sampling_frequency) for group in session.channel_groups
@@ -437,17 +455,9 @@ def make_two_rate_session(session_path: Path, *, rate: float = 2000.0, later_by_
     of Cz's channel-level records as its own.
     """
     ekg = session_path / "EKG.timd"
-    for path in ekg.rglob("*.tmet"):
-        metadata = bytearray(path.read_bytes())
-        metadata[8720:8728] = np.float64(rate).tobytes()  # TIME_SERIES_METADATA_SAMPLING_FREQUENCY_OFFSET
-        path.write_bytes(bytes(metadata))
+    set_channel_rate(session_path, "EKG", rate)
     for path in ekg.rglob("*.tidx"):
-        raw = bytearray(path.read_bytes())
-        entries = np.frombuffer(bytes(raw[1024:]), dtype="<i8").reshape(-1, 7).copy()  # 56-byte entries
-        stored = entries[:, 1]  # TIME_SERIES_INDEX_START_TIME_OFFSET; negative when offset
-        entries[:, 1] = np.where(stored < 0, stored - later_by_microseconds, stored + later_by_microseconds)
-        raw[1024:] = entries.tobytes()
-        path.write_bytes(bytes(raw))
+        rewrite_index_start_times(path, lambda times: times + later_by_microseconds)
     for suffix in (".ridx", ".rdat"):
         shutil.copy(session_path / "Cz.timd" / f"Cz{suffix}", ekg / f"EKG{suffix}")
 
@@ -539,10 +549,7 @@ class TestSessionAtSeveralRates:
         assert len(runs) == sum(len(interface.mef3_session.runs) for interface in interfaces.values())
 
     def test_a_skipped_channel_without_a_rate_is_left_out(self, gapped_copy):
-        for path in (gapped_copy / "EKG.timd").rglob("*.tmet"):
-            metadata = bytearray(path.read_bytes())
-            metadata[8720:8728] = np.float64(-1.0).tobytes()  # TIME_SERIES_METADATA_SAMPLING_FREQUENCY_NO_ENTRY
-            path.write_bytes(bytes(metadata))
+        set_channel_rate(gapped_copy, "EKG", -1.0)  # TIME_SERIES_METADATA_SAMPLING_FREQUENCY_NO_ENTRY
         with pytest.warns(UserWarning, match=r"skipped MEF 3 channel 'EKG'.*sampling frequency of -1\.0"):
             session = read_mef3_session(gapped_copy, channels_to_skip=["EKG"])
         assert session.session_sampling_frequencies == (1000.0,)
@@ -580,12 +587,7 @@ def shift_channel_segment(session_path: Path, channel: str, segment: int, by_mic
     """Move every block of one segment of one channel by ``by_microseconds``, in its index."""
     stem = f"{channel}-{segment:06d}"
     index_path = session_path / f"{channel}.timd" / f"{stem}.segd" / f"{stem}.tidx"
-    raw = bytearray(index_path.read_bytes())
-    entries = np.frombuffer(bytes(raw[1024:]), dtype="<i8").reshape(-1, 7).copy()  # 56-byte entries
-    stored = entries[:, 1]  # TIME_SERIES_INDEX_START_TIME_OFFSET; negative when offset
-    entries[:, 1] = np.where(stored < 0, stored - by_microseconds, stored + by_microseconds)
-    raw[1024:] = entries.tobytes()
-    index_path.write_bytes(bytes(raw))
+    rewrite_index_start_times(index_path, lambda times: times + by_microseconds)
 
 
 def make_slower_ekg(session_path: Path, *, later_by_microseconds: int = 3_000_000):
@@ -593,23 +595,11 @@ def make_slower_ekg(session_path: Path, *, later_by_microseconds: int = 3_000_00
     gapped.mefd with EKG at 500 Hz, its blocks re-timed to that rate (so its runs are 0-4 s and 8-10 s of its
     own time) and starting ``later_by_microseconds`` after Cz and Fp1.
     """
-    ekg = session_path / "EKG.timd"
-    for path in ekg.rglob("*.tmet"):
-        metadata = bytearray(path.read_bytes())
-        metadata[8720:8728] = np.float64(500.0).tobytes()  # TIME_SERIES_METADATA_SAMPLING_FREQUENCY_OFFSET
-        path.write_bytes(bytes(metadata))
-    index_paths = sorted(ekg.rglob("*.tidx"))
-    first = None
+    set_channel_rate(session_path, "EKG", 500.0)
+    index_paths = sorted((session_path / "EKG.timd").rglob("*.tidx"))
+    first = abs(int(np.frombuffer(index_paths[0].read_bytes()[1032:1040], dtype="<i8")[0]))  # block 0's start
     for path in index_paths:
-        raw = bytearray(path.read_bytes())
-        entries = np.frombuffer(bytes(raw[1024:]), dtype="<i8").reshape(-1, 7).copy()  # 56-byte entries
-        stored = entries[:, 1]  # TIME_SERIES_INDEX_START_TIME_OFFSET; negative when offset
-        times = np.abs(stored)
-        first = times[0] if first is None else first
-        retimed = first + 2 * (times - first) + later_by_microseconds
-        entries[:, 1] = np.where(stored < 0, -retimed, retimed)
-        raw[1024:] = entries.tobytes()
-        path.write_bytes(bytes(raw))
+        rewrite_index_start_times(path, lambda times: first + 2 * (times - first) + later_by_microseconds)
 
 
 def make_continuous_ekg(session_path: Path):
@@ -793,6 +783,55 @@ class TestChannelGroups:
         interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
         assert sorted(nwbfile.acquisition) == ["ElectricalSeries0", "ElectricalSeries1"]
         assert set(nwbfile.intervals["runs"]["source_file"][:]) == {"gapped.mefd"}
+
+    @pytest.mark.parametrize(
+        "ekg_rate, labels, suffixes",
+        [
+            # One label under :g, distinct under .10g: the runs rows would merge.
+            (1000.0001, ["1000.0", "1000.0001"], ["1000Hz", "1000.0001Hz"]),
+            # One label under both: the series and metadata keys would collide.
+            (1000.00000001, ["1000.0", "1000.00000001"], ["1000.0Hz", "1000.00000001Hz"]),
+        ],
+    )
+    def test_rates_that_print_alike_keep_their_rows_and_series_apart(
+        self, gapped_copy, tmp_path, ekg_rate, labels, suffixes
+    ):
+        """Two groups whose rates print alike are told apart by the exact rate, in the runs rows and the series."""
+        set_channel_rate(gapped_copy, "EKG", ekg_rate)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(folder_path=gapped_copy, metadata_key="mef3")
+        groups = interface.split_by_channel_group()
+        assert [group.metadata_key for group in groups] == [f"mef3_{suffix}" for suffix in suffixes]
+        nwbfile_path = tmp_path / "close_rates.nwb"
+        write_quietly(interface, nwbfile_path)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            assert len(nwbfile.acquisition) == sum(group.recording_extractor.get_num_segments() for group in groups)
+            runs = nwbfile.intervals["runs"].to_dataframe()
+            assert sorted(set(runs["source_file"])) == [f"gapped.mefd ({label} Hz)" for label in labels]
+            assert len(runs) == sum(len(group.mef3_session.runs) for group in groups)
+
+    def test_a_group_split_by_offset_keeps_its_name(self, gapped_copy):
+        """A group whose channels have different offsets splits further, under the group's own name."""
+        make_slower_ekg(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(folder_path=gapped_copy)
+            interface.split_by_channel_group()[0].recording_extractor.set_channel_offsets([0.0, 5.0])
+            parts = interface.split_by_offset()
+            assert [(part.metadata_key, list(part.channel_ids)) for part in parts] == [
+                ("mef3_recording_1000Hz0", ["Cz"]),
+                ("mef3_recording_1000Hz1", ["Fp1"]),
+                ("mef3_recording_500Hz", ["EKG"]),
+            ]
+            metadata = parts[0].get_metadata()
+        assert metadata["Ecephys"]["ElectricalSeries"]["mef3_recording_1000Hz0"]["name"] == "ElectricalSeries_1000Hz0"
+        assert [part._split_series_name for part in parts] == [
+            "ElectricalSeries_1000Hz0",
+            "ElectricalSeries_1000Hz1",
+            "ElectricalSeries_500Hz",
+        ]
 
 
 class TestEmptySegments:

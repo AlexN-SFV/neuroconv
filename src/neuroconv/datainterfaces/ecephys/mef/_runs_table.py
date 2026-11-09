@@ -9,7 +9,8 @@ from .._intervals_tables import add_rows_to_intervals_table
 RUNS_TABLE_NAME = "runs"
 RUNS_TABLE_DESCRIPTION = (
     "Uninterrupted runs of samples in recordings with gaps. Each run is written as its own ElectricalSeries, "
-    "positioned at the run's start time."
+    "positioned at the run's start time. A recording, or a channel group of one, that has a single run has no "
+    "rows: its series' starting time places it."
 )
 RUNS_COLUMNS = {"run_index": "0-based index of the uninterrupted run of samples within its recording."}
 RUNS_SOURCE_FILE_DESCRIPTION = (

@@ -19,14 +19,15 @@ _SOURCE_FILE_DESCRIPTION = "Name of the MEF 3 .mefd session directory the row wa
 _DEIDENTIFIED_BEFORE = datetime(1980, 1, 1, tzinfo=timezone.utc)
 
 
-def _rate_label(rate: float, rates: tuple[float, ...]) -> str:
+def _rate_label(rate: float, rates: tuple[float, ...], format_spec: str = "g") -> str:
     """
     A rate as the runs rows name it: ``1000`` for 1000.0 Hz, or the exact float when the short form would give
     two of the session's rates one label, since rows are written once per label and the second rate's would be
-    lost.
+    lost. Series names and metadata keys use it with ``format_spec=".10g"``, so they never take an exponent and
+    two rates never share a series.
     """
-    if len({f"{other:g}" for other in rates}) == len(rates):
-        return f"{rate:g}"
+    if len({format(other, format_spec) for other in rates}) == len(set(rates)):
+        return format(rate, format_spec)
     return str(float(rate))
 
 
@@ -263,7 +264,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             interfaces = []
             for index, (group, extractor) in enumerate(zip(groups, self._group_extractors)):
                 rate = group.sampling_frequency
-                suffix, label = f"{rate:.10g}Hz", f"{rate:g} Hz"
+                rates = self.mef3_session.session_sampling_frequencies
+                suffix = f"{_rate_label(rate, rates, '.10g')}Hz"
+                label = f"{_rate_label(rate, rates)} Hz"
                 if groups_at_rate[rate] > 1:
                     number = numbered_at_rate[rate]
                     numbered_at_rate[rate] += 1
@@ -293,16 +296,13 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         """
         if not self._has_several_groups:
             return super().split_by_offset()
-        parts = []
-        for group_interface in self.split_by_channel_group():
-            group_parts = BaseRecordingExtractorInterface.split_by_offset(group_interface)
-            if len(group_parts) > 1:
-                # Keep the group's name ahead of the offset's index, so parts of different groups do not collide.
-                for part in group_parts:
-                    index = part.metadata_key[len(group_interface.metadata_key) :]
-                    part._split_series_name = f"{group_interface._split_series_name}{index}"
-            parts.extend(group_parts)
-        return parts
+        # Each group's parts keep the group's name ahead of the offset's index, so parts of different groups
+        # do not collide.
+        return [
+            part
+            for group_interface in self.split_by_channel_group()
+            for part in BaseRecordingExtractorInterface.split_by_offset(group_interface)
+        ]
 
     def _refuse_several_groups(self, action: str):
         if self._has_several_groups:
