@@ -14,7 +14,8 @@ RUNS_TABLE_DESCRIPTION = (
 RUNS_COLUMNS = {"run_index": "0-based index of the uninterrupted run of samples within its recording."}
 RUNS_SOURCE_FILE_DESCRIPTION = (
     "Name of the MEF recording the row was read from: a MEF 3 .mefd session directory, or a MEF 2 directory of "
-    ".mef files, followed by the sampling rate in parentheses when the directory holds channels at several."
+    ".mef files, followed by the sampling rate in parentheses when the directory holds channels at several, "
+    "and by the channel group's number when channels at one rate were recorded over different stretches of time."
 )
 
 

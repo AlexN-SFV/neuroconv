@@ -155,8 +155,13 @@ class MEF3RecordingExtractor(BaseRecording):
     Lazy SpikeInterface recording for a MEF 3.0 session.
 
     Each uninterrupted run of blocks becomes one segment, placed on the session timeline at its first
-    block's start time, measured from the start of the first run. A session recorded without interruption,
+    block's start time, measured from the session's start. A session recorded without interruption,
     however many MEF segments it is split into, is a single segment.
+
+    A recording has one rate and one set of segments, so it holds one of the session's channel groups (see
+    :class:`._mef3_reader.MEF3ChannelGroup`). A session with several is refused here: keep one group with
+    ``channels_to_skip``, or convert it with ``MEF3RecordingInterface``, which writes each group as its own
+    series.
 
     Parameters
     ----------
@@ -172,6 +177,10 @@ class MEF3RecordingExtractor(BaseRecording):
     The passwords are only needed while the session is read here, and are left out of the extractor's kwargs,
     so ``to_dict()`` and anything that serialises the extractor never carry them. An encrypted session's
     extractor therefore cannot be rebuilt from ``to_dict()``.
+
+    ``_session`` is for ``MEF3RecordingInterface``: a session it has already read, narrowed to one channel group
+    with :meth:`._mef3_reader.MEF3Session.select_group`, so the session is read once for all its groups. The
+    ``channels_to_skip`` given with it must leave exactly that group, so ``to_dict()`` rebuilds the same recording.
     """
 
     extractor_name = "MEF3Recording"
@@ -185,9 +194,16 @@ class MEF3RecordingExtractor(BaseRecording):
         password: str | None = None,
         level_1_password: str | None = None,
         level_2_password: str | None = None,
+        *,
+        _session: MEF3Session | None = None,
     ):
-        passwords = MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
-        session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
+        if _session is None:
+            passwords = MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
+            session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
+        else:
+            session = _session
+        # Raises, describing the groups, when the session has several.
+        session._only_group()
         _warn_about_lossy_blocks(session)
         channel_names = [channel.name for channel in session.channels]
 
