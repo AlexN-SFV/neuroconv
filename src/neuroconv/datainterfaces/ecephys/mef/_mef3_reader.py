@@ -194,11 +194,11 @@ class MEF3Session:
     records: list[MEF3Record]
     lossy_blocks: dict[str, int]  # channel name to its number of scaled or detrended blocks
     largest_scale_factor: float
-
-    @property
-    def start_time(self) -> int:
-        """Start of the first run, in µUTC."""
-        return self.runs[0].start_time
+    # The session's start, in µUTC: the earliest first block of any of its channels, kept or skipped, so every
+    # reader of one session over complementary channels_to_skip puts its series on one timeline.
+    start_time: int
+    # Every sampling rate in the session, skipped channels' included.
+    session_sampling_frequencies: tuple[float, ...]
 
     @property
     def start_datetime(self) -> datetime:
@@ -322,6 +322,16 @@ def _read_segment_metadata(path: Path, passwords: MEF3Passwords | None = None) -
     )
 
 
+def _read_time_series_index(index_path: Path) -> np.ndarray:
+    """The entries of a segment's .tidx, as stored (start times not yet made true)."""
+    raw = _read_exactly(index_path)
+    _check_universal_header(raw, index_path, "tidx")
+    body = raw[UNIVERSAL_HEADER_BYTES:]
+    if len(body) % TIME_SERIES_INDEX_BYTES:
+        raise ValueError(f"The MEF 3 index '{index_path}' is truncated mid-entry.")
+    return np.frombuffer(body, dtype=_TIME_SERIES_INDEX_DTYPE)
+
+
 def _read_block_index(index_path: Path, data_path: Path, recording_time_offset: int) -> np.ndarray:
     """
     The blocks of one segment, with the fields of their RED headers.
@@ -329,12 +339,7 @@ def _read_block_index(index_path: Path, data_path: Path, recording_time_offset: 
     The headers are read from the data file one at a time: 48 bytes per block, a few thousand reads for a
     long channel, which keeps every read a byte range rather than a whole-file load.
     """
-    raw = _read_exactly(index_path)
-    _check_universal_header(raw, index_path, "tidx")
-    body = raw[UNIVERSAL_HEADER_BYTES:]
-    if len(body) % TIME_SERIES_INDEX_BYTES:
-        raise ValueError(f"The MEF 3 index '{index_path}' is truncated mid-entry.")
-    index = np.frombuffer(body, dtype=_TIME_SERIES_INDEX_DTYPE)
+    index = _read_time_series_index(index_path)
 
     headers = np.empty(len(index), dtype=_RED_BLOCK_HEADER_DTYPE)
     with open(data_path, "rb") as file:
@@ -636,6 +641,46 @@ def _read_records(directory: Path, channel: str, recording_time_offset: int) -> 
     return records, encrypted
 
 
+def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_name: str) -> dict | None:
+    """
+    What a skipped channel adds to its session without its samples being read: its rate, the true start time
+    of its first block with samples, and its recording time offset. Read from its first metadata file and its
+    indices only.
+
+    None, with a warning, when they cannot be read: a channel may be skipped because it is unreadable.
+    """
+    try:
+        segment_directories = _segment_directories(directory)
+        if not segment_directories:
+            raise ValueError("it holds no .segd segment directories")
+        metadata = _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)
+        # As _read_channel checks it: meflib's "no entry" is -1.0, and a dead channel is one a user skips.
+        if not (np.isfinite(metadata["sampling_frequency"]) and metadata["sampling_frequency"] > 0):
+            raise ValueError(f"it gives a sampling frequency of {metadata['sampling_frequency']}")
+        first_block_start = None
+        for segment_directory in segment_directories:
+            index = _read_time_series_index(_only_file(segment_directory, ".tidx"))
+            with_samples = index[index["number_of_samples"] > 0]
+            if len(with_samples):
+                first_block_start = int(
+                    _true_time(int(with_samples["start_time"][0]), metadata["recording_time_offset"])
+                )
+                break
+    except (ValueError, OSError) as error:
+        warnings.warn(
+            f"The skipped MEF 3 channel '{directory.name[: -len('.timd')]}' of '{session_name}' cannot be read "
+            f"({error}), so its start and records are not taken into account.",
+            UserWarning,
+            stacklevel=_stacklevel_outside_neuroconv(),
+        )
+        return None
+    return dict(
+        sampling_frequency=metadata["sampling_frequency"],
+        first_block_start=first_block_start,
+        recording_time_offset=metadata["recording_time_offset"],
+    )
+
+
 def read_mef3_session(
     folder_path, channels_to_skip: list | None = None, passwords: MEF3Passwords | None = None
 ) -> MEF3Session:
@@ -647,8 +692,12 @@ def read_mef3_session(
     folder_path : str or Path
         The session's ``.mefd`` directory.
     channels_to_skip : list of str, optional
-        Names of channels to leave out. Their files are not read, so a channel sampled at another rate, or
-        over other stretches of time, can be dropped before the checks that every kept channel agrees.
+        Names of channels to leave out. Their samples and data files are not read, so a channel sampled at
+        another rate, or over other stretches of time, can be dropped before the checks that every kept channel
+        agrees. Their first metadata file and their indices are still read, and their records kept, so the
+        session's start time and records are the same whichever channels are skipped: readers of one session
+        over complementary channels_to_skip (one per sampling rate, say) share one timeline and one set of
+        records.
     passwords : MEF3Passwords, optional
         The session's password, needed when its metadata is encrypted, and ignored when it is not.
 
@@ -664,12 +713,12 @@ def read_mef3_session(
     if not channel_directories:
         raise ValueError(f"'{path}' holds no .timd channel directories, so it is not a MEF 3 session.")
     names = [directory.name[: -len(".timd")] for directory in channel_directories]
-    unknown = sorted(set(channels_to_skip or []) - set(names))
+    to_skip = set(channels_to_skip or [])
+    unknown = sorted(to_skip - set(names))
     if unknown:
         raise ValueError(f"channels_to_skip names channels that are not in the session: {unknown}. Available: {names}.")
-    channel_directories = [
-        directory for directory, name in zip(channel_directories, names) if name not in set(channels_to_skip or [])
-    ]
+    skipped_directories = [directory for directory, name in zip(channel_directories, names) if name in to_skip]
+    channel_directories = [directory for directory, name in zip(channel_directories, names) if name not in to_skip]
     if not channel_directories:
         raise ValueError("channels_to_skip leaves no channels in the session.")
 
@@ -703,16 +752,36 @@ def read_mef3_session(
     sampling_frequency = channels[0].sampling_frequency
     runs = _check_shared_layout(channels, sampling_frequency, path)
 
+    skipped = {
+        directory: summary
+        for directory in skipped_directories
+        if (summary := _skipped_channel(directory, passwords, path.name)) is not None
+    }
+    start_time = min(
+        [runs[0].start_time]
+        + [summary["first_block_start"] for summary in skipped.values() if summary["first_block_start"] is not None]
+    )
+    session_sampling_frequencies = tuple(
+        sorted({sampling_frequency, *(summary["sampling_frequency"] for summary in skipped.values())})
+    )
+
     # The session-level records use the recording time offset the channels share; MEF 3 writers give every
     # segment the session's.
     session_recording_time_offset = recording_time_offsets[0]
     records, encrypted = _read_records(path, channel="", recording_time_offset=session_recording_time_offset)
-    for channel, recording_time_offset in zip(channels, recording_time_offsets):
-        channel_records, channel_encrypted = _read_records(channel.directory, channel.name, recording_time_offset)
+    record_sources = [
+        (channel.directory, channel.name, recording_time_offset)
+        for channel, recording_time_offset in zip(channels, recording_time_offsets)
+    ] + [
+        (directory, directory.name[: -len(".timd")], summary["recording_time_offset"])
+        for directory, summary in skipped.items()
+    ]
+    for directory, name, recording_time_offset in record_sources:
+        channel_records, channel_encrypted = _read_records(directory, name, recording_time_offset)
         records += channel_records
         encrypted += channel_encrypted
-        for segment_directory in _segment_directories(channel.directory):
-            segment_records, segment_encrypted = _read_records(segment_directory, channel.name, recording_time_offset)
+        for segment_directory in _segment_directories(directory):
+            segment_records, segment_encrypted = _read_records(segment_directory, name, recording_time_offset)
             records += segment_records
             encrypted += segment_encrypted
     if encrypted:
@@ -721,7 +790,8 @@ def read_mef3_session(
             UserWarning,
             stacklevel=_stacklevel_outside_neuroconv(),
         )
-    records.sort(key=lambda record: record.time)
+    # Time first; the rest only orders records at the same instant the same way whichever channels are skipped.
+    records.sort(key=lambda record: (record.time, record.channel, record.record_type, record.label, record.details))
 
     lossy_blocks, largest_scale_factor = {}, 1.0
     for channel in channels:
@@ -740,6 +810,8 @@ def read_mef3_session(
         records=records,
         lossy_blocks=lossy_blocks,
         largest_scale_factor=largest_scale_factor,
+        start_time=start_time,
+        session_sampling_frequencies=session_sampling_frequencies,
     )
 
 

@@ -46,6 +46,11 @@ in microvolts per count and with its sign, as the series' gain. All channels con
 sampling rate and the stretches of time they were recorded over; leave the others out with
 ``channels_to_skip`` and convert them separately. ``MEF3RecordingInterface.get_channel_sampling_frequencies``
 gives each channel's rate, reading one metadata file per channel, for a session recorded at several rates.
+Skipped channels still count towards the session: its start time is the earliest first block of any channel,
+skipped or not, and their records are kept. So one interface per rate, over complementary ``channels_to_skip``
+and written through one ``ConverterPipe``, puts every series on one timeline under one ``session_start_time``,
+writes the session's records once, and labels each rate's rows of the ``"runs"`` table with the rate, as MEF 2
+streams are.
 
 Gaps and timing
 ^^^^^^^^^^^^^^^
