@@ -24,13 +24,18 @@ decrypted whole. Of section 3 only its first two AES blocks are decrypted, which
 the daylight saving times and the GMT offset, and the four bytes of ``subject_name_1`` that share the second
 block are dropped at once; the rest of section 3 stays encrypted. Encrypted RED data blocks are not supported.
 
+A session's channels may be sampled at different rates, or recorded over different stretches of time (a
+continuous telemetry channel beside channels with gaps). They are grouped by rate and runs, each group being
+what one ElectricalSeries can hold; see :class:`MEF3ChannelGroup`. A segment that holds no data file and no
+index entry is left out.
+
 Times in MEF are microseconds since the Unix epoch (µUTC). A writer may store them offset by the session's
 recording time offset, marking such a time by making it negative; it is undone here as meflib undoes it on
 input (``remove_recording_time_offset``).
 """
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -183,13 +188,38 @@ class MEF3Record:
 
 
 @dataclass
-class MEF3Session:
-    """A MEF 3.0 session, as far as reading its samples needs."""
+class MEF3ChannelGroup:
+    """
+    Channels of a session that one ElectricalSeries can hold: sampled at one rate and recorded over the same
+    runs, in start time and samples.
+    """
 
-    path: Path
     channels: list[MEF3Channel]
     runs: list[MEF3Run]
     sampling_frequency: float
+
+    def describe(self) -> str:
+        names = ", ".join(channel.name for channel in self.channels[:5])
+        if len(self.channels) > 5:
+            names += f", ... ({len(self.channels)} channels)"
+        samples = [run.number_of_samples for run in self.runs[:5]]
+        return f"{self.sampling_frequency:g} Hz, {len(self.runs)} runs of {samples} samples: {names}"
+
+
+@dataclass
+class MEF3Session:
+    """
+    A MEF 3.0 session, as far as reading its samples needs.
+
+    Its channels fall into one or more :class:`MEF3ChannelGroup`, each of which one ElectricalSeries can
+    hold. :attr:`runs` and :attr:`sampling_frequency` are those of the only group, and raise when there are
+    several; :meth:`select_group` gives a session of one group.
+    """
+
+    path: Path
+    channels: list[MEF3Channel]
+    # The largest group first (most channels, then the highest rate), then in the order of their first channels.
+    channel_groups: list[MEF3ChannelGroup]
     gmt_offset: int | None  # seconds east of UTC, when the metadata gives one
     records: list[MEF3Record]
     lossy_blocks: dict[str, int]  # channel name to its number of scaled or detrended blocks
@@ -199,6 +229,51 @@ class MEF3Session:
     start_time: int
     # Every sampling rate in the session, skipped channels' included.
     session_sampling_frequencies: tuple[float, ...]
+
+    def _only_group(self) -> MEF3ChannelGroup:
+        if len(self.channel_groups) == 1:
+            return self.channel_groups[0]
+        described = "; ".join(f"({group.describe()})" for group in self.channel_groups)
+        raise ValueError(
+            f"The channels of the MEF 3 session '{self.path.name}' fall into {len(self.channel_groups)} groups "
+            f"that are sampled at different rates or were not recorded over the same stretches of time: "
+            f"{described}. An ElectricalSeries holds one group: MEF3RecordingInterface writes each as its own "
+            "series, or keep one with channels_to_skip."
+        )
+
+    @property
+    def runs(self) -> list[MEF3Run]:
+        """The runs of the session's only channel group."""
+        return self._only_group().runs
+
+    @property
+    def sampling_frequency(self) -> float:
+        """The sampling frequency of the session's only channel group."""
+        return self._only_group().sampling_frequency
+
+    def select_group(self, index: int) -> "MEF3Session":
+        """
+        The session as one of its channel groups: its channels, runs and lossy blocks, with the session's start
+        time, time zone and records.
+        """
+        group = self.channel_groups[index]
+        names = {channel.name for channel in group.channels}
+        lossy_blocks = {name: count for name, count in self.lossy_blocks.items() if name in names}
+        largest_scale_factor = max(
+            [1.0]
+            + [
+                float(channel.blocks["scale_factor"].max())
+                for channel in group.channels
+                if channel.name in lossy_blocks
+            ]
+        )
+        return replace(
+            self,
+            channels=list(group.channels),
+            channel_groups=[group],
+            lossy_blocks=lossy_blocks,
+            largest_scale_factor=largest_scale_factor,
+        )
 
     @property
     def start_datetime(self) -> datetime:
@@ -272,6 +347,29 @@ def _only_file(directory: Path, suffix: str) -> Path:
     if len(matches) != 1:
         raise ValueError(f"The MEF 3 segment directory '{directory}' holds {len(matches)} {suffix} files, not one.")
     return matches[0]
+
+
+def _is_empty_segment(segment_directory: Path) -> bool:
+    """
+    Whether a segment holds no data file and no index entry: one a writer opened and never wrote a block to.
+
+    A segment with no data file whose index lists blocks is not empty but broken, and is left for the reader
+    to refuse.
+    """
+    if any(segment_directory.glob("*.tdat")):
+        return False
+    indices = sorted(segment_directory.glob("*.tidx"))
+    if len(indices) > 1:
+        return False
+    return not indices or indices[0].stat().st_size < UNIVERSAL_HEADER_BYTES + TIME_SERIES_INDEX_BYTES
+
+
+def _data_segment_directories(channel_directory: Path) -> tuple[list[Path], list[Path]]:
+    """A channel's segment directories in segment order, as those that hold data and those that are empty."""
+    data, empty = [], []
+    for segment_directory in _segment_directories(channel_directory):
+        (empty if _is_empty_segment(segment_directory) else data).append(segment_directory)
+    return data, empty
 
 
 def _read_segment_metadata(path: Path, passwords: MEF3Passwords | None = None) -> dict:
@@ -398,10 +496,26 @@ def _read_block_index(index_path: Path, data_path: Path, recording_time_offset: 
 def _read_channel(
     channel_directory: Path, passwords: MEF3Passwords | None = None
 ) -> tuple[MEF3Channel, int, int | None]:
-    """A channel, its recording time offset and its GMT offset."""
-    segment_directories = _segment_directories(channel_directory)
-    if not segment_directories:
+    """
+    A channel, its recording time offset and its GMT offset.
+
+    Empty segments, with no data file and no index entry, are left out with a warning.
+    """
+    if not _segment_directories(channel_directory):
         raise ValueError(f"The MEF 3 channel directory '{channel_directory}' holds no .segd segment directories.")
+    segment_directories, empty_segments = _data_segment_directories(channel_directory)
+    if not segment_directories:
+        raise ValueError(
+            f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, with no data file and no "
+            "block in its index, so the channel holds no samples. Leave it out with channels_to_skip."
+        )
+    if empty_segments:
+        warnings.warn(
+            f"{len(empty_segments)} segments of the MEF 3 channel '{channel_directory.name}' hold no data file and "
+            f"no block in their index, and are left out: {', '.join(path.name for path in empty_segments[:5])}.",
+            UserWarning,
+            stacklevel=_stacklevel_outside_neuroconv(),
+        )
 
     channel_metadata = None
     data_paths, all_blocks = [], []
@@ -502,42 +616,78 @@ def group_blocks_into_runs(
     return runs, np.flatnonzero(unflagged_jump) + 1
 
 
-def _check_shared_layout(channels: list[MEF3Channel], sampling_frequency: float, session_path: Path) -> list[MEF3Run]:
-    """The runs of the session, which every channel must share: one electrodes table spans every series."""
-    reference = channels[0]
-    runs, unflagged_gaps = group_blocks_into_runs(reference.blocks, sampling_frequency)
-    reference.runs = runs
-    if unflagged_gaps.size:
-        jumps = [
-            (reference.blocks["start_time"][index] - reference.blocks["start_time"][index - 1]) / 1e6
-            - reference.blocks["number_of_samples"][index - 1] / sampling_frequency
-            for index in unflagged_gaps[:3]
-        ]
-        shown = ", ".join(f"block {index} ({jump:+.3f} s)" for index, jump in zip(unflagged_gaps, jumps))
-        warnings.warn(
-            f"The timestamps of the MEF 3 channel '{reference.name}' of '{session_path.name}' jump by more than a "
-            f"second at {unflagged_gaps.size} blocks that are not flagged as discontinuities: {shown}. Each is "
-            "taken as a gap and starts a new ElectricalSeries.",
-            UserWarning,
-            stacklevel=_stacklevel_outside_neuroconv(),
-        )
+def _warn_about_unflagged_gaps(channel: MEF3Channel, unflagged_gaps: np.ndarray, session_path: Path):
+    if not unflagged_gaps.size:
+        return
+    blocks, sampling_frequency = channel.blocks, channel.sampling_frequency
+    jumps = [
+        (blocks["start_time"][index] - blocks["start_time"][index - 1]) / 1e6
+        - blocks["number_of_samples"][index - 1] / sampling_frequency
+        for index in unflagged_gaps[:3]
+    ]
+    shown = ", ".join(f"block {index} ({jump:+.3f} s)" for index, jump in zip(unflagged_gaps, jumps))
+    warnings.warn(
+        f"The timestamps of the MEF 3 channel '{channel.name}' of '{session_path.name}' jump by more than a "
+        f"second at {unflagged_gaps.size} blocks that are not flagged as discontinuities: {shown}. Each is "
+        "taken as a gap and starts a new ElectricalSeries.",
+        UserWarning,
+        stacklevel=_stacklevel_outside_neuroconv(),
+    )
+
+
+def _same_runs(ours: list[MEF3Run], theirs: list[MEF3Run], sampling_frequency: float) -> bool:
+    """Whether two channels at one rate were recorded over the same runs: the same samples, starting within half a sample."""
     half_sample = 0.5e6 / sampling_frequency
-    for channel in channels[1:]:
-        channel_runs, _ = group_blocks_into_runs(channel.blocks, sampling_frequency)
-        channel.runs = channel_runs
-        same = len(channel_runs) == len(runs) and all(
-            ours.number_of_samples == theirs.number_of_samples
-            and abs(ours.start_time - theirs.start_time) < half_sample
-            for ours, theirs in zip(runs, channel_runs)
-        )
-        if not same:
-            raise ValueError(
-                f"The MEF 3 channels '{reference.name}' and '{channel.name}' of '{session_path.name}' were not recorded "
-                f"over the same stretches of time ({len(runs)} runs of {[run.number_of_samples for run in runs][:5]} "
-                f"samples against {len(channel_runs)} runs of {[run.number_of_samples for run in channel_runs][:5]}). "
-                "Convert them separately, leaving the others out with channels_to_skip."
+    return len(ours) == len(theirs) and all(
+        mine.number_of_samples == other.number_of_samples and abs(mine.start_time - other.start_time) < half_sample
+        for mine, other in zip(ours, theirs)
+    )
+
+
+def _group_channels(channels: list[MEF3Channel], session_path: Path) -> list[MEF3ChannelGroup]:
+    """
+    Group channels, in their order, by sampling rate and runs: each group is what one ElectricalSeries can hold.
+
+    Each channel's runs are found with :func:`group_blocks_into_runs`; a channel joins the first group at its
+    rate whose runs it shares, else starts its own. Unflagged gaps are warned about for each group's first
+    channel. Channels at one rate that fall into several groups are warned about too: they were recorded over
+    different stretches of time, which is how a session holds both a continuous channel and one with gaps.
+    """
+    groups: list[MEF3ChannelGroup] = []
+    for channel in channels:
+        runs, unflagged_gaps = group_blocks_into_runs(channel.blocks, channel.sampling_frequency)
+        channel.runs = runs
+        for group in groups:
+            if group.sampling_frequency == channel.sampling_frequency and _same_runs(
+                group.runs, runs, channel.sampling_frequency
+            ):
+                group.channels.append(channel)
+                break
+        else:
+            _warn_about_unflagged_gaps(channel, unflagged_gaps, session_path)
+            groups.append(
+                MEF3ChannelGroup(channels=[channel], runs=runs, sampling_frequency=channel.sampling_frequency)
             )
-    return runs
+
+    by_rate = {}
+    for group in groups:
+        by_rate.setdefault(group.sampling_frequency, []).append(group)
+    for rate, groups_at_rate in by_rate.items():
+        if len(groups_at_rate) > 1:
+            described = "; ".join(f"({group.describe()})" for group in groups_at_rate)
+            warnings.warn(
+                f"The MEF 3 channels of '{session_path.name}' sampled at {rate:g} Hz were not all recorded over the "
+                f"same stretches of time, so they are read as {len(groups_at_rate)} groups, each written as its own "
+                f"series: {described}.",
+                UserWarning,
+                stacklevel=_stacklevel_outside_neuroconv(),
+            )
+
+    position = {channel.name: index for index, channel in enumerate(channels)}
+    return sorted(
+        groups,
+        key=lambda group: (-len(group.channels), -group.sampling_frequency, position[group.channels[0].name]),
+    )
 
 
 def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int]:
@@ -650,9 +800,9 @@ def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_n
     None, with a warning, when they cannot be read: a channel may be skipped because it is unreadable.
     """
     try:
-        segment_directories = _segment_directories(directory)
+        segment_directories, _ = _data_segment_directories(directory)
         if not segment_directories:
-            raise ValueError("it holds no .segd segment directories")
+            raise ValueError("it holds no .segd segment directory with data")
         metadata = _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)
         # As _read_channel checks it: meflib's "no entry" is -1.0, and a dead channel is one a user skips.
         if not (np.isfinite(metadata["sampling_frequency"]) and metadata["sampling_frequency"] > 0):
@@ -692,9 +842,8 @@ def read_mef3_session(
     folder_path : str or Path
         The session's ``.mefd`` directory.
     channels_to_skip : list of str, optional
-        Names of channels to leave out. Their samples and data files are not read, so a channel sampled at
-        another rate, or over other stretches of time, can be dropped before the checks that every kept channel
-        agrees. Their first metadata file and their indices are still read, and their records kept, so the
+        Names of channels to leave out. Their samples and data files are not read. Their first metadata file
+        and their indices are still read, and their records kept, so the
         session's start time and records are the same whichever channels are skipped: readers of one session
         over complementary channels_to_skip (one per sampling rate, say) share one timeline and one set of
         records.
@@ -704,7 +853,10 @@ def read_mef3_session(
     Returns
     -------
     MEF3Session
-        Channels are in acquisition channel order when every channel gives a distinct one, else by name.
+        Channels are in acquisition channel order when every channel gives a distinct one, else by name. They
+        are grouped by sampling rate and runs into :attr:`MEF3Session.channel_groups`, each of which one
+        ElectricalSeries can hold; a session recorded at several rates, or whose channels were recorded over
+        different stretches of time, has several.
     """
     path = Path(folder_path)
     if not path.is_dir():
@@ -738,19 +890,9 @@ def read_mef3_session(
         [channel.name for channel in channels], [channel.acquisition_channel_number for channel in channels]
     )
     channels = [channels[index] for index in order]
-
-    rates = {}
-    for channel in channels:
-        rates.setdefault(channel.sampling_frequency, []).append(channel.name)
-    if len(rates) > 1:
-        described = "; ".join(f"{rate} Hz: {', '.join(names[:5])}" for rate, names in sorted(rates.items()))
-        raise ValueError(
-            f"The channels of the MEF 3 session '{path.name}' are sampled at {len(rates)} different rates ({described}). "
-            "An ElectricalSeries has one rate, so convert each rate separately, leaving the others out with "
-            "channels_to_skip."
-        )
-    sampling_frequency = channels[0].sampling_frequency
-    runs = _check_shared_layout(channels, sampling_frequency, path)
+    recording_time_offsets = [recording_time_offsets[index] for index in order]
+    gmt_offsets = [gmt_offsets[index] for index in order]
+    channel_groups = _group_channels(channels, path)
 
     skipped = {
         directory: summary
@@ -758,11 +900,16 @@ def read_mef3_session(
         if (summary := _skipped_channel(directory, passwords, path.name)) is not None
     }
     start_time = min(
-        [runs[0].start_time]
+        [group.runs[0].start_time for group in channel_groups]
         + [summary["first_block_start"] for summary in skipped.values() if summary["first_block_start"] is not None]
     )
     session_sampling_frequencies = tuple(
-        sorted({sampling_frequency, *(summary["sampling_frequency"] for summary in skipped.values())})
+        sorted(
+            {
+                *(group.sampling_frequency for group in channel_groups),
+                *(summary["sampling_frequency"] for summary in skipped.values()),
+            }
+        )
     )
 
     # The session-level records use the recording time offset the channels share; MEF 3 writers give every
@@ -804,8 +951,7 @@ def read_mef3_session(
     return MEF3Session(
         path=path,
         channels=channels,
-        runs=runs,
-        sampling_frequency=sampling_frequency,
+        channel_groups=channel_groups,
         gmt_offset=gmt_offsets[0],
         records=records,
         lossy_blocks=lossy_blocks,
@@ -827,15 +973,15 @@ def channel_sampling_frequencies(folder_path, passwords: MEF3Passwords | None = 
     """
     Each time series channel's sampling frequency, in Hz, in the order :func:`read_mef3_session` gives them.
 
-    Only the first segment's metadata file of each channel is read; ``passwords`` as for :func:`read_mef3_session`.
-    A session whose channels are sampled at several rates is converted one rate at a time, leaving the other
-    channels out with ``channels_to_skip``; this says which channels those are without reading any index.
+    Only the first metadata file of each channel is read, of its first segment that holds data; ``passwords``
+    as for :func:`read_mef3_session`. This says which channels are sampled at which rate without reading any
+    index, to choose channels to leave out with ``channels_to_skip``.
     """
     path = Path(folder_path)
     channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
     names, numbers, rates = [], [], []
     for directory in channel_directories:
-        segment_directories = _segment_directories(directory)
+        segment_directories = _data_segment_directories(directory)[0] or _segment_directories(directory)
         if not segment_directories:
             raise ValueError(f"The MEF 3 channel directory '{directory}' holds no .segd segment directories.")
         metadata = _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)

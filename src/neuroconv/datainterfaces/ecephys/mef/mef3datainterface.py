@@ -1,4 +1,6 @@
+import copy
 import warnings
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -9,7 +11,7 @@ from ._runs_table import add_runs_to_nwbfile
 from .._channel_ids import _stacklevel_outside_neuroconv
 from .._intervals_tables import add_rows_to_intervals_table
 from ..baserecordingextractorinterface import BaseRecordingExtractorInterface
-from ....utils import DeepDict
+from ....utils import DeepDict, dict_deep_update
 
 _SOURCE_FILE_DESCRIPTION = "Name of the MEF 3 .mefd session directory the row was read from."
 
@@ -17,14 +19,15 @@ _SOURCE_FILE_DESCRIPTION = "Name of the MEF 3 .mefd session directory the row wa
 _DEIDENTIFIED_BEFORE = datetime(1980, 1, 1, tzinfo=timezone.utc)
 
 
-def _rate_label(rate: float, rates: tuple[float, ...]) -> str:
+def _rate_label(rate: float, rates: tuple[float, ...], format_spec: str = "g") -> str:
     """
     A rate as the runs rows name it: ``1000`` for 1000.0 Hz, or the exact float when the short form would give
     two of the session's rates one label, since rows are written once per label and the second rate's would be
-    lost.
+    lost. Series names and metadata keys use it with ``format_spec=".10g"``, so they never take an exponent and
+    two rates never share a series.
     """
-    if len({f"{other:g}" for other in rates}) == len(rates):
-        return f"{rate:g}"
+    if len({format(other, format_spec) for other in rates}) == len(set(rates)):
+        return format(rate, format_spec)
     return str(float(rate))
 
 
@@ -42,6 +45,13 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
     EDF+ is. Each series uses the session's nominal sampling rate; a recording's clock drifts against it
     (by 28 ms over 55 minutes in ds004696), and the nominal rate is what puts the samples where BIDS event
     files, which count samples, place them.
+
+    A session whose channels are sampled at several rates, or were not all recorded over the same stretches
+    of time (a continuous channel beside channels with gaps, say), is read as several channel groups, each
+    of one rate and one set of runs, and each written as its own series on the session's one timeline:
+    ``ElectricalSeries_<rate>Hz``, with ``_<n>`` after it when several groups share a rate.
+    :meth:`split_by_channel_group` gives one interface per group, for a ``ConverterPipe`` or to align or
+    convert each on its own. A session with one group is written as before, as ``ElectricalSeries``.
 
     MEF records (notes, seizure and stimulation marks, ...) are written to a ``TimeIntervals`` table named
     ``"records"``, and the runs, when there is more than one, to one named ``"runs"``. Several sessions
@@ -108,9 +118,8 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         """
         Get each channel's sampling frequency, reading one metadata file per channel.
 
-        The interface converts channels of one rate together, so a session recorded at several rates (iEEG
-        beside pupil or audio channels, say) is converted one rate at a time, leaving the other channels out
-        with ``channels_to_skip``.
+        The interface writes each rate as its own series; this says which channels are at which rate without
+        reading any index, to choose channels to leave out with ``channels_to_skip``.
 
         Parameters
         ----------
@@ -138,13 +147,43 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         return MEF3RecordingExtractor
 
     def _initialize_extractor(self, interface_kwargs: dict):
-        self.extractor_kwargs = dict(
-            folder_path=interface_kwargs["folder_path"],
-            channels_to_skip=interface_kwargs.get("channels_to_skip"),
+        """
+        Read the session once and build one recording per channel group, returning this interface's own.
+
+        That is the first group's, or, for an interface from :meth:`split_by_channel_group`, its group's. The
+        recordings are kept from the first call, made by ``__init__``; later calls (``get_original_timestamps``)
+        only read the session again.
+        """
+        from ._mef3_crypto import MEF3Passwords
+        from ._mef3_reader import read_mef3_session
+
+        folder_path = interface_kwargs["folder_path"]
+        channels_to_skip = interface_kwargs.get("channels_to_skip")
+        self.extractor_kwargs = dict(folder_path=folder_path, channels_to_skip=channels_to_skip)
+        # The passwords go to the reader but not into extractor_kwargs, which describe the extractor to others.
+        passwords = MEF3Passwords.from_arguments(
+            *(interface_kwargs.get(key) for key in ("password", "level_1_password", "level_2_password"))
         )
-        # The passwords go to the extractor but not into extractor_kwargs, which describe the extractor to others.
-        passwords = {key: interface_kwargs.get(key) for key in ("password", "level_1_password", "level_2_password")}
-        return self.get_extractor_class()(**self.extractor_kwargs, **passwords)
+        session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
+
+        extractor_class = self.get_extractor_class()
+        extractors = []
+        for index in range(len(session.channel_groups)):
+            group_session = session.select_group(index) if len(session.channel_groups) > 1 else session
+            kept = {channel.name for channel in group_session.channels}
+            group_channels_to_skip = list(channels_to_skip or []) + [
+                channel.name for channel in session.channels if channel.name not in kept
+            ]
+            extractors.append(
+                extractor_class(
+                    folder_path=folder_path, channels_to_skip=group_channels_to_skip or None, _session=group_session
+                )
+            )
+        if not hasattr(self, "_group_extractors"):
+            self._group_extractors = extractors
+            self._channel_group_interfaces = None
+            self.mef3_session = session
+        return extractors[getattr(self, "_channel_group_index", 0)]
 
     def __init__(
         self,
@@ -192,9 +231,143 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         if metadata_key is None:
             self.metadata_key = "mef3_recording"
 
-        self.mef3_session = self.recording_extractor.mef3_session
+    @property
+    def _has_several_groups(self) -> bool:
+        return len(self._group_extractors) > 1
+
+    def split_by_channel_group(self) -> list["MEF3RecordingInterface"]:
+        """
+        One interface per channel group of the session: channels of one rate, recorded over the same runs.
+
+        A session with one group gives ``[self]``. Otherwise each interface holds one group's recording and is
+        given a distinct ``metadata_key`` and series name, ``<metadata_key>_<rate>Hz`` and
+        ``ElectricalSeries_<rate>Hz``, followed by ``_<n>`` when several groups share a rate, so they can be
+        written through one ``ConverterPipe``, or aligned and converted one by one. Every group is on the
+        session's timeline and carries its records, which only the first to reach a file writes; each group's
+        runs are labelled with its rate, and its number when several share it, in the ``"runs"`` table.
+
+        The interfaces are made once, from this interface's keys at the time, and share its recordings, so an
+        alignment applied to one applies wherever its recording is used.
+
+        Returns
+        -------
+        list of MEF3RecordingInterface
+            The largest group first: the most channels, then the highest rate.
+        """
+        if not self._has_several_groups:
+            return [self]
+        if self._channel_group_interfaces is None:
+            groups = self.mef3_session.channel_groups
+            groups_at_rate = Counter(group.sampling_frequency for group in groups)
+            numbered_at_rate = Counter()
+            series_name = getattr(self, "_split_series_name", None) or "ElectricalSeries"
+            interfaces = []
+            for index, (group, extractor) in enumerate(zip(groups, self._group_extractors)):
+                rate = group.sampling_frequency
+                rates = self.mef3_session.session_sampling_frequencies
+                suffix = f"{_rate_label(rate, rates, '.10g')}Hz"
+                label = f"{_rate_label(rate, rates)} Hz"
+                if groups_at_rate[rate] > 1:
+                    number = numbered_at_rate[rate]
+                    numbered_at_rate[rate] += 1
+                    # Zero-padded so the names stay distinct after neuroconv appends a run's index to them.
+                    suffix += f"_{number:0{len(str(groups_at_rate[rate] - 1))}}"
+                    label += f", group {number}"
+                interface = copy.copy(self)
+                interface.recording_extractor = extractor
+                interface._number_of_segments = extractor.get_num_segments()
+                interface._group_extractors = [extractor]
+                interface._channel_group_interfaces = None
+                interface._channel_group_index = index
+                interface._runs_label = label
+                interface.mef3_session = extractor.mef3_session
+                interface.metadata_key = f"{self.metadata_key}_{suffix}"
+                interface.es_key = f"{self.es_key}_{suffix}"
+                interface._split_series_name = f"{series_name}_{suffix}"
+                interfaces.append(interface)
+            self._channel_group_interfaces = interfaces
+        return list(self._channel_group_interfaces)
+
+    def split_by_offset(self) -> list[BaseRecordingExtractorInterface]:
+        """
+        Split by channel group (see :meth:`split_by_channel_group`), then each group by channel offset.
+
+        MEF 3 stores no offset, so a session's parts are its channel groups unless an offset has been set.
+        """
+        if not self._has_several_groups:
+            return super().split_by_offset()
+        # Each group's parts keep the group's name ahead of the offset's index, so parts of different groups
+        # do not collide.
+        return [
+            part
+            for group_interface in self.split_by_channel_group()
+            for part in BaseRecordingExtractorInterface.split_by_offset(group_interface)
+        ]
+
+    def _refuse_several_groups(self, action: str):
+        if self._has_several_groups:
+            raise NotImplementedError(
+                f"The MEF 3 session '{self.mef3_session.path.name}' is read as "
+                f"{len(self._group_extractors)} channel groups, each with its own rate or runs, so it cannot "
+                f"{action} as one recording. Use split_by_channel_group() and {action} for each group."
+            )
+
+    @property
+    def channel_ids(self):
+        """Gets the channel ids of the data: every group's, in the session's channel order."""
+        if self._has_several_groups:
+            return [channel.name for channel in self.mef3_session.channels]
+        return super().channel_ids
+
+    def remove_channels(self, channel_ids: list):
+        self._refuse_several_groups("remove channels")
+        return super().remove_channels(channel_ids=channel_ids)
+
+    def get_original_timestamps(self):
+        self._refuse_several_groups("give timestamps")
+        return super().get_original_timestamps()
+
+    def get_timestamps(self):
+        self._refuse_several_groups("give timestamps")
+        return super().get_timestamps()
+
+    def set_aligned_timestamps(self, aligned_timestamps):
+        self._refuse_several_groups("align timestamps")
+        super().set_aligned_timestamps(aligned_timestamps=aligned_timestamps)
+
+    def set_aligned_segment_timestamps(self, aligned_segment_timestamps):
+        self._refuse_several_groups("align timestamps")
+        super().set_aligned_segment_timestamps(aligned_segment_timestamps=aligned_segment_timestamps)
+
+    def set_aligned_segment_starting_times(self, aligned_segment_starting_times):
+        self._refuse_several_groups("align runs")
+        super().set_aligned_segment_starting_times(aligned_segment_starting_times=aligned_segment_starting_times)
+
+    def align_by_interpolation(self, unaligned_timestamps, aligned_timestamps):
+        self._refuse_several_groups("align timestamps")
+        super().align_by_interpolation(unaligned_timestamps=unaligned_timestamps, aligned_timestamps=aligned_timestamps)
+
+    def set_probe(self, probe, group_mode):
+        self._refuse_several_groups("take a probe")
+        super().set_probe(probe=probe, group_mode=group_mode)
+
+    def set_aligned_starting_time(self, aligned_starting_time: float):
+        """Shift every channel group by ``aligned_starting_time`` seconds, keeping them on one timeline."""
+        for interface in self.split_by_channel_group():
+            if interface is self:
+                super().set_aligned_starting_time(aligned_starting_time=aligned_starting_time)
+            else:
+                interface.set_aligned_starting_time(aligned_starting_time=aligned_starting_time)
 
     def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
+        if self._has_several_groups:
+            # Every group's series entry; the rest is the session's, the same from every group.
+            metadata = None
+            for interface in self.split_by_channel_group():
+                group_metadata = interface.get_metadata(use_new_metadata_format=use_new_metadata_format)
+                metadata = group_metadata if metadata is None else dict_deep_update(metadata, group_metadata)
+            return metadata
+
         metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
         session_start_time = self.mef3_session.start_datetime
         if session_start_time < _DEIDENTIFIED_BEFORE:
@@ -258,7 +431,27 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         write_runs : bool, default: True
             If True and the session has more than one uninterrupted run, the runs are written to a
             ``TimeIntervals`` table named ``"runs"``, or added to it as for the records.
+
+        A session read as several channel groups writes each group as its own series, with these options.
         """
+        if self._has_several_groups:
+            for interface in self.split_by_channel_group():
+                interface.add_to_nwbfile(
+                    nwbfile=nwbfile,
+                    metadata=metadata,
+                    stub_test=stub_test,
+                    write_as=write_as,
+                    parent_container=parent_container,
+                    data_representation=data_representation,
+                    write_electrical_series=write_electrical_series,
+                    iterator_type=iterator_type,
+                    iterator_options=iterator_options,
+                    always_write_timestamps=always_write_timestamps,
+                    write_records=write_records,
+                    write_runs=write_runs,
+                )
+            return
+
         # The full signature is redeclared rather than taking **conversion_options, because
         # get_conversion_options_schema is built from it.
         conversion_options = dict(
@@ -345,13 +538,13 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
 
     def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
         session = self.mef3_session
-        # A session at several rates is converted one rate at a time, whose runs differ; each rate's rows are
-        # written, labelled with the rate as MEF 2 streams are. The records are the session's, written once.
-        source_file = (
-            f"{session.path.name} ({_rate_label(session.sampling_frequency, session.session_sampling_frequencies)} Hz)"
-            if len(session.session_sampling_frequencies) > 1
-            else None
-        )
+        # A session at several rates, or in several channel groups, is written a group at a time, whose runs
+        # differ; each group's rows are written, labelled with its rate as MEF 2 streams are, and its number when
+        # several groups share the rate. The records are the session's, written once.
+        label = getattr(self, "_runs_label", None)
+        if label is None and len(session.session_sampling_frequencies) > 1:
+            label = f"{_rate_label(session.sampling_frequency, session.session_sampling_frequencies)} Hz"
+        source_file = f"{session.path.name} ({label})" if label else None
         add_runs_to_nwbfile(
             nwbfile,
             recording_extractor=self.recording_extractor,

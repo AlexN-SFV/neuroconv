@@ -42,11 +42,22 @@ used, which gives the same samples much more slowly.
     interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
 
 The samples are stored as the integer counts the file holds, with each channel's units conversion factor,
-in microvolts per count and with its sign, as the series' gain. All channels converted together must share a
-sampling rate and the stretches of time they were recorded over; leave the others out with
-``channels_to_skip`` and convert them separately. ``MEF3RecordingInterface.get_channel_sampling_frequencies``
-gives each channel's rate, reading one metadata file per channel, for a session recorded at several rates.
-Skipped channels still count towards the session: its start time is the earliest first block of any channel,
+in microvolts per count and with its sign, as the series' gain.
+
+An ``ElectricalSeries`` has one rate and one set of runs, so the channels are read in groups that share a
+sampling rate and the stretches of time they were recorded over, and each group is written as its own series
+into the one NWB file, on the session's timeline: a session of iEEG at 32 kHz beside eye-tracking channels at
+150 Hz, or of channels with gaps beside a continuously recorded telemetry channel, converts as it is. With
+several groups, each series is named ``ElectricalSeries_<rate>Hz``, with ``_<n>`` after it when several groups
+share a rate (``ElectricalSeries_1000Hz_0``, ``ElectricalSeries_1000Hz_1``), and a run's index after that when
+the group has gaps. Channels at one rate that fall into several groups are warned about.
+``interface.split_by_channel_group()`` gives one interface per group, each with its own ``metadata_key``, to
+write through a ``ConverterPipe`` or align on their own; ``split_by_offset()`` gives the same groups. A whole
+session can be aligned with ``set_aligned_starting_time``; aligning timestamps or single runs needs one group.
+
+Channels can still be converted separately, leaving the others out with ``channels_to_skip``.
+``MEF3RecordingInterface.get_channel_sampling_frequencies`` gives each channel's rate, reading one metadata
+file per channel. Skipped channels still count towards the session: its start time is the earliest first block of any channel,
 skipped or not, and their records are kept. So one interface per rate, over complementary ``channels_to_skip``
 and written through one ``ConverterPipe``, puts every series on one timeline under one ``session_start_time``,
 writes the session's records once, and labels each rate's rows of the ``"runs"`` table with the rate, as MEF 2
@@ -66,6 +77,9 @@ samples:
   segments with nothing missing between them is a single series;
 * an unflagged block whose start time is more than a second from where the previous block ended starts a new
   run, with a warning, since no clock drifts that far in one block.
+
+A segment with no data file and no block in its index, one a writer opened and never wrote to, is left out
+with a warning. A segment whose index lists blocks but which has no data file is refused.
 
 Block timestamps are not otherwise compared with sample counts: writers cut blocks on a fixed grid of times
 while the samples in them drift, so a continuous recording's timestamps disagree with its sample counts by a

@@ -9,12 +9,14 @@ from .._intervals_tables import add_rows_to_intervals_table
 RUNS_TABLE_NAME = "runs"
 RUNS_TABLE_DESCRIPTION = (
     "Uninterrupted runs of samples in recordings with gaps. Each run is written as its own ElectricalSeries, "
-    "positioned at the run's start time."
+    "positioned at the run's start time. A recording, or a channel group of one, that has a single run has no "
+    "rows: its series' starting time places it."
 )
 RUNS_COLUMNS = {"run_index": "0-based index of the uninterrupted run of samples within its recording."}
 RUNS_SOURCE_FILE_DESCRIPTION = (
     "Name of the MEF recording the row was read from: a MEF 3 .mefd session directory, or a MEF 2 directory of "
-    ".mef files, followed by the sampling rate in parentheses when the directory holds channels at several."
+    ".mef files, followed by the sampling rate in parentheses when the directory holds channels at several, "
+    "and by the channel group's number when channels at one rate were recorded over different stretches of time."
 )
 
 
