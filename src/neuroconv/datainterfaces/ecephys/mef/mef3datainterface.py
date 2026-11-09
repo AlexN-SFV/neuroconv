@@ -500,6 +500,14 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         rows = []
         for record in self.mef3_session.records:
             start_time = self._session_time(record.time)
+            # The other times the record states are placed on the same timeline, in seconds, so that no absolute
+            # time is written and every time in the file stays relative to session_start_time.
+            details = "; ".join(
+                part
+                for part in [record.details]
+                + [f"{name}_s={self._session_time(value):.6f}" for name, value in record.times.items()]
+                if part
+            )
             rows.append(
                 dict(
                     start_time=start_time,
@@ -508,7 +516,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                     stop_time=start_time + (record.duration / 1e6 if record.duration > 0 else sample_period),
                     record_type=record.record_type,
                     label=record.label,
-                    details=record.details,
+                    details=details,
                     duration_in_microseconds=record.duration,
                     channel=record.channel,
                 )
@@ -525,7 +533,11 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                     "The record's text: the note of a Note or SyLg, the annotation of an EDFA or Seiz, the stimulus "
                     "type of a CSti, the waveform of an ESti, the name of a Curs, the text of an Epoc."
                 ),
-                "details": "The record's other fields, as 'name=value' pairs separated by '; '.",
+                "details": (
+                    "The record's other fields, as 'name=value' pairs separated by '; '. A time the record states "
+                    "(a seizure's earliest onset, a cursor's trace time) is named with '_s' and given in seconds on "
+                    "the same timeline as start_time."
+                ),
                 "duration_in_microseconds": (
                     "The duration the record states, 0 for a record without one, which spans one sample here."
                 ),
