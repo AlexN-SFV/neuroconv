@@ -17,6 +17,17 @@ _SOURCE_FILE_DESCRIPTION = "Name of the MEF 3 .mefd session directory the row wa
 _DEIDENTIFIED_BEFORE = datetime(1980, 1, 1, tzinfo=timezone.utc)
 
 
+def _rate_label(rate: float, rates: tuple[float, ...]) -> str:
+    """
+    A rate as the runs rows name it: ``1000`` for 1000.0 Hz, or the exact float when the short form would give
+    two of the session's rates one label, since rows are written once per label and the second rate's would be
+    lost.
+    """
+    if len({f"{other:g}" for other in rates}) == len(rates):
+        return f"{rate:g}"
+    return str(float(rate))
+
+
 class MEF3RecordingInterface(BaseRecordingExtractorInterface):
     """
     Data interface class for converting MEF 3.0 sessions (Multiscale Electrophysiology Format, ``.mefd``).
@@ -282,10 +293,17 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             if time >= run.start_time:
                 run_index = index
         run = runs[run_index]
-        return self._run_start_time(run_index) + (time - run.start_time) / 1e6
+        # The run's shift from where the reader put it: 0.0 exactly unless the recording was aligned. Adding it
+        # to the time from the session's start, rather than going through the run's own start, gives the
+        # same float for a record whichever interface over the session writes it.
+        session_start = self.mef3_session.start_time
+        shift = self._run_start_time(run_index) - (run.start_time - session_start) / 1e6
+        return (time - session_start) / 1e6 + shift
 
     def _add_records_to_nwbfile(self, nwbfile: NWBFile):
-        sample_period = 1.0 / self.mef3_session.sampling_frequency
+        # The records table is the session's and is written once, by whichever interface over the session
+        # comes first, so an instant spans one sample of the session's fastest rate, not of that interface's.
+        sample_period = 1.0 / max(self.mef3_session.session_sampling_frequencies)
         rows = []
         for record in self.mef3_session.records:
             start_time = self._session_time(record.time)
@@ -330,7 +348,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         # A session at several rates is converted one rate at a time, whose runs differ; each rate's rows are
         # written, labelled with the rate as MEF 2 streams are. The records are the session's, written once.
         source_file = (
-            f"{session.path.name} ({session.sampling_frequency:g} Hz)"
+            f"{session.path.name} ({_rate_label(session.sampling_frequency, session.session_sampling_frequencies)} Hz)"
             if len(session.session_sampling_frequencies) > 1
             else None
         )
