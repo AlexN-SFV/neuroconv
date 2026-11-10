@@ -185,6 +185,9 @@ class MEF3Record:
     details: str
     duration: int  # µs, 0 for a record without one
     channel: str  # empty for a session-level record
+    # The times the record's body states besides its own (a seizure's earliest onset, a cursor's trace time), by
+    # name, as true µUTC. They are kept out of ``details`` so that a writer can place them on its own timeline.
+    times: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -690,9 +693,16 @@ def _group_channels(channels: list[MEF3Channel], session_path: Path) -> list[MEF
     )
 
 
-def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int]:
+def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int, dict[str, int]]:
     """
-    The label, details and duration (µs) of a record, from its body (``mefrec.h``, version 1.0 of each type).
+    The label, details, duration (µs) and body times of a record, from its body (``mefrec.h``, version 1.0 of
+    each type).
+
+    The body times are the µUTC times the body states (``Seiz`` ``earliest_onset`` and ``latest_offset``,
+    ``Curs`` ``trace_timestamp``), as stored: a time the recording time offset was applied to is negative, as
+    in every MEF 3 time field. They are returned apart from ``details``, which holds the other fields, so the
+    caller can recover their true value and place them on a timeline. A time stored as ``UUTC_NO_ENTRY`` or as
+    0 (a body its writer left zero-filled) is left out: it states no time.
 
     Types this does not know are kept with their type alone.
     """
@@ -707,23 +717,25 @@ def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int]:
     def join(**fields) -> str:
         return "; ".join(f"{name}={value}" for name, value in fields.items() if value not in ("", None))
 
+    def times(**fields) -> dict[str, int]:
+        return {name: value for name, value in fields.items() if value not in (UUTC_NO_ENTRY, 0)}
+
     if record_type in ("Note", "SyLg"):
-        return text(0), "", 0
+        return text(0), "", 0, {}
     if record_type == "EDFA":
-        return text(8), "", max(integer(0), 0)
+        return text(8), "", max(integer(0), 0), {}
     if record_type == "Seiz":
+        body_times = times(earliest_onset=integer(0), latest_offset=integer(8))
         details = join(
-            earliest_onset=integer(0),
-            latest_offset=integer(8),
             number_of_channels=integer(24, "<i4"),
             onset_code=integer(28, "<i4"),
             marker_name_1=text(32, 128),
             marker_name_2=text(160, 128),
         )
-        return text(288, 1024), details, max(integer(16), 0)
+        return text(288, 1024), details, max(integer(16), 0), body_times
     if record_type == "CSti":
         details = join(task_type=text(0, 64), patient_response=text(136, 64))
-        return text(72, 64), details, max(integer(64), 0)
+        return text(72, 64), details, max(integer(64), 0), {}
     if record_type == "ESti":
         amplitude_units = {1: "mA", 2: "V"}.get(integer(24, "<i4"), "")
         mode = {1: "current", 2: "voltage"}.get(integer(28, "<i4"), "")
@@ -735,16 +747,16 @@ def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int]:
             anode=text(160, 128),
             cathode=text(288, 128),
         )
-        return text(32, 128), details, 0
+        return text(32, 128), details, 0, {}
     if record_type == "Curs":
-        details = join(id_number=integer(0), trace_timestamp=integer(8), latency=integer(16), value=integer(24, "<f8"))
-        return text(32, 128), details, 0
+        details = join(id_number=integer(0), latency=integer(16), value=integer(24, "<f8"))
+        return text(32, 128), details, 0, times(trace_timestamp=integer(8))
     if record_type == "Epoc":
         details = join(id_number=integer(0), epoch_type=text(32, 32))
-        return text(64, 128), details, max(integer(24), 0)
+        return text(64, 128), details, max(integer(24), 0), {}
     if record_type == "LNTP":
-        return "", join(template_length=integer(0)), 0
-    return "", "", 0
+        return "", join(template_length=integer(0)), 0, {}
+    return "", "", 0, {}
 
 
 def _read_records(directory: Path, channel: str, recording_time_offset: int) -> tuple[list[MEF3Record], int]:
@@ -777,7 +789,7 @@ def _read_records(directory: Path, channel: str, recording_time_offset: int) -> 
             record_type = header[4:8].decode("ascii", errors="replace")
             body_bytes = _number(header, 12, "<u4")
             record_body = raw_data[offset + RECORD_HEADER_BYTES : offset + RECORD_HEADER_BYTES + body_bytes]
-            label, details, duration = _record_body_fields(record_type, record_body)
+            label, details, duration, body_times = _record_body_fields(record_type, record_body)
             records.append(
                 MEF3Record(
                     time=_true_time(_number(header, 16, "<i8"), recording_time_offset),
@@ -786,6 +798,7 @@ def _read_records(directory: Path, channel: str, recording_time_offset: int) -> 
                     details=details,
                     duration=duration,
                     channel=channel,
+                    times={name: _true_time(value, recording_time_offset) for name, value in body_times.items()},
                 )
             )
     return records, encrypted

@@ -6,7 +6,9 @@ also stored in ``expected.json`` what pymef reads from them. pymef is not needed
 
 import hashlib
 import json
+import re
 import shutil
+import struct
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +22,11 @@ from neuroconv.datainterfaces import MEF3RecordingInterface
 from neuroconv.datainterfaces.ecephys.mef._mef3_extractor import (
     MEF3RecordingExtractor,
 )
-from neuroconv.datainterfaces.ecephys.mef._mef3_reader import read_mef3_session
+from neuroconv.datainterfaces.ecephys.mef._mef3_reader import (
+    UUTC_NO_ENTRY,
+    _record_body_fields,
+    read_mef3_session,
+)
 from neuroconv.datainterfaces.ecephys.mef._red import (
     MEF3_RED_LAYOUT,
     NUMBA_AVAILABLE,
@@ -274,6 +280,13 @@ class TestReader:
         assert (by_type["EDFA"].label, by_type["EDFA"].duration) == ("artifact", 1_500_000)
         assert (by_type["Seiz"].label, by_type["Seiz"].duration) == ("focal onset", 500_000)
         assert "marker_name_1=m1" in by_type["Seiz"].details
+        # The body's own times are kept apart from the details, as true µUTC.
+        assert by_type["Seiz"].times == {
+            "earliest_onset": session.start_time + 300_000,
+            "latest_offset": session.start_time + 800_000,
+        }
+        assert "earliest_onset" not in by_type["Seiz"].details and "latest_offset" not in by_type["Seiz"].details
+        assert all(not record.times for record in session.records if record.record_type != "Seiz")
         assert (by_type["CSti"].label, by_type["CSti"].duration) == ("picture", 250_000)
         assert "task_type=naming" in by_type["CSti"].details
         assert by_type["ESti"].label == "biphasic"
@@ -412,6 +425,10 @@ class TestInterface:
             np.testing.assert_allclose(records["stop_time"], [0.101, 0.8, 1.235, 1.75, 4.0])
             assert list(records["channel"]) == ["", "Cz", "Cz", "Cz", ""]
             assert set(records["source_file"]) == {"gapped.mefd"}
+            # A time the record states is written on the same timeline as start_time, never as µUTC.
+            seizure_details = records["details"][records["record_type"] == "Seiz"].iloc[0]
+            assert "earliest_onset_s=0.300000" in seizure_details and "latest_offset_s=0.800000" in seizure_details
+            assert not any(re.search(r"\d{10,}", details) for details in records["details"])
 
             runs = nwbfile.intervals["runs"].to_dataframe()
             assert list(runs["start_time"]) == [0.0, 4.0]
@@ -428,6 +445,10 @@ class TestInterface:
         np.testing.assert_allclose(series_starts, [10.0, 18.5])
         # The Note is 0.1 s into the first run.
         assert nwbfile.intervals["records"]["start_time"][0] == pytest.approx(10.1)
+        # The seizure's stated times move with it.
+        records = nwbfile.intervals["records"].to_dataframe()
+        seizure_details = records["details"][records["record_type"] == "Seiz"].iloc[0]
+        assert "earliest_onset_s=10.300000" in seizure_details and "latest_offset_s=10.800000" in seizure_details
 
     def test_tables_can_be_left_out(self):
         interface = MEF3RecordingInterface(folder_path=GAPPED)
@@ -880,3 +901,44 @@ class TestGappedMEF3RecordingInterfaceContract(RecordingExtractorInterfaceTestMi
 
     def check_extracted_metadata(self, metadata: dict):
         assert metadata["NWBFile"]["session_start_time"] == datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+class TestRecordBodyTimes:
+    """The times a record body states are returned apart from its details."""
+
+    @staticmethod
+    def _cursor_body(trace_timestamp: int) -> bytes:
+        name = b"cursor one".ljust(128, b"\0")
+        return struct.pack("<qqqd", 7, trace_timestamp, 250, 1.5) + name
+
+    def test_a_cursor_trace_time_is_a_body_time(self):
+        label, details, duration, times = _record_body_fields("Curs", self._cursor_body(123_456_789_000_000))
+        assert (label, duration) == ("cursor one", 0)
+        assert details == "id_number=7; latency=250; value=1.5"
+        assert times == {"trace_timestamp": 123_456_789_000_000}
+
+    def test_a_time_with_no_entry_is_left_out(self):
+        _, details, _, times = _record_body_fields("Curs", self._cursor_body(UUTC_NO_ENTRY))
+        assert times == {} and "trace_timestamp" not in details
+
+    def test_a_zero_filled_time_is_left_out(self):
+        _, _, _, times = _record_body_fields("Curs", self._cursor_body(0))
+        assert times == {}
+        seizure = bytes(1312)  # a Seiz body its writer left zero-filled
+        label, details, duration, times = _record_body_fields("Seiz", seizure)
+        assert times == {} and "earliest_onset" not in details and "latest_offset" not in details
+
+    def test_a_stated_time_before_the_session_is_not_written(self):
+        interface = MEF3RecordingInterface(folder_path=GAPPED)
+        seizure = next(record for record in interface.mef3_session.records if record.record_type == "Seiz")
+        seizure.times["earliest_onset"] = interface.mef3_session.start_time - 1
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        details = records["details"][records["record_type"] == "Seiz"].iloc[0]
+        assert "earliest_onset_s" not in details and "latest_offset_s=0.800000" in details
+        assert not any(re.search(r"-\d", cell) for cell in records["details"])
+
+    def test_types_without_body_times(self):
+        assert _record_body_fields("Note", b"a note\0")[3] == {}
+        assert _record_body_fields("Unkn", b"")[3] == {}
