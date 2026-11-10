@@ -501,11 +501,17 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         for record in self.mef3_session.records:
             start_time = self._session_time(record.time)
             # The other times the record states are placed on the same timeline, in seconds, so that no absolute
-            # time is written and every time in the file stays relative to session_start_time.
+            # time is written and every time in the file stays relative to session_start_time. A stated time
+            # before the session started is not a time of this recording (a placeholder, or the clock of another
+            # one) and would only write the session's own start back, negated, so it is left out.
             details = "; ".join(
                 part
                 for part in [record.details]
-                + [f"{name}_s={self._session_time(value):.6f}" for name, value in record.times.items()]
+                + [
+                    f"{name}_s={self._session_time(value):.6f}"
+                    for name, value in record.times.items()
+                    if value >= self.mef3_session.start_time
+                ]
                 if part
             )
             rows.append(

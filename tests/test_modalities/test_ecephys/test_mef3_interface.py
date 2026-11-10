@@ -921,6 +921,24 @@ class TestRecordBodyTimes:
         _, details, _, times = _record_body_fields("Curs", self._cursor_body(UUTC_NO_ENTRY))
         assert times == {} and "trace_timestamp" not in details
 
+    def test_a_zero_filled_time_is_left_out(self):
+        _, _, _, times = _record_body_fields("Curs", self._cursor_body(0))
+        assert times == {}
+        seizure = bytes(1312)  # a Seiz body its writer left zero-filled
+        label, details, duration, times = _record_body_fields("Seiz", seizure)
+        assert times == {} and "earliest_onset" not in details and "latest_offset" not in details
+
+    def test_a_stated_time_before_the_session_is_not_written(self):
+        interface = MEF3RecordingInterface(folder_path=GAPPED)
+        seizure = next(record for record in interface.mef3_session.records if record.record_type == "Seiz")
+        seizure.times["earliest_onset"] = interface.mef3_session.start_time - 1
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        details = records["details"][records["record_type"] == "Seiz"].iloc[0]
+        assert "earliest_onset_s" not in details and "latest_offset_s=0.800000" in details
+        assert not any(re.search(r"-\d", cell) for cell in records["details"])
+
     def test_types_without_body_times(self):
         assert _record_body_fields("Note", b"a note\0")[3] == {}
         assert _record_body_fields("Unkn", b"")[3] == {}

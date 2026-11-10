@@ -701,8 +701,8 @@ def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int, d
     The body times are the µUTC times the body states (``Seiz`` ``earliest_onset`` and ``latest_offset``,
     ``Curs`` ``trace_timestamp``), as stored: a time the recording time offset was applied to is negative, as
     in every MEF 3 time field. They are returned apart from ``details``, which holds the other fields, so the
-    caller can recover their true value and place them on a timeline. A time stored as ``UUTC_NO_ENTRY`` is
-    left out.
+    caller can recover their true value and place them on a timeline. A time stored as ``UUTC_NO_ENTRY`` or as
+    0 (a body its writer left zero-filled) is left out: it states no time.
 
     Types this does not know are kept with their type alone.
     """
@@ -718,7 +718,7 @@ def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int, d
         return "; ".join(f"{name}={value}" for name, value in fields.items() if value not in ("", None))
 
     def times(**fields) -> dict[str, int]:
-        return {name: value for name, value in fields.items() if value != UUTC_NO_ENTRY}
+        return {name: value for name, value in fields.items() if value not in (UUTC_NO_ENTRY, 0)}
 
     if record_type in ("Note", "SyLg"):
         return text(0), "", 0, {}
