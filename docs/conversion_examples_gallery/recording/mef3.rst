@@ -98,6 +98,12 @@ and segment level are written to a ``TimeIntervals`` table named ``"records"``, 
 text in the ``label`` column, its other fields in ``details``, and its channel. Pass ``write_records=False``
 as a conversion option to leave them out.
 
+Some writers store their records offset by the session's start rather than by the recording time offset the
+blocks are stored against. Read the MEF 3 way, such records would all fall far outside the session. A record
+file whose times all fit the session when read from its start, and none of which fits it when read with the
+recording time offset (by more than the session's length), is read from the start, with a warning saying how
+many records were. Any other file is read as stored.
+
 A writer can store RED blocks lossily, scaled by a factor or with a fitted line subtracted. Such blocks are
 decoded as meflib decodes them, with a warning saying how many there are and the largest scale factor, since
 the precision lost when the file was written cannot be recovered.
