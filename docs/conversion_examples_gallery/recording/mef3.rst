@@ -102,7 +102,9 @@ Some writers store their records offset by the session's start rather than by th
 blocks are stored against. Read the MEF 3 way, such records would all fall far outside the session. A record
 file whose times all fit the session when read from its start, and none of which fits it when read with the
 recording time offset (by more than the session's length), is read from the start, with a warning saying how
-many records were. Any other file is read as stored.
+many records were. Any other file is read as stored. A record time stored as 0 is the time its file counts
+from (meflib stores a time equal to the recording time offset as 0), and a record that states no time
+(``UUTC_NO_ENTRY``) is left out of the table with a warning.
 
 A writer can store RED blocks lossily, scaled by a factor or with a fitted line subtracted. Such blocks are
 decoded as meflib decodes them, with a warning saying how many there are and the largest scale factor, since

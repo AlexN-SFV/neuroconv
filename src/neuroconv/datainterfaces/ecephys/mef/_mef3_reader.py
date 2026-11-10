@@ -790,7 +790,9 @@ def _records_clock(stored_times: np.ndarray, recording_time_offset: int, session
         return recording_time_offset
     start, end = session_span
     length = end - start
-    as_stated = _true_time(stored_times, recording_time_offset)
+    # A time stored as 0 is the recording time offset itself (_records_true_times), so an offset near the start
+    # keeps a file of zeros as stored.
+    as_stated = _records_true_times(stored_times, recording_time_offset)
     from_start = -stored_times + start
     apart = (as_stated < start - length) | (as_stated > end + length + _SESSION_CLOCK_TOLERANCE)
     if np.all(apart) and np.all(from_start <= end + _SESSION_CLOCK_TOLERANCE):
@@ -798,17 +800,17 @@ def _records_clock(stored_times: np.ndarray, recording_time_offset: int, session
     return recording_time_offset
 
 
-def _records_true_times(stored_times, clock: int, recording_time_offset: int):
+def _records_true_times(stored_times, clock: int):
     """
-    The true µUTC times of a record file's stored times, read with ``clock`` (see :func:`_records_clock`). When
-    the file counts from the session's start, a time stored as 0 is that start itself. Works on scalars and on
+    The true µUTC times of a record file's stored times, read with ``clock``: the recording time offset, or the
+    session's start (see :func:`_records_clock`). A time stored as 0 is the clock itself: meflib's
+    ``apply_recording_time_offset`` stores a time ``t`` as ``-(t - offset)``, so a record written at the offset
+    is stored as 0, which its ``remove_recording_time_offset`` would read as the epoch. Works on scalars and on
     int64 arrays alike.
     """
     true_times = _true_time(stored_times, clock)
-    if clock == recording_time_offset:
-        return true_times
     stored = np.asarray(stored_times, dtype=np.int64)
-    true_times = np.where(stored == 0, clock, true_times)
+    true_times = np.where(stored == 0, 0 if clock == UUTC_NO_ENTRY else clock, true_times)
     return true_times if true_times.ndim else int(true_times)
 
 
@@ -853,7 +855,7 @@ def _read_records(
         clock = _records_clock(stored_times, recording_time_offset, session_span)
         if clock != recording_time_offset:
             records_from_start += len(readable)
-        true_times = _records_true_times(stored_times, clock, recording_time_offset)
+        true_times = _records_true_times(stored_times, clock)
 
         for (offset, header), true_time in zip(readable, true_times):
             record_type = header[4:8].decode("ascii", errors="replace")
@@ -868,10 +870,7 @@ def _read_records(
                     details=details,
                     duration=duration,
                     channel=channel,
-                    times={
-                        name: _records_true_times(value, clock, recording_time_offset)
-                        for name, value in body_times.items()
-                    },
+                    times={name: _records_true_times(value, clock) for name, value in body_times.items()},
                 )
             )
     return records, encrypted, records_from_start

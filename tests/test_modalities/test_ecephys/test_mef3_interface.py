@@ -1102,6 +1102,36 @@ class TestRecordsOffsetByTheSessionStart:
         assert seizure.time == UUTC_NO_ENTRY  # no time stated, returned as meflib returns it
         assert seizure.times == expected["Seiz"]
 
+    def test_a_record_with_no_time_is_left_out_of_the_table(self, gapped_copy):
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - self.FAR_OFFSET), {"Seiz": UUTC_NO_ENTRY})
+        interface = MEF3RecordingInterface(folder_path=gapped_copy)
+        nwbfile = mock_NWBFile()
+        with pytest.warns(UserWarning, match=r"^1 records .* state no time"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        assert list(records["record_type"]) == ["Note", "ESti", "CSti", "EDFA"]
+        np.testing.assert_allclose(records["start_time"], [0.1, 1.234, 1.5, 2.5])
+
+    def test_a_file_of_records_stored_as_0_stays_on_an_offset_near_the_start(self, gapped_copy):
+        """A record stored as 0 is at the recording time offset, as meflib's writer means it: 1 s before the session
+        with the fixtures' offset. The two readings are then a second apart, so the file is not moved."""
+        fixture_offset = START_TIME - 1_000_000
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - fixture_offset), {"Seiz": 0})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy)
+        seizure = next(record for record in session.records if record.record_type == "Seiz")
+        assert seizure.time == fixture_offset
+        assert seizure.times == {"earliest_onset": START_TIME + 300_000, "latest_offset": START_TIME + 800_000}
+        interface = MEF3RecordingInterface(folder_path=gapped_copy)
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        seizure_row = records[records["record_type"] == "Seiz"].iloc[0]
+        assert seizure_row["start_time"] == pytest.approx(-1.0)
+        assert "latest_offset_s=0.800000" in seizure_row["details"]
+
     def test_no_entry_is_returned_as_it_is(self):
         assert _true_time(UUTC_NO_ENTRY, START_TIME) == UUTC_NO_ENTRY
         assert _true_time(np.array([UUTC_NO_ENTRY, -5], dtype=np.int64), 10).tolist() == [UUTC_NO_ENTRY, 15]
