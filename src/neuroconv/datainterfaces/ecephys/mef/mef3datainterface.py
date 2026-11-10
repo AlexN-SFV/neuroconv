@@ -494,11 +494,24 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         return (time - session_start) / 1e6 + shift
 
     def _add_records_to_nwbfile(self, nwbfile: NWBFile):
+        from ._mef3_reader import UUTC_NO_ENTRY
+
         # The records table is the session's and is written once, by whichever interface over the session
         # comes first, so an instant spans one sample of the session's fastest rate, not of that interface's.
         sample_period = 1.0 / max(self.mef3_session.session_sampling_frequencies)
         rows = []
+        # A record whose own time is "no entry" states no time to place it at, so it is left out.
+        untimed = [record for record in self.mef3_session.records if record.time == UUTC_NO_ENTRY]
+        if untimed:
+            warnings.warn(
+                f"{len(untimed)} records of the MEF 3 session '{self.mef3_session.path.name}' state no time "
+                "(UUTC_NO_ENTRY) and are left out of the records table.",
+                UserWarning,
+                stacklevel=_stacklevel_outside_neuroconv(),
+            )
         for record in self.mef3_session.records:
+            if record.time == UUTC_NO_ENTRY:
+                continue
             start_time = self._session_time(record.time)
             # The other times the record states are placed on the same timeline, in seconds, so that no absolute
             # time is written and every time in the file stays relative to session_start_time. A stated time
@@ -527,6 +540,8 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                     channel=record.channel,
                 )
             )
+        if not rows:
+            return
         add_rows_to_intervals_table(
             nwbfile=nwbfile,
             file_path=self.mef3_session.path,

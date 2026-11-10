@@ -25,6 +25,7 @@ from neuroconv.datainterfaces.ecephys.mef._mef3_extractor import (
 from neuroconv.datainterfaces.ecephys.mef._mef3_reader import (
     UUTC_NO_ENTRY,
     _record_body_fields,
+    _true_time,
     read_mef3_session,
 )
 from neuroconv.datainterfaces.ecephys.mef._red import (
@@ -942,3 +943,195 @@ class TestRecordBodyTimes:
     def test_types_without_body_times(self):
         assert _record_body_fields("Note", b"a note\0")[3] == {}
         assert _record_body_fields("Unkn", b"")[3] == {}
+
+
+def move_recording_time_offset(session_path: Path, new_offset: int):
+    """
+    Give every segment the recording time offset ``new_offset`` and re-store every block start time against it,
+    so the session reads exactly as before (the fixtures are not encrypted).
+    """
+    for metadata_path in session_path.rglob("*.tmet"):
+        metadata = bytearray(metadata_path.read_bytes())
+        old_offset = int(np.frombuffer(bytes(metadata[13312:13320]), dtype="<i8")[0])  # recording_time_offset
+        metadata[13312:13320] = np.int64(new_offset).tobytes()
+        metadata_path.write_bytes(bytes(metadata))
+        # A stored magnitude is the true time minus the offset.
+        rewrite_index_start_times(metadata_path.with_suffix(".tidx"), lambda times: times + (old_offset - new_offset))
+
+
+def restore_record_times(session_path: Path, store, stored_record_times: dict | None = None):
+    """
+    Re-store the time of every record of a copy of the gapped fixture, and every time a Seiz body states, as
+    ``store(true_time)``, given the true times the fixture holds. ``stored_record_times`` gives, by record type
+    (each is used once in the fixture), a record's own stored time instead.
+    """
+    true_times = {
+        (record.channel, record.record_type, record.label): record for record in read_mef3_session(GAPPED).records
+    }
+    for index_path in session_path.rglob("*.ridx"):
+        index = bytearray(index_path.read_bytes())
+        data = bytearray(index_path.with_suffix(".rdat").read_bytes())
+        channel = "" if index_path.parent == session_path else index_path.parent.name.split(".")[0].split("-")[0]
+        for entry in range(1024, len(index) - len(index) % 24, 24):
+            offset = int(np.frombuffer(bytes(index[entry + 8 : entry + 16]), dtype="<i8")[0])
+            record_type = bytes(data[offset + 4 : offset + 8]).decode()
+            label, _, _, _ = _record_body_fields(record_type, bytes(data[offset + 24 :]))
+            record = true_times[(channel, record_type, label)]
+            stored = (stored_record_times or {}).get(record_type)
+            stored = np.int64(store(record.time) if stored is None else stored).tobytes()
+            index[entry + 16 : entry + 24] = stored
+            data[offset + 16 : offset + 24] = stored
+            for name, body_offset in (("earliest_onset", 0), ("latest_offset", 8)):
+                if name in record.times:
+                    position = offset + 24 + body_offset
+                    data[position : position + 8] = np.int64(store(record.times[name])).tobytes()
+        index_path.write_bytes(bytes(index))
+        index_path.with_suffix(".rdat").write_bytes(bytes(data))
+
+
+class TestRecordsOffsetByTheSessionStart:
+    """
+    A writer may store its records offset by the session's start rather than by the recording time offset its
+    blocks are stored against. Read as MEF 3 has them, with an offset decades before the session, every record
+    would fall decades before it too, and on the session timeline each would be minus the session's start.
+    """
+
+    FAR_OFFSET = START_TIME - 25 * 365 * 86_400_000_000  # an offset 25 years before the session
+
+    def expected(self):
+        return [
+            (record.time, record.record_type, record.channel, record.times)
+            for record in read_mef3_session(GAPPED).records
+        ]
+
+    def test_they_are_read_from_the_session_start(self, gapped_copy):
+        expected = self.expected()
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - START_TIME))
+        with pytest.warns(UserWarning, match=r"5 records .* offset by the session's start"):
+            session = read_mef3_session(gapped_copy)
+        assert session.start_time == START_TIME
+        assert [(r.time, r.record_type, r.channel, r.times) for r in session.records] == expected
+
+    def test_a_record_stored_as_0_is_at_the_session_start(self, gapped_copy):
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(
+            gapped_copy, lambda true_time: -(true_time - START_TIME) if true_time != START_TIME + 100_000 else 0
+        )
+        with pytest.warns(UserWarning, match="offset by the session's start"):
+            session = read_mef3_session(gapped_copy)
+        note = next(record for record in session.records if record.record_type == "Note")
+        assert note.time == START_TIME
+
+    def test_records_stored_against_the_recording_time_offset_are_read_with_it(self, gapped_copy):
+        expected = self.expected()
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - self.FAR_OFFSET))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy)
+        assert [(r.time, r.record_type, r.channel, r.times) for r in session.records] == expected
+
+    def test_a_file_that_does_not_fit_the_session_from_its_start_is_read_as_stored(self, gapped_copy):
+        # One record 10 s past the session's end: read from the start, not every record falls within the session.
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        late = START_TIME + 2_500_000  # the EDFA, a session-level record
+        restore_record_times(
+            gapped_copy, lambda true_time: -(true_time - START_TIME) - (10_000_000 if true_time == late else 0)
+        )
+        # The decision is each record file's own: the channel and segment files still fit, and are read from it.
+        with pytest.warns(UserWarning, match=r"^3 records .* offset by the session's start"):
+            session = read_mef3_session(gapped_copy)
+        session_level = [record for record in session.records if not record.channel]
+        assert len(session_level) == 2 and all(record.time < START_TIME for record in session_level)
+
+    def test_on_the_session_timeline(self, gapped_copy):
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - START_TIME))
+        with pytest.warns(UserWarning, match="offset by the session's start"):
+            interface = MEF3RecordingInterface(folder_path=gapped_copy)
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        np.testing.assert_allclose(records["start_time"], [0.1, 0.3, 1.234, 1.5, 2.5])
+        seizure_details = records["details"][records["record_type"] == "Seiz"].iloc[0]
+        assert "earliest_onset_s=0.300000" in seizure_details and "latest_offset_s=0.800000" in seizure_details
+
+    def test_complementary_channel_skips_read_the_same_records(self, gapped_copy):
+        """The span's end is taken over skipped channels too, so which channels are kept cannot change the records."""
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        # EKG's second segment 5 s later: EKG runs to 10 s, Cz and Fp1 to 5 s.
+        rewrite_index_start_times(
+            gapped_copy / "EKG.timd" / "EKG-000001.segd" / "EKG-000001.tidx", lambda t: t + 5_000_000
+        )
+        late_edfa = -9_500_000  # the session-level EDFA, 9.5 s after the start: within EKG's span only
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - START_TIME), {"EDFA": late_edfa})
+        read = {}
+        for skip in (["EKG"], ["Cz", "Fp1"]):
+            with pytest.warns(UserWarning, match=r"^5 records .* offset by the session's start"):
+                session = read_mef3_session(gapped_copy, channels_to_skip=skip)
+            read[tuple(skip)] = [(r.time, r.record_type, r.channel, r.times) for r in session.records]
+        assert read[("EKG",)] == read[("Cz", "Fp1")]
+        edfa = next(record for record in read[("EKG",)] if record[1] == "EDFA")
+        assert edfa[0] == START_TIME + 9_500_000
+
+    def test_records_just_before_the_first_sample_stay_as_stored(self, gapped_copy):
+        """With the offset 1 s before the first sample, as the fixtures have it, the two readings are a second apart:
+        a Seiz stored at its true time 0.5 s before the session stays there, and nothing warns."""
+        fixture_offset = START_TIME - 1_000_000
+        restore_record_times(
+            gapped_copy,
+            lambda true_time: -(true_time - fixture_offset),
+            {"Seiz": -((START_TIME - 500_000) - fixture_offset)},
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy)
+        seizure = next(record for record in session.records if record.record_type == "Seiz")
+        assert seizure.time == START_TIME - 500_000
+        assert seizure.times == {"earliest_onset": START_TIME + 300_000, "latest_offset": START_TIME + 800_000}
+
+    def test_a_time_stored_as_no_entry_does_not_move_a_file(self, gapped_copy):
+        expected = {r.record_type: r.times for r in read_mef3_session(GAPPED).records}
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - self.FAR_OFFSET), {"Seiz": UUTC_NO_ENTRY})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy)
+        seizure = next(record for record in session.records if record.record_type == "Seiz")
+        assert seizure.time == UUTC_NO_ENTRY  # no time stated, returned as meflib returns it
+        assert seizure.times == expected["Seiz"]
+
+    def test_a_record_with_no_time_is_left_out_of_the_table(self, gapped_copy):
+        move_recording_time_offset(gapped_copy, self.FAR_OFFSET)
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - self.FAR_OFFSET), {"Seiz": UUTC_NO_ENTRY})
+        interface = MEF3RecordingInterface(folder_path=gapped_copy)
+        nwbfile = mock_NWBFile()
+        with pytest.warns(UserWarning, match=r"^1 records .* state no time"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        assert list(records["record_type"]) == ["Note", "ESti", "CSti", "EDFA"]
+        np.testing.assert_allclose(records["start_time"], [0.1, 1.234, 1.5, 2.5])
+
+    def test_a_file_of_records_stored_as_0_stays_on_an_offset_near_the_start(self, gapped_copy):
+        """A record stored as 0 is at the recording time offset, as meflib's writer means it: 1 s before the session
+        with the fixtures' offset. The two readings are then a second apart, so the file is not moved."""
+        fixture_offset = START_TIME - 1_000_000
+        restore_record_times(gapped_copy, lambda true_time: -(true_time - fixture_offset), {"Seiz": 0})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy)
+        seizure = next(record for record in session.records if record.record_type == "Seiz")
+        assert seizure.time == fixture_offset
+        assert seizure.times == {"earliest_onset": START_TIME + 300_000, "latest_offset": START_TIME + 800_000}
+        interface = MEF3RecordingInterface(folder_path=gapped_copy)
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        records = nwbfile.intervals["records"].to_dataframe()
+        seizure_row = records[records["record_type"] == "Seiz"].iloc[0]
+        assert seizure_row["start_time"] == pytest.approx(-1.0)
+        assert "latest_offset_s=0.800000" in seizure_row["details"]
+
+    def test_no_entry_is_returned_as_it_is(self):
+        assert _true_time(UUTC_NO_ENTRY, START_TIME) == UUTC_NO_ENTRY
+        assert _true_time(np.array([UUTC_NO_ENTRY, -5], dtype=np.int64), 10).tolist() == [UUTC_NO_ENTRY, 15]
