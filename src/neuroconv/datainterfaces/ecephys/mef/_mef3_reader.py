@@ -759,9 +759,43 @@ def _record_body_fields(record_type: str, body: bytes) -> tuple[str, str, int, d
     return "", "", 0, {}
 
 
-def _read_records(directory: Path, channel: str, recording_time_offset: int) -> tuple[list[MEF3Record], int]:
-    """The records of one level of the session, and how many were left out for being encrypted."""
-    records, encrypted = [], 0
+# How far past the session's last sample a record read by the session's start may fall (see _records_clock).
+_SESSION_CLOCK_TOLERANCE = 1_000_000  # µs
+
+
+def _records_clock(stored_times: np.ndarray, recording_time_offset: int, session_span: tuple[int, int] | None):
+    """
+    The time a record file's offset times count from: the recording time offset, as MEF 3 has it, or the
+    session's start, for a writer that stored its records offset by the session's start instead.
+
+    Read with the recording time offset, such records all fall before the session, decades before it when the
+    offset is far from the start; read from the session's start, every one falls within it. The start is
+    taken only then: when every time in the file is stored offset (negative, or 0 at the start itself), none
+    of them falls within the session read with the recording time offset, and all of them do read from its
+    start. Otherwise the file is read as MEF 3 has it.
+    """
+    if session_span is None or len(stored_times) == 0 or np.any(stored_times > 0):
+        return recording_time_offset
+    start, end = session_span
+    as_stated = _true_time(stored_times, recording_time_offset)
+    from_start = -stored_times + start
+    if np.any((as_stated >= start) & (as_stated <= end + _SESSION_CLOCK_TOLERANCE)):
+        return recording_time_offset
+    if np.all(from_start <= end + _SESSION_CLOCK_TOLERANCE):
+        return start
+    return recording_time_offset
+
+
+def _read_records(
+    directory: Path, channel: str, recording_time_offset: int, session_span: tuple[int, int] | None = None
+) -> tuple[list[MEF3Record], int, int]:
+    """
+    The records of one level of the session, how many were left out for being encrypted, and how many were read
+    from the session's start rather than with the recording time offset (see :func:`_records_clock`).
+
+    ``session_span`` is the session's first and last µUTC time, from its samples.
+    """
+    records, encrypted, from_start = [], 0, 0
     for index_path in sorted(directory.glob("*.ridx")):
         data_path = index_path.with_suffix(".rdat")
         if not data_path.is_file():
@@ -777,6 +811,7 @@ def _read_records(directory: Path, channel: str, recording_time_offset: int) -> 
         entries = np.frombuffer(body[: len(body) - len(body) % RECORD_INDEX_BYTES], dtype=_RECORD_INDEX_DTYPE)
         raw_data = _read_exactly(data_path)
         _check_universal_header(raw_data, data_path, "rdat")
+        readable = []
         for entry in entries:
             offset = int(entry["file_offset"])
             header = raw_data[offset : offset + RECORD_HEADER_BYTES]
@@ -786,22 +821,35 @@ def _read_records(directory: Path, channel: str, recording_time_offset: int) -> 
             if np.frombuffer(header, dtype="i1", count=1, offset=11)[0] > 0:
                 encrypted += 1
                 continue
+            readable.append((offset, header))
+        stored_times = np.array([_number(header, 16, "<i8") for _, header in readable], dtype=np.int64)
+        clock = _records_clock(stored_times, recording_time_offset, session_span)
+        if clock != recording_time_offset:
+            from_start += len(readable)
+
+        def true_time(stored: int) -> int:
+            # A time stored as 0 is the session's start itself when the file counts from it.
+            if clock != recording_time_offset and stored == 0:
+                return clock
+            return _true_time(stored, clock)
+
+        for (offset, header), stored_time in zip(readable, stored_times):
             record_type = header[4:8].decode("ascii", errors="replace")
             body_bytes = _number(header, 12, "<u4")
             record_body = raw_data[offset + RECORD_HEADER_BYTES : offset + RECORD_HEADER_BYTES + body_bytes]
             label, details, duration, body_times = _record_body_fields(record_type, record_body)
             records.append(
                 MEF3Record(
-                    time=_true_time(_number(header, 16, "<i8"), recording_time_offset),
+                    time=true_time(int(stored_time)),
                     record_type=record_type,
                     label=label,
                     details=details,
                     duration=duration,
                     channel=channel,
-                    times={name: _true_time(value, recording_time_offset) for name, value in body_times.items()},
+                    times={name: true_time(value) for name, value in body_times.items()},
                 )
             )
-    return records, encrypted
+    return records, encrypted, from_start
 
 
 def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_name: str) -> dict | None:
@@ -928,7 +976,17 @@ def read_mef3_session(
     # The session-level records use the recording time offset the channels share; MEF 3 writers give every
     # segment the session's.
     session_recording_time_offset = recording_time_offsets[0]
-    records, encrypted = _read_records(path, channel="", recording_time_offset=session_recording_time_offset)
+    session_span = (
+        start_time,
+        max(
+            run.start_time + round(run.number_of_samples * 1e6 / group.sampling_frequency)
+            for group in channel_groups
+            for run in group.runs
+        ),
+    )
+    records, encrypted, from_start = _read_records(
+        path, channel="", recording_time_offset=session_recording_time_offset, session_span=session_span
+    )
     record_sources = [
         (channel.directory, channel.name, recording_time_offset)
         for channel, recording_time_offset in zip(channels, recording_time_offsets)
@@ -937,13 +995,21 @@ def read_mef3_session(
         for directory, summary in skipped.items()
     ]
     for directory, name, recording_time_offset in record_sources:
-        channel_records, channel_encrypted = _read_records(directory, name, recording_time_offset)
-        records += channel_records
-        encrypted += channel_encrypted
-        for segment_directory in _segment_directories(directory):
-            segment_records, segment_encrypted = _read_records(segment_directory, name, recording_time_offset)
-            records += segment_records
-            encrypted += segment_encrypted
+        for level_directory in [directory, *_segment_directories(directory)]:
+            level_records, level_encrypted, level_from_start = _read_records(
+                level_directory, name, recording_time_offset, session_span
+            )
+            records += level_records
+            encrypted += level_encrypted
+            from_start += level_from_start
+    if from_start:
+        warnings.warn(
+            f"{from_start} records of the MEF 3 session '{path.name}' are stored offset by the session's start "
+            "rather than by its recording time offset: read with that offset none of them falls within the "
+            "session, and read from its start every one does. They are placed from the session's start.",
+            UserWarning,
+            stacklevel=_stacklevel_outside_neuroconv(),
+        )
     if encrypted:
         warnings.warn(
             f"{encrypted} records of the MEF 3 session '{path.name}' are encrypted and are left out.",
