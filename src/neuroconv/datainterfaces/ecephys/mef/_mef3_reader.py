@@ -31,7 +31,8 @@ index entry is left out.
 
 Times in MEF are microseconds since the Unix epoch (µUTC). A writer may store them offset by the session's
 recording time offset, marking such a time by making it negative; it is undone here as meflib undoes it on
-input (``remove_recording_time_offset``).
+input (``remove_recording_time_offset``). A record file whose writer offset its times by the session's start
+instead is read from that start (see ``_records_clock``).
 """
 
 import warnings
