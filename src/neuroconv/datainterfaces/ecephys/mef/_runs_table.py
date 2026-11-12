@@ -24,8 +24,7 @@ RUNS_SOURCE_FILE_DESCRIPTION = (
 def add_runs_to_nwbfile(
     nwbfile: NWBFile,
     *,
-    recording_extractor=None,
-    run_start_times=None,
+    run_start_times,
     run_samples: list[int],
     sampling_frequency: float,
     file_path: Path,
@@ -33,13 +32,10 @@ def add_runs_to_nwbfile(
     source_file: str | None = None,
 ):
     """
-    Add one row per run to the ``runs`` table, each where the recording's segment for it starts.
+    Add one row per run to the ``runs`` table, starting at ``run_start_times``.
 
-    The start times are read from the recording, so any alignment moves the rows with the series, or given as
-    ``run_start_times`` by a reader that has worked them out from it.
+    The caller reads the start times from its recording, so any alignment moves the rows with the series.
     """
-    if run_start_times is None:
-        run_start_times = [recording_extractor.get_start_time(segment_index=index) for index in range(len(run_samples))]
     rows = []
     for run_index, (number_of_samples, start_time) in enumerate(zip(run_samples, run_start_times)):
         start_time = float(start_time)

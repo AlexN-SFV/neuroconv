@@ -565,7 +565,7 @@ class TestSessionAtSeveralRates:
         interfaces = self._per_rate_interfaces(gapped_copy, [("main", ["EKG"]), ("ekg", ["Cz", "Fp1"])])
         nwbfile = mock_NWBFile()
         for interface in interfaces.values():
-            interface._add_runs_to_nwbfile(nwbfile=nwbfile)
+            interface._add_runs_to_nwbfile(nwbfile=nwbfile, run_start_times=interface._run_start_times())
         runs = nwbfile.intervals["runs"].to_dataframe()
         assert set(runs["source_file"]) == {"gapped.mefd (1000.0 Hz)", "gapped.mefd (1000.0001 Hz)"}
         assert len(runs) == sum(len(interface.mef3_session.runs) for interface in interfaces.values())
@@ -597,7 +597,7 @@ class TestSessionAtSeveralRates:
         tables = []
         for interface in interfaces.values():
             nwbfile = mock_NWBFile()
-            interface._add_records_to_nwbfile(nwbfile=nwbfile)
+            interface._add_records_to_nwbfile(nwbfile=nwbfile, run_start_times=interface._run_start_times())
             tables.append(nwbfile.intervals["records"].to_dataframe().reset_index(drop=True))
         assert tables[0].equals(tables[1])
         instants = tables[0][tables[0]["duration_in_microseconds"] == 0]
@@ -1337,3 +1337,53 @@ class TestConcatenatedRuns:
         np.testing.assert_allclose(series.timestamps[[0, 2000]], [10.0, 14.0])
         np.testing.assert_allclose(nwbfile.intervals["runs"]["start_time"][:], [10.0, 14.0])
         assert nwbfile.intervals["records"]["start_time"][0] == pytest.approx(10.1)
+
+    def test_a_stub_of_concatenated_runs(self):
+        """A stub slices the segment by frames, which rebuilds it from its times without the time vector."""
+        interface = MEF3RecordingInterface(folder_path=GAPPED, concatenate_runs_above=1)
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata(), stub_test=True)
+        series = nwbfile.acquisition["ElectricalSeries"]
+        # The first 100 samples lie in the first run, so the stub is placed by its start and rate.
+        assert series.data.maxshape == (100, 3)
+        assert (series.starting_time, series.rate, series.timestamps) == (0.0, 1000.0, None)
+
+    @staticmethod
+    def make_overlapping_runs(session_path: Path):
+        """gapped.mefd with every channel's second segment moved 3 s earlier: runs at 0 s for 2 s and at 1 s for 1 s."""
+        for channel in ("Cz", "Fp1", "EKG"):
+            shift_channel_segment(session_path, channel, segment=1, by_microseconds=-3_000_000)
+
+    def test_runs_that_go_back_in_time_stay_one_series_each(self, gapped_copy):
+        self.make_overlapping_runs(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assert [run.start_time - START_TIME for run in read_mef3_session(gapped_copy).runs] == [0, 1_000_000]
+        with pytest.warns(UserWarning, match=r"not concatenated: a run starts before the previous one ends"):
+            interface = MEF3RecordingInterface(folder_path=gapped_copy, concatenate_runs_above=1)
+        assert interface.recording_extractor.get_num_segments() == 2
+        nwbfile = mock_NWBFile()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        assert sorted(series.starting_time for series in nwbfile.acquisition.values()) == [0.0, 1.0]
+        assert all(series.timestamps is None for series in nwbfile.acquisition.values())
+        with pytest.raises(ValueError, match=r"cannot be concatenated: a run starts before the previous one ends"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                MEF3RecordingExtractor(gapped_copy, concatenate_runs=True)
+
+    def test_records_are_placed_in_the_last_run_that_starts_before_them(self):
+        """Bisection over ascending starts, and a check of every run when a run starts before the previous one,
+        both pick the run master's scan picked: the last that starts at or before the time, else the first."""
+        interface = MEF3RecordingInterface(folder_path=GAPPED)
+        start = interface.mef3_session.start_time
+        aligned = np.array([10.0, 30.0])  # the runs' starts as written, moved from 0 s and 4 s
+        for starts_ascend, utc in ((True, [0, 4_000_000]), (False, [4_000_000, 1_000_000])):
+            utc = np.array(utc, dtype=np.int64) + start
+            for offset in (-500_000, 0, 1_500_000, 4_000_000, 4_250_000):
+                time = start + offset
+                at_or_before = [index for index, run_start in enumerate(utc) if time >= run_start]
+                expected_run = at_or_before[-1] if at_or_before else 0
+                expected = (time - start) / 1e6 + aligned[expected_run] - (utc[expected_run] - start) / 1e6
+                assert interface._session_time(time, aligned, utc, starts_ascend) == pytest.approx(expected)

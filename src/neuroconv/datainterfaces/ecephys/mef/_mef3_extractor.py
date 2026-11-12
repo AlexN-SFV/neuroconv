@@ -44,10 +44,9 @@ class MEF3RecordingSegment(BaseRecordingSegment):
         time_vector: np.ndarray | None = None,
         number_of_runs: int = 1,
     ):
-        if time_vector is None:
-            super().__init__(sampling_frequency=sampling_frequency, t_start=t_start)
-        else:
-            super().__init__(time_vector=time_vector)
+        # The rate stays beside a time vector, as spikeinterface's own set_times leaves it: a frame slice of the
+        # segment (a stub) rebuilds it from its times kwargs without the vector, and needs the rate then.
+        super().__init__(sampling_frequency=sampling_frequency, t_start=t_start, time_vector=time_vector)
         self._channels = channels
         self._number_of_samples = number_of_samples
         # Per channel: the segment's first block and the sample each of its blocks ends at, within the segment.
@@ -99,13 +98,31 @@ class MEF3RecordingSegment(BaseRecordingSegment):
         return traces
 
 
+def runs_ascend(runs, sampling_frequency: float) -> bool:
+    """
+    Whether every run starts after the previous run's last sample, so the runs back to back have increasing times.
+
+    A run can start before the previous one ended: a flagged block that overlaps the one before it, or an unflagged
+    jump back of more than a second, starts a new run.
+    """
+    starts = np.array([run.start_time for run in runs], dtype=np.int64)
+    last_samples = starts[:-1] + (np.array([run.number_of_samples for run in runs[:-1]]) - 1) * (
+        1e6 / sampling_frequency
+    )
+    return bool(np.all(starts[1:] > last_samples))
+
+
 def _runs_time_vector(runs, sampling_frequency: float, session_start_time: int) -> np.ndarray:
     """Each sample's time in seconds from the session's start: every run at the nominal rate from its own start."""
     counts = np.array([run.number_of_samples for run in runs], dtype=np.int64)
     run_starts = (np.array([run.start_time for run in runs], dtype=np.int64) - session_start_time) / 1e6
     first_samples = np.concatenate([[0], np.cumsum(counts)[:-1]])
-    sample_in_run = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(first_samples, counts)
-    return np.repeat(run_starts, counts) + sample_in_run / sampling_frequency
+    # The sample's index in the whole vector over the rate, plus its run's start less its run's first index over the
+    # rate: one float64 array the size of the result besides it, where index arithmetic would take three.
+    times = np.arange(int(counts.sum()), dtype=np.float64)
+    times /= sampling_frequency
+    times += np.repeat(run_starts - first_samples / sampling_frequency, counts)
+    return times
 
 
 def _gains_to_microvolts(session: MEF3Session) -> np.ndarray:
@@ -201,6 +218,7 @@ class MEF3RecordingExtractor(BaseRecording):
         If True and the session has more than one run, read them as one segment with a time vector instead of
         one segment per run. A recording with thousands of short runs (a recorder that drops a few samples
         every so often) is then written as one series with timestamps, rather than as thousands of series.
+        Refused when a run starts before the previous one ends, since the times would go back.
 
     The passwords are only needed while the session is read here, and are left out of the extractor's kwargs,
     so ``to_dict()`` and anything that serialises the extractor never carry them. An encrypted session's
@@ -240,6 +258,12 @@ class MEF3RecordingExtractor(BaseRecording):
             sampling_frequency=session.sampling_frequency, channel_ids=channel_names, dtype=np.dtype("int32")
         )
         runs = session.runs
+        if concatenate_runs and len(runs) > 1 and not runs_ascend(runs, session.sampling_frequency):
+            raise ValueError(
+                f"The runs of the MEF 3 session '{session.path.name}' cannot be concatenated: a run starts before "
+                "the previous one ends, so their samples back to back would go back in time. Read them as one "
+                "segment per run (concatenate_runs=False)."
+            )
         if concatenate_runs and len(runs) > 1:
             self.add_recording_segment(
                 MEF3RecordingSegment(
