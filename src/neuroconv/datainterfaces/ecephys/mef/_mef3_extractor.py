@@ -25,7 +25,13 @@ from .._voltage_units import unit_to_microvolts
 
 
 class MEF3RecordingSegment(BaseRecordingSegment):
-    """One uninterrupted run of a session, decoded lazily, block by block, from each channel's data files."""
+    """
+    Runs of a session, decoded lazily, block by block, from each channel's data files.
+
+    Usually the one uninterrupted run ``run_index``, placed at ``t_start``. With ``time_vector`` it is
+    ``number_of_runs`` consecutive runs from ``run_index``, back to back, and the time vector gives each
+    sample's time, gaps included.
+    """
 
     def __init__(
         self,
@@ -34,19 +40,26 @@ class MEF3RecordingSegment(BaseRecordingSegment):
         run_index: int,
         number_of_samples: int,
         sampling_frequency: float,
-        t_start: float,
+        t_start: float | None = None,
+        time_vector: np.ndarray | None = None,
+        number_of_runs: int = 1,
     ):
-        super().__init__(sampling_frequency=sampling_frequency, t_start=t_start)
+        if time_vector is None:
+            super().__init__(sampling_frequency=sampling_frequency, t_start=t_start)
+        else:
+            super().__init__(time_vector=time_vector)
         self._channels = channels
-        self._run_index = run_index
         self._number_of_samples = number_of_samples
-        # Per channel: the run's first block and the sample each of its blocks ends at, within the run.
+        # Per channel: the segment's first block and the sample each of its blocks ends at, within the segment.
+        # A channel's runs partition its blocks in order, so consecutive runs are consecutive blocks.
         self._first_blocks = []
         self._block_ends = []
         for channel in channels:
-            run = channel.runs[run_index]
-            counts = channel.blocks["number_of_samples"][run.first_block : run.first_block + run.number_of_blocks]
-            self._first_blocks.append(run.first_block)
+            first_run, last_run = channel.runs[run_index], channel.runs[run_index + number_of_runs - 1]
+            first_block = first_run.first_block
+            end_block = last_run.first_block + last_run.number_of_blocks
+            counts = channel.blocks["number_of_samples"][first_block:end_block]
+            self._first_blocks.append(first_block)
             self._block_ends.append(np.cumsum(counts))
 
     def get_num_samples(self) -> int:
@@ -84,6 +97,15 @@ class MEF3RecordingSegment(BaseRecordingSegment):
             for column, position in enumerate(positions):
                 traces[:, column] = self._read_channel(position, start_frame, end_frame)
         return traces
+
+
+def _runs_time_vector(runs, sampling_frequency: float, session_start_time: int) -> np.ndarray:
+    """Each sample's time in seconds from the session's start: every run at the nominal rate from its own start."""
+    counts = np.array([run.number_of_samples for run in runs], dtype=np.int64)
+    run_starts = (np.array([run.start_time for run in runs], dtype=np.int64) - session_start_time) / 1e6
+    first_samples = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    sample_in_run = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(first_samples, counts)
+    return np.repeat(run_starts, counts) + sample_in_run / sampling_frequency
 
 
 def _gains_to_microvolts(session: MEF3Session) -> np.ndarray:
@@ -156,7 +178,9 @@ class MEF3RecordingExtractor(BaseRecording):
 
     Each uninterrupted run of blocks becomes one segment, placed on the session timeline at its first
     block's start time, measured from the session's start. A session recorded without interruption,
-    however many MEF segments it is split into, is a single segment.
+    however many MEF segments it is split into, is a single segment. With ``concatenate_runs`` the runs are
+    instead one segment with a time vector: each run's samples at the nominal rate from its own start time,
+    so the gaps between runs are in the times rather than between segments.
 
     A recording has one rate and one set of segments, so it holds one of the session's channel groups (see
     :class:`._mef3_reader.MEF3ChannelGroup`). A session with several is refused here: keep one group with
@@ -173,6 +197,10 @@ class MEF3RecordingExtractor(BaseRecording):
         The session's password, of either level, when its metadata is encrypted.
     level_1_password, level_2_password : str, optional
         The session's passwords by level, instead of ``password``.
+    concatenate_runs : bool, default: False
+        If True and the session has more than one run, read them as one segment with a time vector instead of
+        one segment per run. A recording with thousands of short runs (a recorder that drops a few samples
+        every so often) is then written as one series with timestamps, rather than as thousands of series.
 
     The passwords are only needed while the session is read here, and are left out of the extractor's kwargs,
     so ``to_dict()`` and anything that serialises the extractor never carry them. An encrypted session's
@@ -194,6 +222,7 @@ class MEF3RecordingExtractor(BaseRecording):
         password: str | None = None,
         level_1_password: str | None = None,
         level_2_password: str | None = None,
+        concatenate_runs: bool = False,
         *,
         _session: MEF3Session | None = None,
     ):
@@ -210,16 +239,29 @@ class MEF3RecordingExtractor(BaseRecording):
         super().__init__(
             sampling_frequency=session.sampling_frequency, channel_ids=channel_names, dtype=np.dtype("int32")
         )
-        for run_index, run in enumerate(session.runs):
+        runs = session.runs
+        if concatenate_runs and len(runs) > 1:
             self.add_recording_segment(
                 MEF3RecordingSegment(
                     channels=session.channels,
-                    run_index=run_index,
-                    number_of_samples=run.number_of_samples,
+                    run_index=0,
+                    number_of_runs=len(runs),
+                    number_of_samples=sum(run.number_of_samples for run in runs),
                     sampling_frequency=session.sampling_frequency,
-                    t_start=(run.start_time - session.start_time) / 1e6,
+                    time_vector=_runs_time_vector(runs, session.sampling_frequency, session.start_time),
                 )
             )
+        else:
+            for run_index, run in enumerate(runs):
+                self.add_recording_segment(
+                    MEF3RecordingSegment(
+                        channels=session.channels,
+                        run_index=run_index,
+                        number_of_samples=run.number_of_samples,
+                        sampling_frequency=session.sampling_frequency,
+                        t_start=(run.start_time - session.start_time) / 1e6,
+                    )
+                )
 
         # Gains take the stored counts to microvolts; the ecephys writer then scales microvolts to the volts
         # NWB's ElectricalSeries expects. MEF has no offset.
@@ -241,4 +283,6 @@ class MEF3RecordingExtractor(BaseRecording):
             self.set_property(key="reference", values=np.asarray(references))
 
         self.mef3_session = session
-        self._kwargs = dict(folder_path=str(folder_path), channels_to_skip=channels_to_skip)
+        self._kwargs = dict(
+            folder_path=str(folder_path), channels_to_skip=channels_to_skip, concatenate_runs=concatenate_runs
+        )
