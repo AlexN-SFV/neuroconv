@@ -574,7 +574,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         List, in ``invalid_times``, each stretch where a channel of a merged group has no sample and is written as 0.
 
         One row per channel and uninterrupted stretch: a stretch that runs across a gap of the group's ends at it.
-        The rows are written once per group into a file, as the runs are; they carry no ``source_file`` column, since
+        The rows are written once per group into a file; they carry no ``source_file`` column, since
         their channel and times place them, and every text column of an intervals table is text a reader of the file
         (a PHI scan, say) goes through.
         """
@@ -603,7 +603,12 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             for (name, start, end), first, last in zip(stretches, firsts, lasts)
         ]
         rows.sort(key=lambda row: (row["start_time"], row["channel"]))
-        label = getattr(self, "_runs_label", None)
+        # Written once per group into a file, whichever interfaces over the session write it, and once for each
+        # group: the key names the group's rate and channels, so two readers of one session with complementary
+        # channels_to_skip (one per rate, say), each with a merged group of its own, both write their rows. It is
+        # only a key, since the rows carry no source_file column.
+        channels = ", ".join(channel.name for channel in group.channels)
+        key = f"{session.path.name} ({session.sampling_frequency!r} Hz: {channels})"
         add_rows_to_intervals_table(
             nwbfile=nwbfile,
             file_path=session.path,
@@ -619,7 +624,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             rows=rows,
             kind="MEF 3",
             source_file_description=_SOURCE_FILE_DESCRIPTION,
-            source_file=f"{session.path.name} ({label})" if label else None,
+            source_file=key,
             source_file_column=False,
         )
 

@@ -1630,3 +1630,68 @@ class TestMergedChannelGroups:
         with pytest.warns(UserWarning, match=r"already has an intervals table named 'invalid_times'"):
             interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
         assert len(nwbfile.invalid_times) == 0
+
+    @staticmethod
+    def copy_channel(session_path: Path, source: str, name: str):
+        """A copy of one channel under another name: its directory, segment directories and files renamed."""
+        shutil.copytree(session_path / f"{source}.timd", session_path / f"{name}.timd")
+        # Deepest first, so a file is renamed before the directory holding it.
+        for path in sorted((session_path / f"{name}.timd").rglob(f"{source}-*"), key=lambda path: -len(path.parts)):
+            path.rename(path.with_name(path.name.replace(f"{source}-", f"{name}-", 1)))
+
+    @staticmethod
+    def make_slower(session_path: Path, channel: str):
+        """One channel at 500 Hz, its blocks re-timed to that rate (runs at 0-4 s and 8-10 s)."""
+        set_channel_rate(session_path, channel, 500.0)
+        index_paths = sorted((session_path / f"{channel}.timd").rglob("*.tidx"))
+        first = abs(int(np.frombuffer(index_paths[0].read_bytes()[1032:1040], dtype="<i8")[0]))
+        for path in index_paths:
+            rewrite_index_start_times(path, lambda times: first + 2 * (times - first))
+
+    def test_readers_of_one_session_each_list_their_merged_group(self, gapped_copy):
+        """Two interfaces over one session with complementary channels_to_skip, one per rate as a converter builds
+        them, each with a merged group of its own: both groups' stretches are listed."""
+        self.copy_channel(gapped_copy, "EKG", "EMG")
+        for channel in ("EKG", "EMG"):
+            self.make_slower(gapped_copy, channel)
+        self.make_dropout(gapped_copy, "Fp1", block=4)
+        # At 500 Hz a 250-sample block lasts 0.5 s.
+        shift_channel_blocks(gapped_copy, "EMG", segment=0, first_block=2, by_microseconds=500_000)
+        flag_channel_block(gapped_copy, "EMG", segment=0, block=2)
+        nwbfile = mock_NWBFile()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for key, skip in (("fast", ["EKG", "EMG"]), ("slow", ["Cz", "Fp1"])):
+                interface = MEF3RecordingInterface(
+                    folder_path=gapped_copy, channels_to_skip=skip, metadata_key=key, merge_groups_max_fill=0.1
+                )
+                assert interface.mef3_session.channel_groups[0].channel_run_positions is not None
+                metadata = interface.get_metadata()
+                metadata["Ecephys"]["ElectricalSeries"][key]["name"] = f"ElectricalSeries_{key}"
+                interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
+        invalid = nwbfile.invalid_times.to_dataframe()
+        assert sorted(zip(invalid["channel"], invalid["number_of_samples"])) == [
+            ("Cz", 250),
+            ("EKG", 250),
+            ("EMG", 250),
+            ("Fp1", 250),
+        ]
+        # Fp1 lacks 1.0-1.25 s and Cz 2.0-2.25 s at 1 kHz; EMG lacks 1.0-1.5 s and EKG 4.0-4.5 s at 500 Hz.
+        stretches = {row.channel: (round(row.start_time, 9), round(row.stop_time, 9)) for row in invalid.itertuples()}
+        assert stretches == {"Fp1": (1.0, 1.25), "Cz": (2.0, 2.25), "EMG": (1.0, 1.5), "EKG": (4.0, 4.5)}
+
+    def test_readers_with_overlapping_channels_each_list_their_group(self, gapped_copy):
+        """One reader skipping EKG (Cz and Fp1 merged) and one skipping Cz (Fp1 and EKG merged), into one file."""
+        self.make_dropout(gapped_copy, "Fp1", block=4)
+        self.make_dropout(gapped_copy, "EKG", block=2)
+        nwbfile = mock_NWBFile()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for key, skip in (("first", ["EKG"]), ("second", ["Cz"])):
+                interface = MEF3RecordingInterface(
+                    folder_path=gapped_copy, channels_to_skip=[*skip], metadata_key=key, merge_groups_max_fill=0.1
+                )
+                metadata = interface.get_metadata()
+                metadata["Ecephys"]["ElectricalSeries"][key]["name"] = f"ElectricalSeries_{key}"
+                interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, write_records=False)
+        assert len(nwbfile.invalid_times) == 4
