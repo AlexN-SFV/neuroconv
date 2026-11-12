@@ -90,6 +90,15 @@ group with more than ``n`` runs as one ``ElectricalSeries`` with timestamps inst
 at the nominal rate from its own start time, so the gaps are in the timestamps. The ``"runs"`` table lists the
 runs either way. Groups with ``n`` runs or fewer are still written one series per run.
 
+A recorder can also drop a few samples on each channel independently, so channels that share nearly every sample
+time still differ in their runs and are read as a group each, every one its own series. ``merge_groups_max_fill=f``
+writes groups at one rate that share one sample clock as one series instead, over every time any of them has a
+sample, as long as no channel then has no sample for more than the fraction ``f`` of the series. A channel's
+samples where it has none are written as 0, and every such stretch is listed, with its channel and its number of
+samples, in the file's ``invalid_times`` table. A continuous channel beside channels with long gaps stays apart,
+since those channels would be missing too much of its time, and so do channels whose runs do not start a whole
+number of samples apart.
+
 A segment with no data file and no block in its index, one a writer opened and never wrote to, is left out
 with a warning. A segment whose index lists blocks but which has no data file is refused.
 

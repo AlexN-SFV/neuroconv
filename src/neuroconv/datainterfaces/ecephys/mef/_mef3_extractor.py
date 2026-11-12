@@ -98,6 +98,68 @@ class MEF3RecordingSegment(BaseRecordingSegment):
         return traces
 
 
+class MEF3FilledRecordingSegment(MEF3RecordingSegment):
+    """
+    Runs of a channel group merged from groups whose runs differ (see
+    :func:`._mef3_reader.merge_channel_groups`): ``number_of_samples`` of the group's samples from
+    ``first_sample``, its runs back to back. Each channel's samples are placed where its own runs sit among the
+    group's, and a channel with no sample at a time the group has is read there as 0.
+    """
+
+    def __init__(
+        self,
+        *,
+        channels: list[MEF3Channel],
+        run_positions: list[np.ndarray],
+        first_sample: int,
+        number_of_samples: int,
+        sampling_frequency: float,
+        t_start: float | None = None,
+        time_vector: np.ndarray | None = None,
+    ):
+        BaseRecordingSegment.__init__(
+            self, sampling_frequency=sampling_frequency, t_start=t_start, time_vector=time_vector
+        )
+        self._channels = channels
+        self._number_of_samples = number_of_samples
+        self._first_sample = first_sample
+        # Per channel: where each of its runs starts among the group's samples, its length, where it starts among
+        # the channel's own samples, and the own sample each of the channel's blocks ends at.
+        self._pieces = []
+        for channel, positions in zip(channels, run_positions):
+            lengths = np.array([run.number_of_samples for run in channel.runs], dtype=np.int64)
+            own_starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+            block_ends = np.cumsum(channel.blocks["number_of_samples"].astype(np.int64))
+            self._pieces.append((np.asarray(positions, dtype=np.int64), lengths, own_starts, block_ends))
+
+    def _decode(self, position: int, start: int, end: int) -> np.ndarray:
+        """The channel's own samples ``start`` to ``end``, decoding only the blocks they fall in."""
+        channel, block_ends = self._channels[position], self._pieces[position][3]
+        first = int(np.searchsorted(block_ends, start, side="right"))
+        last = int(np.searchsorted(block_ends, end - 1, side="right"))
+        samples = channel.read_blocks(first, last - first + 1)
+        offset = start - (int(block_ends[first]) - int(channel.blocks["number_of_samples"][first]))
+        return samples[offset : offset + (end - start)]
+
+    def _read_channel(self, position: int, start_frame: int, end_frame: int) -> np.ndarray:
+        starts, lengths, own_starts, _ = self._pieces[position]
+        low, high = self._first_sample + start_frame, self._first_sample + end_frame
+        column = np.zeros(end_frame - start_frame, dtype=np.int32)
+        # The channel's runs that overlap the window: from the first ending after its start to the last starting
+        # before its end. The channel's own samples over them are consecutive.
+        first = int(np.searchsorted(starts + lengths, low, side="right"))
+        stop = int(np.searchsorted(starts, high, side="left"))
+        if first >= stop:
+            return column
+        lows = np.maximum(starts[first:stop], low)
+        counts = np.minimum(starts[first:stop] + lengths[first:stop], high) - lows
+        own_first = int(own_starts[first] + (lows[0] - starts[first]))
+        samples = self._decode(position, own_first, own_first + int(counts.sum()))
+        within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+        column[np.repeat(lows - low, counts) + within] = samples
+        return column
+
+
 def runs_ascend(runs, sampling_frequency: float) -> bool:
     """
     Whether every run starts after the previous run's last sample, so the runs back to back have increasing times.
@@ -219,6 +281,10 @@ class MEF3RecordingExtractor(BaseRecording):
         one segment per run. A recording with thousands of short runs (a recorder that drops a few samples
         every so often) is then written as one series with timestamps, rather than as thousands of series.
         Refused when a run starts before the previous one ends, since the times would go back.
+    merge_groups_max_fill : float, optional
+        Merge channel groups at one rate that share one sample clock into one, where no channel then has no
+        sample for more than this fraction of its samples; a channel's missing samples are read as 0 (see
+        :func:`._mef3_reader.merge_channel_groups`). The session must still come to one group.
 
     The passwords are only needed while the session is read here, and are left out of the extractor's kwargs,
     so ``to_dict()`` and anything that serialises the extractor never carry them. An encrypted session's
@@ -241,12 +307,18 @@ class MEF3RecordingExtractor(BaseRecording):
         level_1_password: str | None = None,
         level_2_password: str | None = None,
         concatenate_runs: bool = False,
+        merge_groups_max_fill: float | None = None,
         *,
         _session: MEF3Session | None = None,
     ):
         if _session is None:
             passwords = MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
-            session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
+            session = read_mef3_session(
+                folder_path,
+                channels_to_skip=channels_to_skip,
+                passwords=passwords,
+                merge_groups_max_fill=merge_groups_max_fill,
+            )
         else:
             session = _session
         # Raises, describing the groups, when the session has several.
@@ -258,13 +330,16 @@ class MEF3RecordingExtractor(BaseRecording):
             sampling_frequency=session.sampling_frequency, channel_ids=channel_names, dtype=np.dtype("int32")
         )
         runs = session.runs
-        if concatenate_runs and len(runs) > 1 and not runs_ascend(runs, session.sampling_frequency):
+        group = session._only_group()
+        if group.channel_run_positions is not None:
+            self._add_filled_segments(session, group, concatenate_runs)
+        elif concatenate_runs and len(runs) > 1 and not runs_ascend(runs, session.sampling_frequency):
             raise ValueError(
                 f"The runs of the MEF 3 session '{session.path.name}' cannot be concatenated: a run starts before "
                 "the previous one ends, so their samples back to back would go back in time. Read them as one "
                 "segment per run (concatenate_runs=False)."
             )
-        if concatenate_runs and len(runs) > 1:
+        elif concatenate_runs and len(runs) > 1:
             self.add_recording_segment(
                 MEF3RecordingSegment(
                     channels=session.channels,
@@ -308,5 +383,38 @@ class MEF3RecordingExtractor(BaseRecording):
 
         self.mef3_session = session
         self._kwargs = dict(
-            folder_path=str(folder_path), channels_to_skip=channels_to_skip, concatenate_runs=concatenate_runs
+            folder_path=str(folder_path),
+            channels_to_skip=channels_to_skip,
+            concatenate_runs=concatenate_runs,
+            merge_groups_max_fill=merge_groups_max_fill,
         )
+
+    def _add_filled_segments(self, session: MEF3Session, group, concatenate_runs: bool):
+        """The segments of a merged group: one over its runs with a time vector, or one per run."""
+        runs = session.runs
+        lengths = [run.number_of_samples for run in runs]
+        first_samples = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int64)
+        common = dict(
+            channels=session.channels,
+            run_positions=group.channel_run_positions,
+            sampling_frequency=session.sampling_frequency,
+        )
+        if concatenate_runs and len(runs) > 1:
+            self.add_recording_segment(
+                MEF3FilledRecordingSegment(
+                    **common,
+                    first_sample=0,
+                    number_of_samples=int(sum(lengths)),
+                    time_vector=_runs_time_vector(runs, session.sampling_frequency, session.start_time),
+                )
+            )
+            return
+        for run, first_sample in zip(runs, first_samples):
+            self.add_recording_segment(
+                MEF3FilledRecordingSegment(
+                    **common,
+                    first_sample=int(first_sample),
+                    number_of_samples=run.number_of_samples,
+                    t_start=(run.start_time - session.start_time) / 1e6,
+                )
+            )

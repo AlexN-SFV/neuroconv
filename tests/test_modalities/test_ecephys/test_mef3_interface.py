@@ -1387,3 +1387,155 @@ class TestConcatenatedRuns:
                 expected_run = at_or_before[-1] if at_or_before else 0
                 expected = (time - start) / 1e6 + aligned[expected_run] - (utc[expected_run] - start) / 1e6
                 assert interface._session_time(time, aligned, utc, starts_ascend) == pytest.approx(expected)
+
+
+def flag_channel_block(session_path: Path, channel: str, segment: int, block: int):
+    """Set one block's discontinuity flag in one channel, in its index entry and in its RED header."""
+    stem = f"{channel}-{segment:06d}"
+    segment_directory = session_path / f"{channel}.timd" / f"{stem}.segd"
+    index_path, data_path = segment_directory / f"{stem}.tidx", segment_directory / f"{stem}.tdat"
+    index, data = bytearray(index_path.read_bytes()), bytearray(data_path.read_bytes())
+    entry = 1024 + 56 * block
+    offset = int(np.frombuffer(bytes(index[entry : entry + 8]), dtype="<i8")[0])
+    for raw, position in ((index, entry + 44), (data, offset + 4)):
+        raw[position] |= 1
+    index_path.write_bytes(bytes(index))
+    data_path.write_bytes(bytes(data))
+
+
+def shift_channel_blocks(session_path: Path, channel: str, segment: int, first_block: int, by_microseconds: int):
+    """Move blocks ``first_block`` onwards of one segment of one channel by ``by_microseconds``, in its index."""
+    stem = f"{channel}-{segment:06d}"
+    index_path = session_path / f"{channel}.timd" / f"{stem}.segd" / f"{stem}.tidx"
+
+    def change(times):
+        times = times.copy()
+        times[first_block:] += by_microseconds
+        return times
+
+    rewrite_index_start_times(index_path, change)
+
+
+def make_ekg_dropout(session_path: Path):
+    """
+    gapped.mefd with EKG missing 250 samples at 0.5 s that Cz and Fp1 have: its blocks 2-7 start a block later
+    (0.75-2.25 s) behind a flagged block, so EKG's runs are 0-0.5 s, 0.75-2.25 s and 4-5 s, and Cz and Fp1's
+    0-2 s and 4-5 s. Every channel holds 3000 samples on one 1 kHz clock.
+    """
+    shift_channel_blocks(session_path, "EKG", segment=0, first_block=2, by_microseconds=250_000)
+    flag_channel_block(session_path, "EKG", segment=0, block=2)
+
+
+class TestMergedChannelGroups:
+    """Channel groups at one rate on one sample clock, written as one series with the missing samples as 0."""
+
+    def test_the_reader_merges_groups_within_the_fill_limit(self, gapped_copy):
+        make_ekg_dropout(gapped_copy)
+        with pytest.warns(UserWarning, match=r"read as 2 groups"):
+            assert len(read_mef3_session(gapped_copy).channel_groups) == 2
+        with pytest.warns(UserWarning, match=r"3 MEF 3 channels .* written as one series of 3250 samples in 2 runs"):
+            session = read_mef3_session(gapped_copy, merge_groups_max_fill=0.1)
+        (group,) = session.channel_groups
+        assert [channel.name for channel in group.channels] == ["Cz", "Fp1", "EKG"]
+        assert [(run.start_time - START_TIME, run.number_of_samples) for run in group.runs] == [
+            (0, 2250),
+            (4_000_000, 1000),
+        ]
+        assert [list(positions) for positions in group.channel_run_positions] == [[0, 2250], [0, 2250], [0, 750, 2250]]
+        assert [group.missing_samples(position) for position in range(3)] == [250, 250, 250]
+        # 250 of 3250 samples is 7.7 %: over a limit of 5 % nothing is merged.
+        with pytest.warns(UserWarning, match=r"read as 2 groups"):
+            assert len(read_mef3_session(gapped_copy, merge_groups_max_fill=0.05).channel_groups) == 2
+
+    def test_a_continuous_channel_beside_channels_with_long_gaps_stays_apart(self, gapped_copy):
+        make_continuous_ekg(gapped_copy)  # EKG 0-3 s; Cz and Fp1 0-2 s and 4-5 s: 1000 of 4000 missing
+        with pytest.warns(UserWarning, match=r"read as 2 groups"):
+            session = read_mef3_session(gapped_copy, merge_groups_max_fill=0.1)
+        assert all(group.channel_run_positions is None for group in session.channel_groups)
+
+    def test_channels_off_one_sample_clock_are_not_merged(self, gapped_copy):
+        make_ekg_dropout(gapped_copy)
+        shift_channel_blocks(gapped_copy, "EKG", segment=0, first_block=0, by_microseconds=400)  # 0.4 samples
+        shift_channel_blocks(gapped_copy, "EKG", segment=1, first_block=0, by_microseconds=400)
+        with pytest.warns(UserWarning, match=r"read as 2 groups"):
+            session = read_mef3_session(gapped_copy, merge_groups_max_fill=0.1)
+        assert len(session.channel_groups) == 2
+
+    @staticmethod
+    def expected(session):
+        """Each channel's samples on the merged group's 3250 samples, 0 where it has none."""
+        full = {channel.name: read_all_blocks(channel) for channel in session.channels}
+        expected = np.zeros((3250, 3), dtype=np.int32)
+        expected[:2000, 0], expected[2250:, 0] = full["Cz"][:2000], full["Cz"][2000:]
+        expected[:2000, 1], expected[2250:, 1] = full["Fp1"][:2000], full["Fp1"][2000:]
+        expected[:500, 2], expected[750:, 2] = full["EKG"][:500], full["EKG"][500:]
+        return expected
+
+    @pytest.mark.parametrize("concatenate", [False, True], ids=["per_run", "concatenated"])
+    def test_traces_place_each_channel_and_fill_the_rest(self, gapped_copy, concatenate):
+        make_ekg_dropout(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            recording = MEF3RecordingExtractor(gapped_copy, merge_groups_max_fill=0.1, concatenate_runs=concatenate)
+        expected = self.expected(recording.mef3_session)
+        if concatenate:
+            assert recording.get_num_segments() == 1
+            full = recording.get_traces()
+            times = recording.get_times(segment_index=0)
+            np.testing.assert_allclose(times[[0, 2249, 2250, 3249]], [0.0, 2.249, 4.0, 4.999], atol=1e-12)
+        else:
+            assert recording.get_num_segments() == 2
+            assert [recording.get_start_time(segment_index=index) for index in (0, 1)] == [0.0, 4.0]
+            full = np.concatenate([recording.get_traces(segment_index=index) for index in (0, 1)])
+        np.testing.assert_array_equal(full, expected)
+        # Windows within a channel's gap, straddling its edges, and one channel at a time, all in the first run.
+        for start, end in [(490, 760), (500, 750), (1990, 2010), (0, 2250), (2240, 2250)]:
+            np.testing.assert_array_equal(
+                recording.get_traces(segment_index=0, start_frame=start, end_frame=end), expected[start:end]
+            )
+            np.testing.assert_array_equal(
+                recording.get_traces(segment_index=0, start_frame=start, end_frame=end, channel_ids=["EKG"])[:, 0],
+                expected[start:end, 2],
+            )
+        assert recording.to_dict()["kwargs"]["merge_groups_max_fill"] == 0.1
+
+    def test_one_series_and_its_missing_samples_in_invalid_times(self, gapped_copy, tmp_path):
+        make_ekg_dropout(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(
+                folder_path=gapped_copy, merge_groups_max_fill=0.1, concatenate_runs_above=1
+            )
+        expected = self.expected(interface.mef3_session)
+        nwbfile_path = tmp_path / "merged.nwb"
+        write_quietly(interface, nwbfile_path)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            assert list(nwbfile.acquisition) == ["ElectricalSeries"]
+            series = nwbfile.acquisition["ElectricalSeries"]
+            np.testing.assert_array_equal(series.data[:], expected)
+            np.testing.assert_allclose(series.timestamps[[0, 2249, 2250, 3249]], [0.0, 2.249, 4.0, 4.999], atol=1e-9)
+            invalid = nwbfile.invalid_times.to_dataframe()
+            assert list(zip(invalid["channel"], invalid["number_of_samples"])) == [
+                ("EKG", 250),
+                ("Cz", 250),
+                ("Fp1", 250),
+            ]
+            np.testing.assert_allclose(invalid["start_time"], [0.5, 2.0, 2.0])
+            np.testing.assert_allclose(invalid["stop_time"], [0.75, 2.25, 2.25])
+            runs = nwbfile.intervals["runs"].to_dataframe()
+            assert list(zip(runs["start_time"], runs["stop_time"])) == [(0.0, 2.25), (4.0, 5.0)]
+            assert len(nwbfile.intervals["records"]) == len(interface.mef3_session.records)
+
+    def test_missing_samples_per_run_series_after_alignment(self, gapped_copy):
+        make_ekg_dropout(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(folder_path=gapped_copy, merge_groups_max_fill=0.1)
+        interface.set_aligned_starting_time(10.0)
+        nwbfile = mock_NWBFile()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
+        assert sorted(series.starting_time for series in nwbfile.acquisition.values()) == [10.0, 14.0]
+        np.testing.assert_allclose(nwbfile.invalid_times["start_time"][:], [10.5, 12.0, 12.0])

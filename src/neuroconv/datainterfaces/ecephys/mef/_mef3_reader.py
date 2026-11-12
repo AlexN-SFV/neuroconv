@@ -201,6 +201,21 @@ class MEF3ChannelGroup:
     channels: list[MEF3Channel]
     runs: list[MEF3Run]
     sampling_frequency: float
+    # Set for a group merged from groups whose runs differ (merge_channel_groups): per channel, the index in the
+    # group's samples (its runs back to back) at which each of the channel's own runs starts. The group's runs
+    # are then the stretches where any of its channels has a sample, and a channel holds no sample over the
+    # rest. None for a group whose channels share its runs exactly, each channel's run k being the group's.
+    channel_run_positions: list[np.ndarray] | None = field(default=None, repr=False)
+
+    @property
+    def number_of_samples(self) -> int:
+        return sum(run.number_of_samples for run in self.runs)
+
+    def missing_samples(self, position: int) -> int:
+        """How many of the group's samples the channel at ``position`` has no sample for (0 unless merged)."""
+        if self.channel_run_positions is None:
+            return 0
+        return self.number_of_samples - self.channels[position].number_of_samples
 
     def describe(self) -> str:
         names = ", ".join(channel.name for channel in self.channels[:5])
@@ -699,7 +714,20 @@ def _group_channels(channels: list[MEF3Channel], session_path: Path) -> list[MEF
             groups.append(
                 MEF3ChannelGroup(channels=[channel], runs=runs, sampling_frequency=channel.sampling_frequency)
             )
+    return _sorted_groups(groups, channels)
 
+
+def _sorted_groups(groups: list[MEF3ChannelGroup], channels: list[MEF3Channel]) -> list[MEF3ChannelGroup]:
+    """The largest group first (most channels, then the highest rate), then in the order of their first channels."""
+    position = {channel.name: index for index, channel in enumerate(channels)}
+    return sorted(
+        groups,
+        key=lambda group: (-len(group.channels), -group.sampling_frequency, position[group.channels[0].name]),
+    )
+
+
+def _warn_about_groups(groups: list[MEF3ChannelGroup], session_path: Path):
+    """Warn about channels at one rate that are read as several groups, each written as its own series."""
     by_rate = {}
     for group in groups:
         by_rate.setdefault(group.sampling_frequency, []).append(group)
@@ -714,10 +742,129 @@ def _group_channels(channels: list[MEF3Channel], session_path: Path) -> list[MEF
                 stacklevel=_stacklevel_outside_neuroconv(),
             )
 
-    position = {channel.name: index for index, channel in enumerate(channels)}
-    return sorted(
-        groups,
-        key=lambda group: (-len(group.channels), -group.sampling_frequency, position[group.channels[0].name]),
+
+# How far, in samples, a run's start may be from a whole number of samples after the rate's earliest start for its
+# group to be merged with others at that rate (merge_channel_groups): the channels must share one sample clock.
+_GRID_TOLERANCE_SAMPLES = 0.25
+
+
+def _grid_runs(group: MEF3ChannelGroup, reference: int) -> np.ndarray | None:
+    """
+    The group's runs as ``[start, end)`` intervals in whole samples after ``reference`` (µUTC), on the grid of its
+    rate; None when a run starts off that grid, or a run starts before the previous one ends on it.
+    """
+    rate = group.sampling_frequency
+    starts = (np.array([run.start_time for run in group.runs], dtype=np.int64) - reference) * (rate / 1e6)
+    grid = np.rint(starts)
+    if np.any(np.abs(starts - grid) > _GRID_TOLERANCE_SAMPLES):
+        return None
+    grid = grid.astype(np.int64)
+    ends = grid + np.array([run.number_of_samples for run in group.runs], dtype=np.int64)
+    if np.any(grid[1:] < ends[:-1]):
+        return None
+    return np.stack([grid, ends], axis=1)
+
+
+def _union(intervals: list[np.ndarray]) -> np.ndarray:
+    """The union of sets of ``[start, end)`` intervals, as sorted, disjoint, non-adjacent intervals."""
+    every = np.concatenate(intervals)
+    every = every[np.argsort(every[:, 0], kind="stable")]
+    starts, ends = every[:, 0], every[:, 1]
+    # An interval starts a new one unless it starts at or before the furthest end so far.
+    new = np.concatenate([[True], starts[1:] > np.maximum.accumulate(ends)[:-1]])
+    firsts = np.flatnonzero(new)
+    return np.stack([starts[firsts], np.maximum.reduceat(ends, firsts)], axis=1).astype(np.int64)
+
+
+def merge_channel_groups(
+    groups: list[MEF3ChannelGroup], max_fill: float, channels: list[MEF3Channel], session_path: Path
+) -> list[MEF3ChannelGroup]:
+    """
+    Merge groups at one rate whose channels share one sample clock into one group, where no channel of it then has
+    no sample for more than ``max_fill`` of the group's samples.
+
+    A recorder can drop a few samples on each channel independently: the channels then share nearly every sample
+    time, but not their runs, and are read as a group each. Merged, their runs are the stretches where any of them
+    has a sample, and a channel with no sample at some of those times is written there as 0 by the extractor and
+    listed by the interface. Groups are taken largest first and each joins the first merged group at its rate that
+    keeps every member within ``max_fill``, else starts its own: a continuous channel beside channels with long gaps
+    stays apart, since those channels would be missing too much of its time.
+
+    Every run must start a whole number of samples (within a quarter of one) after the rate's earliest run, and
+    a group whose runs overlap on that grid is never merged.
+    """
+    result = []
+    for rate in sorted({group.sampling_frequency for group in groups}, reverse=True):
+        at_rate = [group for group in groups if group.sampling_frequency == rate]
+        if len(at_rate) < 2:
+            result += at_rate
+            continue
+        reference = min(group.runs[0].start_time for group in at_rate)
+        clusters = []  # [groups, intervals of each, union]
+        for group in at_rate:
+            intervals = _grid_runs(group, reference)
+            if intervals is None:
+                result.append(group)
+                continue
+            for cluster in clusters:
+                union = _union([cluster[2], intervals])
+                total = int((union[:, 1] - union[:, 0]).sum())
+                members = cluster[0] + [group]
+                if all(member.number_of_samples >= (1.0 - max_fill) * total for member in members):
+                    cluster[0].append(group)
+                    cluster[1].append(intervals)
+                    cluster[2] = union
+                    break
+            else:
+                clusters.append([[group], [intervals], intervals])
+        for members, member_intervals, union in clusters:
+            if len(members) == 1:
+                result.append(members[0])
+                continue
+            result.append(_merged_group(members, member_intervals, union, reference, rate, channels))
+    merged = [group for group in result if group.channel_run_positions is not None]
+    for group in merged:
+        missing = [group.missing_samples(position) for position in range(len(group.channels))]
+        short = sum(1 for count in missing if count)
+        warnings.warn(
+            f"{len(group.channels)} MEF 3 channels of '{session_path.name}' at {group.sampling_frequency:g} Hz, recorded "
+            f"over slightly different stretches of time, are written as one series of {group.number_of_samples} "
+            f"samples in {len(group.runs)} runs. {short} of them have no sample at some of its times "
+            f"({sum(missing)} samples in all, at most {max(missing)} in one channel, "
+            f"{100 * max(missing) / group.number_of_samples:.3g} % of the series), written as 0 and listed in the "
+            "file's invalid_times table.",
+            UserWarning,
+            stacklevel=_stacklevel_outside_neuroconv(),
+        )
+    return _sorted_groups(result, channels)
+
+
+def _merged_group(members, member_intervals, union, reference: int, rate: float, channels) -> MEF3ChannelGroup:
+    """One group of ``members``' channels whose runs are ``union``; see :attr:`MEF3ChannelGroup.channel_run_positions`."""
+    lengths = union[:, 1] - union[:, 0]
+    first_samples = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+    # A union run starts where one of its members' runs does: take that run's own start time.
+    start_of = {}
+    for member, intervals in zip(members, member_intervals):
+        for run, grid_start in zip(member.runs, intervals[:, 0]):
+            start_of[int(grid_start)] = min(start_of.get(int(grid_start), run.start_time), run.start_time)
+    runs = [
+        MEF3Run(first_block=-1, number_of_blocks=0, number_of_samples=int(length), start_time=start_of[int(start)])
+        for start, length in zip(union[:, 0], lengths)
+    ]
+    order = {channel.name: index for index, channel in enumerate(channels)}
+    by_channel = []
+    for member, intervals in zip(members, member_intervals):
+        run_of = np.searchsorted(union[:, 0], intervals[:, 0], side="right") - 1
+        positions = first_samples[run_of] + (intervals[:, 0] - union[run_of, 0])
+        for channel in member.channels:
+            by_channel.append((order[channel.name], channel, positions.astype(np.int64)))
+    by_channel.sort(key=lambda item: item[0])
+    return MEF3ChannelGroup(
+        channels=[channel for _, channel, _ in by_channel],
+        runs=runs,
+        sampling_frequency=rate,
+        channel_run_positions=[positions for _, _, positions in by_channel],
     )
 
 
@@ -949,7 +1096,10 @@ def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_n
 
 
 def read_mef3_session(
-    folder_path, channels_to_skip: list | None = None, passwords: MEF3Passwords | None = None
+    folder_path,
+    channels_to_skip: list | None = None,
+    passwords: MEF3Passwords | None = None,
+    merge_groups_max_fill: float | None = None,
 ) -> MEF3Session:
     """
     Read the metadata and block indices of a MEF 3.0 session, without decoding any samples.
@@ -966,6 +1116,9 @@ def read_mef3_session(
         records.
     passwords : MEF3Passwords, optional
         The session's password, needed when its metadata is encrypted, and ignored when it is not.
+    merge_groups_max_fill : float, optional
+        Merge groups at one rate that share one sample clock, where no channel then has no sample for more than
+        this fraction of the merged group's samples (see :func:`merge_channel_groups`). None merges nothing.
 
     Returns
     -------
@@ -1005,6 +1158,11 @@ def read_mef3_session(
     recording_time_offsets = [recording_time_offsets[index] for index in order]
     gmt_offsets = [gmt_offsets[index] for index in order]
     channel_groups = _group_channels(channels, path)
+    if merge_groups_max_fill is not None:
+        if not 0.0 <= merge_groups_max_fill < 1.0:
+            raise ValueError(f"merge_groups_max_fill must be at least 0 and below 1, not {merge_groups_max_fill}.")
+        channel_groups = merge_channel_groups(channel_groups, merge_groups_max_fill, channels, path)
+    _warn_about_groups(channel_groups, path)
 
     skipped = {
         directory: summary
