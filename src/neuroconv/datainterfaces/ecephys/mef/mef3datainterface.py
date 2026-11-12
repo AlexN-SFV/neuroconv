@@ -140,6 +140,30 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             folder_path, MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
         )
 
+    @staticmethod
+    def get_empty_channel_ids(folder_path: DirectoryPath) -> list:
+        """
+        Get the names of the channels of a MEF 3 session that hold no samples, reading their block indices only.
+
+        A writer may create a channel and never write a sample to it. The interface refuses such a channel unless
+        it is left out; pass these to ``channels_to_skip`` to convert the rest. A skipped channel's records are
+        kept, as any skipped channel's are. The indices are never encrypted, so no password is needed. A channel
+        whose index cannot be read raises rather than being listed.
+
+        Parameters
+        ----------
+        folder_path : DirectoryPath
+            Path to the session's ``.mefd`` directory.
+
+        Returns
+        -------
+        list
+            The names of the channels that hold no samples, in name order; empty when every channel holds some.
+        """
+        from ._mef3_reader import empty_channel_names
+
+        return empty_channel_names(folder_path)
+
     @classmethod
     def get_extractor_class(cls):
         from ._mef3_extractor import MEF3RecordingExtractor

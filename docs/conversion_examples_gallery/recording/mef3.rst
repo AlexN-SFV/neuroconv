@@ -63,6 +63,12 @@ and written through one ``ConverterPipe``, puts every series on one timeline und
 writes the session's records once, and labels each rate's rows of the ``"runs"`` table with the rate, as MEF 2
 streams are.
 
+A writer may create a channel and never write a sample to it. Such a channel is refused, and with it the session,
+unless it is left out: ``MEF3RecordingInterface.get_empty_channel_ids`` lists the channels whose block indices hold
+no samples, reading nothing else and needing no password, to pass to ``channels_to_skip``. Like any skipped
+channel, an empty one keeps its records. A channel whose index cannot be read is not listed: the call raises,
+naming the file.
+
 Gaps and timing
 ^^^^^^^^^^^^^^^
 
