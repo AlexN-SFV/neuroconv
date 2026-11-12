@@ -370,6 +370,12 @@ def _is_empty_segment(segment_directory: Path) -> bool:
     return not indices or indices[0].stat().st_size < UNIVERSAL_HEADER_BYTES + TIME_SERIES_INDEX_BYTES
 
 
+_LEAVE_EMPTY_CHANNELS_OUT = (
+    "Leave it out with channels_to_skip; MEF3RecordingInterface.get_empty_channel_ids lists every channel of "
+    "the session that holds no samples."
+)
+
+
 def _data_segment_directories(channel_directory: Path) -> tuple[list[Path], list[Path]]:
     """A channel's segment directories in segment order, as those that hold data and those that are empty."""
     data, empty = [], []
@@ -513,7 +519,7 @@ def _read_channel(
     if not segment_directories:
         raise ValueError(
             f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, with no data file and no "
-            "block in its index, so the channel holds no samples. Leave it out with channels_to_skip."
+            f"block in its index, so the channel holds no samples. {_LEAVE_EMPTY_CHANNELS_OUT}"
         )
     if empty_segments:
         warnings.warn(
@@ -885,10 +891,13 @@ def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_n
     None, with a warning, when they cannot be read: a channel may be skipped because it is unreadable.
     """
     try:
-        segment_directories, _ = _data_segment_directories(directory)
-        if not segment_directories:
-            raise ValueError("it holds no .segd segment directory with data")
-        metadata = _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)
+        segment_directories, empty_segments = _data_segment_directories(directory)
+        # A channel whose segments are all empty, one skipped because it holds no samples, still has metadata
+        # and records; its first segment's metadata file gives its rate and recording time offset.
+        metadata_directories = segment_directories or empty_segments
+        if not metadata_directories:
+            raise ValueError("it holds no .segd segment directory")
+        metadata = _read_segment_metadata(_only_file(metadata_directories[0], ".tmet"), passwords)
         # As _read_channel checks it: meflib's "no entry" is -1.0, and a dead channel is one a user skips.
         if not (np.isfinite(metadata["sampling_frequency"]) and metadata["sampling_frequency"] > 0):
             raise ValueError(f"it gives a sampling frequency of {metadata['sampling_frequency']}")
@@ -968,8 +977,7 @@ def read_mef3_session(
         channel, recording_time_offset, gmt_offset = _read_channel(directory, passwords)
         if channel.number_of_samples == 0:
             raise ValueError(
-                f"The MEF 3 channel '{channel.name}' of '{path.name}' holds no samples. Leave it out with "
-                "channels_to_skip."
+                f"The MEF 3 channel '{channel.name}' of '{path.name}' holds no samples. {_LEAVE_EMPTY_CHANNELS_OUT}"
             )
         channels.append(channel)
         recording_time_offsets.append(recording_time_offset)
@@ -1101,6 +1109,40 @@ def channel_sampling_frequencies(folder_path, passwords: MEF3Passwords | None = 
         numbers.append(metadata["acquisition_channel_number"])
         rates.append(metadata["sampling_frequency"])
     return {names[index]: rates[index] for index in _channel_order(names, numbers)}
+
+
+def _holds_no_samples(channel_directory: Path) -> bool:
+    """
+    Whether a channel has segments but none of them holds a sample: each is empty (see :func:`_is_empty_segment`),
+    or its index lists no block with samples.
+
+    Read from the indices alone, up to the first that lists a block with samples. A channel with no segment
+    directory is not said to be empty, and an index read on the way that cannot be read raises: neither is a
+    channel that holds no samples, and the reader refuses both as they are.
+    """
+    if not _segment_directories(channel_directory):
+        return False
+    segment_directories, _ = _data_segment_directories(channel_directory)
+    return not any(
+        (_read_time_series_index(_only_file(segment_directory, ".tidx"))["number_of_samples"] > 0).any()
+        for segment_directory in segment_directories
+    )
+
+
+def empty_channel_names(folder_path) -> list[str]:
+    """
+    The names of a session's time series channels that hold no samples, in name order.
+
+    A writer may create a channel and never write a block with samples to it. :func:`read_mef3_session` refuses
+    such a channel unless it is in ``channels_to_skip``; this lists them, to leave them out. Only the block
+    indices are read, which MEF 3 never encrypts, so no password is needed. A channel whose index cannot be read
+    is not listed: reading its index raises.
+    """
+    path = Path(folder_path)
+    if not path.is_dir():
+        raise ValueError(f"'{path}' is not a directory. A MEF 3 session is a .mefd directory.")
+    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
+    return [directory.name[: -len(".timd")] for directory in channel_directories if _holds_no_samples(directory)]
 
 
 def available_channel_names(folder_path, passwords: MEF3Passwords | None = None) -> list[str]:

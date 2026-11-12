@@ -887,6 +887,94 @@ class TestEmptySegments:
         assert len(read_mef3_session(gapped_copy, channels_to_skip=["Cz"]).channels) == 2
 
 
+def empty_channel(session_path: Path, channel: str, keep_data_files: bool):
+    """
+    Leave every segment of a channel without a block: its indices cut to their universal header, and its data
+    files cut to theirs, or removed, which makes each segment empty (see TestEmptySegments).
+    """
+    for segment_directory in (session_path / f"{channel}.timd").glob("*.segd"):
+        for index_path in segment_directory.glob("*.tidx"):
+            index_path.write_bytes(index_path.read_bytes()[:1024])
+        for data_path in segment_directory.glob("*.tdat"):
+            if keep_data_files:
+                data_path.write_bytes(data_path.read_bytes()[:1024])
+            else:
+                data_path.unlink()
+
+
+class TestEmptyChannels:
+    """A channel that holds no samples is refused, listed by get_empty_channel_ids, and can be skipped."""
+
+    @pytest.mark.parametrize("keep_data_files", [True, False], ids=["data files without blocks", "empty segments"])
+    def test_listed_and_skipped_with_their_records_kept(self, gapped_copy, keep_data_files):
+        whole = read_mef3_session(GAPPED)
+        empty_channel(gapped_copy, "Cz", keep_data_files)
+        assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == ["Cz"]
+        message = "holds no samples. Leave it out with channels_to_skip; MEF3RecordingInterface.get_empty_channel_ids"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            read_mef3_session(gapped_copy)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy, channels_to_skip=["Cz"])
+        assert [channel.name for channel in session.channels] == ["Fp1", "EKG"]
+        assert session.start_time == whole.start_time
+        assert session.session_sampling_frequencies == whole.session_sampling_frequencies
+        # The skipped channel's metadata is still read, so its records are kept and the session's are as before.
+        assert session.records == whole.records
+        assert any(record.channel == "Cz" for record in session.records)
+        for channel in session.channels:
+            whole_channel = next(other for other in whole.channels if other.name == channel.name)
+            np.testing.assert_array_equal(read_all_blocks(channel), read_all_blocks(whole_channel))
+
+    def test_an_interface_over_the_rest(self, gapped_copy, tmp_path):
+        empty_channel(gapped_copy, "Fp1", keep_data_files=True)
+        interface = MEF3RecordingInterface(
+            folder_path=gapped_copy, channels_to_skip=MEF3RecordingInterface.get_empty_channel_ids(gapped_copy)
+        )
+        assert list(interface.channel_ids) == ["Cz", "EKG"]
+        nwbfile_path = tmp_path / "without_fp1.nwb"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface.run_conversion(nwbfile_path=nwbfile_path, overwrite=True)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            assert list(nwbfile.electrodes["channel_name"][:]) == ["Cz", "EKG"]
+
+    def test_none_when_every_channel_holds_samples(self):
+        for session_path in (GAPPED, LOSSY, CONTIGUOUS, TRUNCATED):
+            assert MEF3RecordingInterface.get_empty_channel_ids(session_path) == []
+
+    def test_every_channel_empty(self, gapped_copy):
+        for channel in ("Cz", "Fp1", "EKG"):
+            empty_channel(gapped_copy, channel, keep_data_files=True)
+        assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == ["Cz", "EKG", "Fp1"]
+        with pytest.raises(ValueError, match="channels_to_skip leaves no channels in the session"):
+            read_mef3_session(gapped_copy, channels_to_skip=["Cz", "EKG", "Fp1"])
+
+    def test_one_block_with_samples_is_not_empty(self, gapped_copy):
+        """Every block but the last of one segment cut from the index: the channel still holds samples."""
+        for index_path in sorted((gapped_copy / "Fp1.timd").rglob("*.tidx"))[1:]:
+            index_path.write_bytes(index_path.read_bytes()[:1024])
+        first = sorted((gapped_copy / "Fp1.timd").rglob("*.tidx"))[0]
+        first.write_bytes(first.read_bytes()[: 1024 + 56])
+        assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == []
+
+    def test_an_unreadable_index_raises_rather_than_being_listed(self, gapped_copy):
+        for index_path in (gapped_copy / "Fp1.timd").rglob("*.tidx"):
+            index_path.write_bytes(index_path.read_bytes()[:-1])
+        with pytest.raises(ValueError, match="truncated mid-entry"):
+            MEF3RecordingInterface.get_empty_channel_ids(gapped_copy)
+
+    def test_a_channel_without_segments_is_not_listed(self, gapped_copy):
+        (gapped_copy / "Pz.timd").mkdir()
+        assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == []
+
+    def test_an_encrypted_session_without_its_password(self):
+        """The indices are never encrypted, so a session's empty channels are listed without its password."""
+        assert MEF3RecordingInterface.get_empty_channel_ids(ENCRYPTED) == []
+
+
 class TestMEF3RecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):
     data_interface_cls = MEF3RecordingInterface
     interface_kwargs = dict(folder_path=str(TRUNCATED))
