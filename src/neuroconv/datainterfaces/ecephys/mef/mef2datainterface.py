@@ -317,7 +317,9 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         source_file = f"{recording.path.name} ({recording.stream_name})" if recording.number_of_streams > 1 else None
         add_runs_to_nwbfile(
             nwbfile,
-            recording_extractor=self.recording_extractor,
+            run_start_times=[
+                self.recording_extractor.get_start_time(segment_index=index) for index in range(len(recording.runs))
+            ],
             run_samples=[run.number_of_samples for run in recording.runs],
             sampling_frequency=recording.sampling_frequency,
             file_path=recording.path,

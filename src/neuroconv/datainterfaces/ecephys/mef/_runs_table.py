@@ -9,8 +9,9 @@ from .._intervals_tables import add_rows_to_intervals_table
 RUNS_TABLE_NAME = "runs"
 RUNS_TABLE_DESCRIPTION = (
     "Uninterrupted runs of samples in recordings with gaps. Each run is written as its own ElectricalSeries, "
-    "positioned at the run's start time. A recording, or a channel group of one, that has a single run has no "
-    "rows: its series' starting time places it."
+    "positioned at the run's start time, or, for a recording with many runs, as a stretch of one ElectricalSeries "
+    "whose timestamps hold the gaps. A recording, or a channel group of one, that has a single run has no rows: "
+    "its series' starting time places it."
 )
 RUNS_COLUMNS = {"run_index": "0-based index of the uninterrupted run of samples within its recording."}
 RUNS_SOURCE_FILE_DESCRIPTION = (
@@ -23,7 +24,7 @@ RUNS_SOURCE_FILE_DESCRIPTION = (
 def add_runs_to_nwbfile(
     nwbfile: NWBFile,
     *,
-    recording_extractor,
+    run_start_times,
     run_samples: list[int],
     sampling_frequency: float,
     file_path: Path,
@@ -31,13 +32,13 @@ def add_runs_to_nwbfile(
     source_file: str | None = None,
 ):
     """
-    Add one row per run to the ``runs`` table, each where the recording's segment for it starts.
+    Add one row per run to the ``runs`` table, starting at ``run_start_times``.
 
-    The start times are read from the recording, so any alignment moves the rows with the series.
+    The caller reads the start times from its recording, so any alignment moves the rows with the series.
     """
     rows = []
-    for run_index, number_of_samples in enumerate(run_samples):
-        start_time = float(recording_extractor.get_start_time(segment_index=run_index))
+    for run_index, (number_of_samples, start_time) in enumerate(zip(run_samples, run_start_times)):
+        start_time = float(start_time)
         rows.append(
             dict(
                 start_time=start_time,

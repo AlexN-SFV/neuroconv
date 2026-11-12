@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Literal
 
+import numpy as np
 from pydantic import DirectoryPath
 from pynwb import NWBFile
 
@@ -42,7 +43,8 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
 
     A session recorded with interruptions is written as one ``ElectricalSeries`` per uninterrupted run of
     blocks, sharing one electrodes table, each placed at its first block's start time, as discontinuous
-    EDF+ is. Each series uses the session's nominal sampling rate; a recording's clock drifts against it
+    EDF+ is, or, with ``concatenate_runs_above``, a session with many runs as one series with timestamps.
+    Each series uses the session's nominal sampling rate; a recording's clock drifts against it
     (by 28 ms over 55 minutes in ds004696), and the nominal rate is what puts the samples where BIDS event
     files, which count samples, place them.
 
@@ -179,10 +181,12 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         only read the session again.
         """
         from ._mef3_crypto import MEF3Passwords
+        from ._mef3_extractor import runs_ascend
         from ._mef3_reader import read_mef3_session
 
         folder_path = interface_kwargs["folder_path"]
         channels_to_skip = interface_kwargs.get("channels_to_skip")
+        concatenate_runs_above = interface_kwargs.get("concatenate_runs_above")
         self.extractor_kwargs = dict(folder_path=folder_path, channels_to_skip=channels_to_skip)
         # The passwords go to the reader but not into extractor_kwargs, which describe the extractor to others.
         passwords = MEF3Passwords.from_arguments(
@@ -198,9 +202,25 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             group_channels_to_skip = list(channels_to_skip or []) + [
                 channel.name for channel in session.channels if channel.name not in kept
             ]
+            group = session.channel_groups[index]
+            concatenate_runs = concatenate_runs_above is not None and len(group.runs) > concatenate_runs_above
+            if concatenate_runs and not runs_ascend(group.runs, group.sampling_frequency):
+                concatenate_runs = False
+                warnings.warn(
+                    f"The {len(group.runs)} runs of the MEF 3 channels "
+                    f"{', '.join(channel.name for channel in group.channels[:5])}"
+                    f"{', ...' if len(group.channels) > 5 else ''} of '{session.path.name}' are written as one series "
+                    "each, not concatenated: a run starts before the previous one ends, so their timestamps would go "
+                    "back in time.",
+                    UserWarning,
+                    stacklevel=_stacklevel_outside_neuroconv(),
+                )
             extractors.append(
                 extractor_class(
-                    folder_path=folder_path, channels_to_skip=group_channels_to_skip or None, _session=group_session
+                    folder_path=folder_path,
+                    channels_to_skip=group_channels_to_skip or None,
+                    concatenate_runs=concatenate_runs,
+                    _session=group_session,
                 )
             )
         if not hasattr(self, "_group_extractors"):
@@ -219,6 +239,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         password: str | None = None,
         level_1_password: str | None = None,
         level_2_password: str | None = None,
+        concatenate_runs_above: int | None = None,
     ):
         """
         Load and prepare data for MEF 3.
@@ -242,6 +263,14 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             it out.
         level_1_password, level_2_password : str, optional
             The session's passwords by level, instead of ``password``; each is checked at its own level.
+        concatenate_runs_above : int, optional
+            Write a channel group with more than this many runs as one ``ElectricalSeries`` with timestamps,
+            the runs back to back and the gaps in the timestamps, instead of one series per run. The default,
+            None, always writes one series per run. Every series costs time to build and write and space in the
+            file whatever its length, so a recording with thousands of short runs (a recorder that drops a few
+            samples every so often) takes far longer as thousands of series than as one, which the timestamps
+            make about twice the size of the samples for a single channel. The ``"runs"`` table lists the runs
+            either way.
         """
         super().__init__(
             folder_path=folder_path,
@@ -251,6 +280,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             password=password,
             level_1_password=level_1_password,
             level_2_password=level_2_password,
+            concatenate_runs_above=concatenate_runs_above,
         )
         if metadata_key is None:
             self.metadata_key = "mef3_recording"
@@ -492,32 +522,54 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             conversion_options.pop("parent_container")
         super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
 
-        if write_records and self.mef3_session.records:
-            self._add_records_to_nwbfile(nwbfile=nwbfile)
+        write_records = write_records and bool(self.mef3_session.records)
         # A single run is indistinguishable from an uninterrupted recording, so there is nothing to record.
-        if write_runs and len(self.mef3_session.runs) > 1:
-            self._add_runs_to_nwbfile(nwbfile=nwbfile)
+        write_runs = write_runs and len(self.mef3_session.runs) > 1
+        if write_records or write_runs:
+            run_start_times = self._run_start_times()
+        if write_records:
+            self._add_records_to_nwbfile(nwbfile=nwbfile, run_start_times=run_start_times)
+        if write_runs:
+            self._add_runs_to_nwbfile(nwbfile=nwbfile, run_start_times=run_start_times)
 
-    def _run_start_time(self, run_index: int) -> float:
-        """A run's start on the session timeline, read from the recording, so any alignment moves the tables too."""
-        return float(self.recording_extractor.get_start_time(segment_index=run_index))
+    def _run_start_times(self) -> np.ndarray:
+        """
+        Each run's start on the session timeline, read from the recording, so any alignment moves the tables too.
 
-    def _session_time(self, time: int) -> float:
-        """A µUTC time on the session timeline, shifted with the run it falls in, or the run before it."""
+        A run is a segment of the recording, or, when the runs were concatenated, a stretch of its one segment.
+        """
+        recording = self.recording_extractor
         runs = self.mef3_session.runs
-        run_index = 0
-        for index, run in enumerate(runs):
-            if time >= run.start_time:
-                run_index = index
-        run = runs[run_index]
+        if recording.get_num_segments() == len(runs):
+            return np.array([recording.get_start_time(segment_index=index) for index in range(len(runs))], dtype=float)
+        first_samples = np.concatenate([[0], np.cumsum([run.number_of_samples for run in runs])[:-1]])
+        return np.asarray(recording.get_times(segment_index=0)[first_samples], dtype=float)
+
+    def _session_time(
+        self, time: int, run_start_times: np.ndarray, run_start_utc: np.ndarray, starts_ascend: bool
+    ) -> float:
+        """
+        A µUTC time on the session timeline, shifted with the run it falls in, or the run before it: the last run
+        that starts at or before it, or the first run for a time before them all.
+
+        ``run_start_times`` is :meth:`_run_start_times`, ``run_start_utc`` the runs' µUTC starts and
+        ``starts_ascend`` whether those ascend, all worked out once for every time placed. Ascending starts, as
+        they nearly always are, are searched by bisection; a run can start before the previous one (a jump back),
+        and then every run is checked.
+        """
+        if starts_ascend:
+            run_index = max(int(np.searchsorted(run_start_utc, time, side="right")) - 1, 0)
+        else:
+            at_or_before = np.flatnonzero(run_start_utc <= time)
+            run_index = int(at_or_before[-1]) if at_or_before.size else 0
         # The run's shift from where the reader put it: 0.0 exactly unless the recording was aligned. Adding it
         # to the time from the session's start, rather than going through the run's own start, gives the
         # same float for a record whichever interface over the session writes it.
         session_start = self.mef3_session.start_time
-        shift = self._run_start_time(run_index) - (run.start_time - session_start) / 1e6
+        shift = float(run_start_times[run_index]) - (int(run_start_utc[run_index]) - session_start) / 1e6
         return (time - session_start) / 1e6 + shift
 
-    def _add_records_to_nwbfile(self, nwbfile: NWBFile):
+    def _add_records_to_nwbfile(self, nwbfile: NWBFile, run_start_times: np.ndarray):
         from ._mef3_reader import UUTC_NO_ENTRY
 
         # The records table is the session's and is written once, by whichever interface over the session
@@ -533,10 +585,12 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                 UserWarning,
                 stacklevel=_stacklevel_outside_neuroconv(),
             )
+        run_start_utc = np.array([run.start_time for run in self.mef3_session.runs], dtype=np.int64)
+        timing = (run_start_times, run_start_utc, bool(np.all(np.diff(run_start_utc) >= 0)))
         for record in self.mef3_session.records:
             if record.time == UUTC_NO_ENTRY:
                 continue
-            start_time = self._session_time(record.time)
+            start_time = self._session_time(record.time, *timing)
             # The other times the record states are placed on the same timeline, in seconds, so that no absolute
             # time is written and every time in the file stays relative to session_start_time. A stated time
             # before the session started is not a time of this recording (a placeholder, or the clock of another
@@ -545,7 +599,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                 part
                 for part in [record.details]
                 + [
-                    f"{name}_s={self._session_time(value):.6f}"
+                    f"{name}_s={self._session_time(value, *timing):.6f}"
                     for name, value in record.times.items()
                     if value >= self.mef3_session.start_time
                 ]
@@ -593,7 +647,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             source_file_description=_SOURCE_FILE_DESCRIPTION,
         )
 
-    def _add_runs_to_nwbfile(self, nwbfile: NWBFile):
+    def _add_runs_to_nwbfile(self, nwbfile: NWBFile, run_start_times: np.ndarray):
         session = self.mef3_session
         # A session at several rates, or in several channel groups, is written a group at a time, whose runs
         # differ; each group's rows are written, labelled with its rate as MEF 2 streams are, and its number when
@@ -604,7 +658,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         source_file = f"{session.path.name} ({label})" if label else None
         add_runs_to_nwbfile(
             nwbfile,
-            recording_extractor=self.recording_extractor,
+            run_start_times=run_start_times,
             run_samples=[run.number_of_samples for run in session.runs],
             sampling_frequency=session.sampling_frequency,
             file_path=session.path,

@@ -84,6 +84,12 @@ samples:
 * an unflagged block whose start time is more than a second from where the previous block ended starts a new
   run, with a warning, since no clock drifts that far in one block.
 
+A recording that drops a few samples every so often can have thousands of short runs, and thousands of series
+take far longer to write, and more room, than the samples in them. ``concatenate_runs_above=n`` writes a channel
+group with more than ``n`` runs as one ``ElectricalSeries`` with timestamps instead: the runs back to back, each
+at the nominal rate from its own start time, so the gaps are in the timestamps. The ``"runs"`` table lists the
+runs either way. Groups with ``n`` runs or fewer are still written one series per run.
+
 A segment with no data file and no block in its index, one a writer opened and never wrote to, is left out
 with a warning. A segment whose index lists blocks but which has no data file is refused.
 
