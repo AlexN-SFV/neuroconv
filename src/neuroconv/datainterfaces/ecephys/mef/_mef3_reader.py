@@ -532,9 +532,9 @@ def _read_channel(
 
     Empty segments, with no data file and no index entry, are left out with a warning.
     """
-    if not _segment_directories(channel_directory):
-        raise ValueError(f"The MEF 3 channel directory '{channel_directory}' holds no .segd segment directories.")
     segment_directories, empty_segments = _data_segment_directories(channel_directory)
+    if not segment_directories and not empty_segments:
+        raise ValueError(f"The MEF 3 channel directory '{channel_directory}' holds no .segd segment directories.")
     if not segment_directories:
         raise ValueError(
             f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, with no data file and no "

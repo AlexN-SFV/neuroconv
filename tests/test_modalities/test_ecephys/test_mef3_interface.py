@@ -964,8 +964,11 @@ class TestEmptyChannels:
             MEF3RecordingInterface.get_empty_channel_ids(gapped_copy)
 
     def test_a_channel_without_segments_is_not_listed(self, gapped_copy):
+        """Not a channel that holds no samples but a malformed one, which the reader refuses as such."""
         (gapped_copy / "Pz.timd").mkdir()
         assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == []
+        with pytest.raises(ValueError, match=r"'.*Pz\.timd' holds no \.segd segment directories"):
+            read_mef3_session(gapped_copy)
 
     def test_a_path_that_is_not_a_session_is_refused(self, tmp_path):
         """As read_mef3_session refuses it, rather than reading as a session with no empty channel."""
