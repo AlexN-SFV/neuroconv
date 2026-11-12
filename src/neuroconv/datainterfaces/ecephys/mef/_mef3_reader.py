@@ -790,8 +790,10 @@ def merge_channel_groups(
     keeps every member within ``max_fill``, else starts its own: a continuous channel beside channels with long gaps
     stays apart, since those channels would be missing too much of its time.
 
-    Every run must start a whole number of samples (within a quarter of one) after the rate's earliest run, and
-    a group whose runs overlap on that grid is never merged.
+    Each merged group has its own sample grid, from its first member's first run: a group joins it only when every
+    one of its runs starts a whole number of samples (within a quarter of one) from that, so one channel off the
+    clock is left apart without keeping the others from merging. A group whose runs overlap on a grid, or do not
+    start a whole number of samples apart among themselves, is never merged.
     """
     result = []
     for rate in sorted({group.sampling_frequency for group in groups}, reverse=True):
@@ -799,25 +801,29 @@ def merge_channel_groups(
         if len(at_rate) < 2:
             result += at_rate
             continue
-        reference = min(group.runs[0].start_time for group in at_rate)
-        clusters = []  # [groups, intervals of each, union]
+        clusters = []  # [groups, intervals of each on the cluster's grid, union, the grid's reference]
+        samples = {id(group): group.number_of_samples for group in at_rate}
         for group in at_rate:
-            intervals = _grid_runs(group, reference)
-            if intervals is None:
-                result.append(group)
-                continue
             for cluster in clusters:
+                intervals = _grid_runs(group, cluster[3])
+                if intervals is None:
+                    continue
                 union = _union([cluster[2], intervals])
                 total = int((union[:, 1] - union[:, 0]).sum())
                 members = cluster[0] + [group]
-                if all(member.number_of_samples >= (1.0 - max_fill) * total for member in members):
+                if all(samples[id(member)] >= (1.0 - max_fill) * total for member in members):
                     cluster[0].append(group)
                     cluster[1].append(intervals)
                     cluster[2] = union
                     break
             else:
-                clusters.append([[group], [intervals], intervals])
-        for members, member_intervals, union in clusters:
+                reference = group.runs[0].start_time
+                intervals = _grid_runs(group, reference)
+                if intervals is None:
+                    result.append(group)
+                else:
+                    clusters.append([[group], [intervals], intervals, reference])
+        for members, member_intervals, union, reference in clusters:
             if len(members) == 1:
                 result.append(members[0])
                 continue
@@ -1128,6 +1134,10 @@ def read_mef3_session(
         ElectricalSeries can hold; a session recorded at several rates, or whose channels were recorded over
         different stretches of time, has several.
     """
+    if merge_groups_max_fill is not None and not 0.0 <= merge_groups_max_fill < 1.0:
+        raise ValueError(
+            f"merge_groups_max_fill is a fraction, at least 0 and below 1 (0.01 for 1 %), not {merge_groups_max_fill}."
+        )
     path = Path(folder_path)
     channel_directories = _channel_directories(path)
     names = [directory.name[: -len(".timd")] for directory in channel_directories]
@@ -1159,8 +1169,6 @@ def read_mef3_session(
     gmt_offsets = [gmt_offsets[index] for index in order]
     channel_groups = _group_channels(channels, path)
     if merge_groups_max_fill is not None:
-        if not 0.0 <= merge_groups_max_fill < 1.0:
-            raise ValueError(f"merge_groups_max_fill must be at least 0 and below 1, not {merge_groups_max_fill}.")
         channel_groups = merge_channel_groups(channel_groups, merge_groups_max_fill, channels, path)
     _warn_about_groups(channel_groups, path)
 

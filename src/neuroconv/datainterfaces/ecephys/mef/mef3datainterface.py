@@ -552,29 +552,38 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             self._add_missing_samples_to_nwbfile(nwbfile=nwbfile)
 
     def _group_sample_times(self, indices: np.ndarray) -> np.ndarray:
-        """The times, on the session timeline as written, of samples of this interface's group by their index among
-        its samples (its runs back to back), read from the recording so any alignment moves them too."""
+        """
+        The times, on the session timeline as written, of samples of this interface's group by their index among its
+        samples (its runs back to back), read from the recording so any alignment moves them too.
+
+        A run per segment is placed from the segments' start times; only runs concatenated into one segment read
+        its time vector, which then exists already.
+        """
         recording = self.recording_extractor
         indices = np.asarray(indices, dtype=np.int64)
-        if recording.get_num_segments() == 1:
-            return np.asarray(recording.get_times(segment_index=0)[indices], dtype=float)
         lengths = [run.number_of_samples for run in self.mef3_session.runs]
-        first_samples = np.concatenate([[0], np.cumsum(lengths)[:-1]])
-        segments = np.searchsorted(first_samples, indices, side="right") - 1
-        starts = np.array([recording.get_start_time(segment_index=index) for index in range(len(lengths))])
-        return starts[segments] + (indices - first_samples[segments]) / recording.get_sampling_frequency()
+        if recording.get_num_segments() == len(lengths):
+            first_samples = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+            segments = np.searchsorted(first_samples, indices, side="right") - 1
+            starts = np.array([recording.get_start_time(segment_index=index) for index in range(len(lengths))])
+            return starts[segments] + (indices - first_samples[segments]) / recording.get_sampling_frequency()
+        return np.asarray(recording.get_times(segment_index=0)[indices], dtype=float)
 
     def _add_missing_samples_to_nwbfile(self, nwbfile: NWBFile):
         """
         List, in ``invalid_times``, each stretch where a channel of a merged group has no sample and is written as 0.
 
         One row per channel and uninterrupted stretch: a stretch that runs across a gap of the group's ends at it.
+        The rows are written once per group into a file, as the runs are; they carry no ``source_file`` column, since
+        their channel and times place them, and every text column of an intervals table is text a reader of the file
+        (a PHI scan, say) goes through.
         """
-        group = self.mef3_session.channel_groups[0]
+        session = self.mef3_session
+        group = session.channel_groups[0]
         lengths = np.array([run.number_of_samples for run in group.runs], dtype=np.int64)
         run_firsts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
         total = int(lengths.sum())
-        rows = []
+        stretches = []
         for channel, positions in zip(group.channels, group.channel_run_positions):
             own_lengths = np.array([run.number_of_samples for run in channel.runs], dtype=np.int64)
             starts = np.concatenate([[0], positions + own_lengths])
@@ -583,42 +592,36 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                 # Cut at the group's own run boundaries, so each row is one interval of time.
                 cuts = run_firsts[(run_firsts > start) & (run_firsts < end)]
                 for piece_start, piece_end in zip(np.concatenate([[start], cuts]), np.concatenate([cuts, [end]])):
-                    rows.append((channel.name, int(piece_start), int(piece_end)))
-        if not rows:
+                    stretches.append((channel.name, int(piece_start), int(piece_end)))
+        if not stretches:
             return
-        firsts = self._group_sample_times(np.array([row[1] for row in rows]))
-        lasts = self._group_sample_times(np.array([row[2] - 1 for row in rows]))
-        period = 1.0 / self.mef3_session.sampling_frequency
-        table_rows = sorted(
-            (float(first), float(last) + period, name, end - start)
-            for (name, start, end), first, last in zip(rows, firsts, lasts)
+        firsts = self._group_sample_times(np.array([stretch[1] for stretch in stretches]))
+        lasts = self._group_sample_times(np.array([stretch[2] - 1 for stretch in stretches]))
+        period = 1.0 / session.sampling_frequency
+        rows = [
+            dict(start_time=float(first), stop_time=float(last) + period, channel=name, number_of_samples=end - start)
+            for (name, start, end), first, last in zip(stretches, firsts, lasts)
+        ]
+        rows.sort(key=lambda row: (row["start_time"], row["channel"]))
+        label = getattr(self, "_runs_label", None)
+        add_rows_to_intervals_table(
+            nwbfile=nwbfile,
+            file_path=session.path,
+            name="invalid_times",
+            description="Time intervals that should be removed from analysis.",
+            columns={
+                "channel": (
+                    "The channel that has no sample over the interval. Its series has samples there for other "
+                    "channels, so this channel's samples over the interval were written as 0 and are not recorded data."
+                ),
+                "number_of_samples": "How many of the channel's samples over the interval were written as 0.",
+            },
+            rows=rows,
+            kind="MEF 3",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
+            source_file=f"{session.path.name} ({label})" if label else None,
+            source_file_column=False,
         )
-        columns = {
-            "channel": (
-                "The channel that has no sample over the interval. Its series has samples there for other channels, "
-                "so this channel's samples over the interval were written as 0 and are not recorded data."
-            ),
-            "number_of_samples": "How many of the channel's samples over the interval were written as 0.",
-        }
-        table = nwbfile.invalid_times
-        if table is None or not len(table):
-            existing = set(table.colnames) if table is not None else set()
-            for name, description in columns.items():
-                if name not in existing:
-                    nwbfile.add_invalid_times_column(name=name, description=description)
-        elif not set(columns) <= set(table.colnames):
-            warnings.warn(
-                f"The NWB file's invalid_times table already has rows without the columns {sorted(columns)}, so the "
-                f"{len(table_rows)} stretches where channels of '{self.mef3_session.path.name}' were written as 0 "
-                "are not listed there.",
-                UserWarning,
-                stacklevel=_stacklevel_outside_neuroconv(),
-            )
-            return
-        for start_time, stop_time, name, count in table_rows:
-            nwbfile.add_invalid_time_interval(
-                start_time=start_time, stop_time=stop_time, channel=name, number_of_samples=count
-            )
 
     def _run_start_times(self) -> np.ndarray:
         """

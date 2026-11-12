@@ -32,6 +32,7 @@ def add_rows_to_intervals_table(
     kind: str,
     source_file_description: str,
     source_file: str | None = None,
+    source_file_column: bool = True,
 ):
     """
     Add ``rows`` read from ``file_path`` to the ``TimeIntervals`` table ``name``, creating it if the file has none.
@@ -41,7 +42,8 @@ def add_rows_to_intervals_table(
     so only the first of them to reach this NWB file writes them. A table of that name with other columns
     came from something else and is left alone, with a warning.
 
-    The table named ``"epochs"`` is ``nwbfile.epochs``; every other name is an entry of ``nwbfile.intervals``.
+    The table named ``"epochs"`` is ``nwbfile.epochs`` and ``"invalid_times"`` is ``nwbfile.invalid_times``; every
+    other name is an entry of ``nwbfile.intervals``.
 
     Which files have been written is known only for the NWB file in memory. Appending on disk to a file
     that already holds a source file's rows writes them again.
@@ -70,6 +72,10 @@ def add_rows_to_intervals_table(
         What the rows' ``source_file`` column says, in place of the name of ``file_path``. For a source that
         holds more than one set of rows for the table, such as each sampling rate of a MEF 2 recording; each
         set is then written once.
+    source_file_column : bool, default: True
+        If False, the rows get no ``source_file`` column; ``source_file`` still says which rows have been written.
+        For a table whose rows say which file they came from by other means, where a column of file names would
+        only be more text for a reader of the file to go through.
     """
     from pynwb.epoch import TimeIntervals
 
@@ -84,7 +90,8 @@ def add_rows_to_intervals_table(
     # Marked before writing, so a clash with a foreign table warns once per source file, not once per interface.
     written.add(key)
 
-    columns = dict(columns, source_file=source_file_description)
+    if source_file_column:
+        columns = dict(columns, source_file=source_file_description)
 
     table = _get_table(nwbfile=nwbfile, name=name)
     if table is None:
@@ -107,12 +114,17 @@ def add_rows_to_intervals_table(
             return
 
     for row in rows:
-        table.add_row(**row, source_file=source_file)
+        if source_file_column:
+            table.add_row(**row, source_file=source_file)
+        else:
+            table.add_row(**row)
 
 
 def _get_table(nwbfile: NWBFile, name: str):
     if name == "epochs":
         return nwbfile.epochs
+    if name == "invalid_times":
+        return nwbfile.invalid_times
     if nwbfile.intervals is not None and name in nwbfile.intervals:
         return nwbfile.intervals[name]
     return None
@@ -123,5 +135,7 @@ def _add_table(nwbfile: NWBFile, table):
     # nwbfile.intervals instead is written to the same group without an error, and one of the two is lost.
     if table.name == "epochs":
         nwbfile.epochs = table
+    elif table.name == "invalid_times":
+        nwbfile.invalid_times = table
     else:
         nwbfile.add_time_intervals(table)

@@ -1539,3 +1539,94 @@ class TestMergedChannelGroups:
             interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata())
         assert sorted(series.starting_time for series in nwbfile.acquisition.values()) == [10.0, 14.0]
         np.testing.assert_allclose(nwbfile.invalid_times["start_time"][:], [10.5, 12.0, 12.0])
+
+    @staticmethod
+    def make_dropout(session_path: Path, channel: str, block: int):
+        """One channel's blocks ``block`` onwards of segment 0 start a 250-sample block later, behind a flagged block."""
+        shift_channel_blocks(session_path, channel, segment=0, first_block=block, by_microseconds=250_000)
+        flag_channel_block(session_path, channel, segment=0, block=block)
+
+    def test_one_channel_off_the_clock_does_not_keep_the_others_apart(self, gapped_copy):
+        """A merged group's grid is its first member's: EKG 0.4 samples off and starting earliest is left apart,
+        while Cz and Fp1, each with a dropout of its own, still merge."""
+        self.make_dropout(gapped_copy, "Fp1", block=4)
+        self.make_dropout(gapped_copy, "EKG", block=2)
+        for segment in (0, 1):
+            shift_channel_blocks(gapped_copy, "EKG", segment=segment, first_block=0, by_microseconds=-400)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            session = read_mef3_session(gapped_copy, merge_groups_max_fill=0.1)
+        groups = {tuple(channel.name for channel in group.channels): group for group in session.channel_groups}
+        assert set(groups) == {("Cz", "Fp1"), ("EKG",)}
+        assert groups[("Cz", "Fp1")].channel_run_positions is not None
+        assert groups[("EKG",)].channel_run_positions is None
+        assert session.start_time == START_TIME - 400
+
+    def test_a_merged_group_beside_a_group_at_another_rate(self, gapped_copy, tmp_path):
+        make_slower_ekg(gapped_copy)
+        self.make_dropout(gapped_copy, "Fp1", block=4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(folder_path=gapped_copy, merge_groups_max_fill=0.1)
+        parts = interface.split_by_channel_group()
+        assert [
+            (list(part.channel_ids), part.mef3_session.channel_groups[0].channel_run_positions is not None)
+            for part in parts
+        ] == [
+            (["Cz", "Fp1"], True),
+            (["EKG"], False),
+        ]
+        nwbfile_path = tmp_path / "two_rates.nwb"
+        write_quietly(interface, nwbfile_path)
+        with NWBHDF5IO(nwbfile_path, "r") as io:
+            nwbfile = io.read()
+            assert sorted(nwbfile.acquisition) == [
+                "ElectricalSeries_1000Hz0",
+                "ElectricalSeries_1000Hz1",
+                "ElectricalSeries_500Hz0",
+                "ElectricalSeries_500Hz1",
+            ]
+            assert nwbfile.acquisition["ElectricalSeries_1000Hz0"].data.shape == (2250, 2)
+            invalid = nwbfile.invalid_times.to_dataframe()
+            assert list(zip(invalid["channel"], invalid["number_of_samples"])) == [("Fp1", 250), ("Cz", 250)]
+            assert "source_file" not in invalid.columns
+
+    @pytest.mark.parametrize("concatenate_runs_above", [None, 1], ids=["per_run", "concatenated"])
+    def test_a_stub_of_a_merged_group(self, gapped_copy, concatenate_runs_above):
+        make_ekg_dropout(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(
+                folder_path=gapped_copy, merge_groups_max_fill=0.1, concatenate_runs_above=concatenate_runs_above
+            )
+            nwbfile = mock_NWBFile()
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=interface.get_metadata(), stub_test=True)
+        assert {series.data.maxshape for series in nwbfile.acquisition.values()} == {(100, 3)}
+
+    def test_the_fill_limit_is_checked_before_the_session_is_read(self, tmp_path):
+        with pytest.raises(ValueError, match=r"merge_groups_max_fill is a fraction"):
+            read_mef3_session(tmp_path / "not_a_session.mefd", merge_groups_max_fill=5)
+
+    def test_missing_samples_are_listed_once_per_group(self, gapped_copy):
+        make_ekg_dropout(gapped_copy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(folder_path=gapped_copy, merge_groups_max_fill=0.1)
+            nwbfile = mock_NWBFile()
+            metadata = interface.get_metadata()
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
+            # A second write of the same session into the same file (another interface over it) adds no rows.
+            interface._add_missing_samples_to_nwbfile(nwbfile=nwbfile)
+        assert len(nwbfile.invalid_times) == 3
+
+    def test_a_foreign_invalid_times_table_is_left_alone(self, gapped_copy):
+        make_ekg_dropout(gapped_copy)
+        nwbfile = mock_NWBFile()
+        nwbfile.add_invalid_times_column(name="reason", description="Why the interval is invalid.")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            interface = MEF3RecordingInterface(folder_path=gapped_copy, merge_groups_max_fill=0.1)
+            metadata = interface.get_metadata()
+        with pytest.warns(UserWarning, match=r"already has an intervals table named 'invalid_times'"):
+            interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
+        assert len(nwbfile.invalid_times) == 0
