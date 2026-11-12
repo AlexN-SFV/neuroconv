@@ -878,10 +878,7 @@ class TestEmptySegments:
             read_mef3_session(gapped_copy)
 
     def test_a_channel_of_empty_segments_is_refused(self, gapped_copy):
-        for data_path in (gapped_copy / "Cz.timd").rglob("*.tdat"):
-            data_path.unlink()
-        for index_path in (gapped_copy / "Cz.timd").rglob("*.tidx"):
-            index_path.write_bytes(index_path.read_bytes()[:1024])
+        empty_channel(gapped_copy, "Cz", keep_data_files=False)
         with pytest.raises(ValueError, match="Every segment of the MEF 3 channel 'Cz.timd' is empty"):
             read_mef3_session(gapped_copy)
         assert len(read_mef3_session(gapped_copy, channels_to_skip=["Cz"]).channels) == 2
@@ -969,6 +966,28 @@ class TestEmptyChannels:
     def test_a_channel_without_segments_is_not_listed(self, gapped_copy):
         (gapped_copy / "Pz.timd").mkdir()
         assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == []
+
+    def test_a_path_that_is_not_a_session_is_refused(self, tmp_path):
+        """As read_mef3_session refuses it, rather than reading as a session with no empty channel."""
+        with pytest.raises(ValueError, match="holds no .timd channel directories"):
+            MEF3RecordingInterface.get_empty_channel_ids(tmp_path)
+        with pytest.raises(ValueError, match="is not a directory"):
+            MEF3RecordingInterface.get_empty_channel_ids(tmp_path / "missing.mefd")
+        with pytest.raises(ValueError, match="holds no .timd channel directories"):
+            MEF3RecordingInterface.get_channel_sampling_frequencies(tmp_path)
+
+    def test_segments_with_only_their_metadata_file(self, gapped_copy):
+        """A writer that opened the segments and never wrote: listed, and skipped with its records."""
+        whole = read_mef3_session(GAPPED)
+        for segment_directory in (gapped_copy / "Cz.timd").glob("*.segd"):
+            for path in [*segment_directory.glob("*.tidx"), *segment_directory.glob("*.tdat")]:
+                path.unlink()
+        assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == ["Cz"]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            session = read_mef3_session(gapped_copy, channels_to_skip=["Cz"])
+        assert session.records == whole.records
+        assert session.start_time == whole.start_time
 
     def test_an_encrypted_session_without_its_password(self):
         """The indices are never encrypted, so a session's empty channels are listed without its password."""

@@ -376,6 +376,25 @@ _LEAVE_EMPTY_CHANNELS_OUT = (
 )
 
 
+def _channel_directories(path: Path) -> list[Path]:
+    """A session's ``.timd`` channel directories, in name order; a path that is not a session is refused."""
+    if not path.is_dir():
+        raise ValueError(f"'{path}' is not a directory. A MEF 3 session is a .mefd directory.")
+    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
+    if not channel_directories:
+        raise ValueError(f"'{path}' holds no .timd channel directories, so it is not a MEF 3 session.")
+    return channel_directories
+
+
+def _metadata_segment_directory(data_segments: list[Path], empty_segments: list[Path]) -> Path | None:
+    """
+    The segment whose metadata file describes a channel, given its segments as :func:`_data_segment_directories`
+    splits them: its first segment that holds data, else its first segment, for a channel whose segments are all
+    empty. None for a channel with no segment.
+    """
+    return (data_segments or empty_segments or [None])[0]
+
+
 def _data_segment_directories(channel_directory: Path) -> tuple[list[Path], list[Path]]:
     """A channel's segment directories in segment order, as those that hold data and those that are empty."""
     data, empty = [], []
@@ -894,10 +913,10 @@ def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_n
         segment_directories, empty_segments = _data_segment_directories(directory)
         # A channel whose segments are all empty, one skipped because it holds no samples, still has metadata
         # and records; its first segment's metadata file gives its rate and recording time offset.
-        metadata_directories = segment_directories or empty_segments
-        if not metadata_directories:
+        metadata_directory = _metadata_segment_directory(segment_directories, empty_segments)
+        if metadata_directory is None:
             raise ValueError("it holds no .segd segment directory")
-        metadata = _read_segment_metadata(_only_file(metadata_directories[0], ".tmet"), passwords)
+        metadata = _read_segment_metadata(_only_file(metadata_directory, ".tmet"), passwords)
         # As _read_channel checks it: meflib's "no entry" is -1.0, and a dead channel is one a user skips.
         if not (np.isfinite(metadata["sampling_frequency"]) and metadata["sampling_frequency"] > 0):
             raise ValueError(f"it gives a sampling frequency of {metadata['sampling_frequency']}")
@@ -957,11 +976,7 @@ def read_mef3_session(
         different stretches of time, has several.
     """
     path = Path(folder_path)
-    if not path.is_dir():
-        raise ValueError(f"'{path}' is not a directory. A MEF 3 session is a .mefd directory.")
-    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
-    if not channel_directories:
-        raise ValueError(f"'{path}' holds no .timd channel directories, so it is not a MEF 3 session.")
+    channel_directories = _channel_directories(path)
     names = [directory.name[: -len(".timd")] for directory in channel_directories]
     to_skip = set(channels_to_skip or [])
     unknown = sorted(to_skip - set(names))
@@ -1098,13 +1113,12 @@ def channel_sampling_frequencies(folder_path, passwords: MEF3Passwords | None = 
     index, to choose channels to leave out with ``channels_to_skip``.
     """
     path = Path(folder_path)
-    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
     names, numbers, rates = [], [], []
-    for directory in channel_directories:
-        segment_directories = _data_segment_directories(directory)[0] or _segment_directories(directory)
-        if not segment_directories:
+    for directory in _channel_directories(path):
+        metadata_directory = _metadata_segment_directory(*_data_segment_directories(directory))
+        if metadata_directory is None:
             raise ValueError(f"The MEF 3 channel directory '{directory}' holds no .segd segment directories.")
-        metadata = _read_segment_metadata(_only_file(segment_directories[0], ".tmet"), passwords)
+        metadata = _read_segment_metadata(_only_file(metadata_directory, ".tmet"), passwords)
         names.append(directory.name[: -len(".timd")])
         numbers.append(metadata["acquisition_channel_number"])
         rates.append(metadata["sampling_frequency"])
@@ -1120,9 +1134,9 @@ def _holds_no_samples(channel_directory: Path) -> bool:
     directory is not said to be empty, and an index read on the way that cannot be read raises: neither is a
     channel that holds no samples, and the reader refuses both as they are.
     """
-    if not _segment_directories(channel_directory):
+    segment_directories, empty_segments = _data_segment_directories(channel_directory)
+    if not segment_directories and not empty_segments:
         return False
-    segment_directories, _ = _data_segment_directories(channel_directory)
     return not any(
         (_read_time_series_index(_only_file(segment_directory, ".tidx"))["number_of_samples"] > 0).any()
         for segment_directory in segment_directories
@@ -1136,13 +1150,14 @@ def empty_channel_names(folder_path) -> list[str]:
     A writer may create a channel and never write a block with samples to it. :func:`read_mef3_session` refuses
     such a channel unless it is in ``channels_to_skip``; this lists them, to leave them out. Only the block
     indices are read, which MEF 3 never encrypts, so no password is needed. A channel whose index cannot be read
-    is not listed: reading its index raises.
+    is not listed: reading its index raises. A path that is not a session is refused, as by
+    :func:`read_mef3_session`.
     """
-    path = Path(folder_path)
-    if not path.is_dir():
-        raise ValueError(f"'{path}' is not a directory. A MEF 3 session is a .mefd directory.")
-    channel_directories = sorted(directory for directory in path.glob("*.timd") if directory.is_dir())
-    return [directory.name[: -len(".timd")] for directory in channel_directories if _holds_no_samples(directory)]
+    return [
+        directory.name[: -len(".timd")]
+        for directory in _channel_directories(Path(folder_path))
+        if _holds_no_samples(directory)
+    ]
 
 
 def available_channel_names(folder_path, passwords: MEF3Passwords | None = None) -> list[str]:
