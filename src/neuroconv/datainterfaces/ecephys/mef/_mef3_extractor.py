@@ -12,6 +12,7 @@ import path in ``to_dict()``; classes built inside a function cannot be pickled 
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 from pydantic import DirectoryPath
@@ -24,57 +25,30 @@ from .._channel_ids import _stacklevel_outside_neuroconv
 from .._voltage_units import unit_to_microvolts
 
 
-class MEF3RecordingSegment(BaseRecordingSegment):
-    """
-    Runs of a session, decoded lazily, block by block, from each channel's data files.
-
-    Usually the one uninterrupted run ``run_index``, placed at ``t_start``. With ``time_vector`` it is
-    ``number_of_runs`` consecutive runs from ``run_index``, back to back, and the time vector gives each
-    sample's time, gaps included.
-    """
+class _MEF3Segment(BaseRecordingSegment):
+    """What the MEF 3 segments share: their number of samples, and traces assembled a channel at a time."""
 
     def __init__(
         self,
         *,
         channels: list[MEF3Channel],
-        run_index: int,
         number_of_samples: int,
         sampling_frequency: float,
         t_start: float | None = None,
         time_vector: np.ndarray | None = None,
-        number_of_runs: int = 1,
     ):
         # The rate stays beside a time vector, as spikeinterface's own set_times leaves it: a frame slice of the
         # segment (a stub) rebuilds it from its times kwargs without the vector, and needs the rate then.
         super().__init__(sampling_frequency=sampling_frequency, t_start=t_start, time_vector=time_vector)
         self._channels = channels
         self._number_of_samples = number_of_samples
-        # Per channel: the segment's first block and the sample each of its blocks ends at, within the segment.
-        # A channel's runs partition its blocks in order, so consecutive runs are consecutive blocks.
-        self._first_blocks = []
-        self._block_ends = []
-        for channel in channels:
-            first_run, last_run = channel.runs[run_index], channel.runs[run_index + number_of_runs - 1]
-            first_block = first_run.first_block
-            end_block = last_run.first_block + last_run.number_of_blocks
-            counts = channel.blocks["number_of_samples"][first_block:end_block]
-            self._first_blocks.append(first_block)
-            self._block_ends.append(np.cumsum(counts))
 
     def get_num_samples(self) -> int:
         return int(self._number_of_samples)
 
     def _read_channel(self, position: int, start_frame: int, end_frame: int) -> np.ndarray:
-        """Samples ``start_frame`` to ``end_frame`` of one channel, decoding only the blocks they fall in."""
-        block_ends = self._block_ends[position]
-        first = int(np.searchsorted(block_ends, start_frame, side="right"))
-        last = int(np.searchsorted(block_ends, end_frame - 1, side="right"))
-        samples = self._channels[position].read_blocks(self._first_blocks[position] + first, last - first + 1)
-        first_sample_of_blocks = int(block_ends[first]) - int(
-            self._channels[position].blocks["number_of_samples"][self._first_blocks[position] + first]
-        )
-        offset = start_frame - first_sample_of_blocks
-        return samples[offset : offset + (end_frame - start_frame)]
+        """Samples ``start_frame`` to ``end_frame`` of the channel at ``position``, as int32."""
+        raise NotImplementedError
 
     def get_traces(self, start_frame=None, end_frame=None, channel_indices=None) -> np.ndarray:
         start_frame = 0 if start_frame is None else max(int(start_frame), 0)
@@ -96,6 +70,146 @@ class MEF3RecordingSegment(BaseRecordingSegment):
             for column, position in enumerate(positions):
                 traces[:, column] = self._read_channel(position, start_frame, end_frame)
         return traces
+
+
+class MEF3RecordingSegment(_MEF3Segment):
+    """
+    Runs of a session, decoded lazily, block by block, from each channel's data files.
+
+    Usually the one uninterrupted run ``run_index``, placed at ``t_start``. With ``time_vector`` it is
+    ``number_of_runs`` consecutive runs from ``run_index``, back to back, and the time vector gives each
+    sample's time, gaps included.
+    """
+
+    def __init__(
+        self,
+        *,
+        channels: list[MEF3Channel],
+        run_index: int,
+        number_of_samples: int,
+        sampling_frequency: float,
+        t_start: float | None = None,
+        time_vector: np.ndarray | None = None,
+        number_of_runs: int = 1,
+    ):
+        super().__init__(
+            channels=channels,
+            number_of_samples=number_of_samples,
+            sampling_frequency=sampling_frequency,
+            t_start=t_start,
+            time_vector=time_vector,
+        )
+        # Per channel: the segment's first block and the sample each of its blocks ends at, within the segment.
+        # A channel's runs partition its blocks in order, so consecutive runs are consecutive blocks.
+        self._first_blocks = []
+        self._block_ends = []
+        for channel in channels:
+            first_run, last_run = channel.runs[run_index], channel.runs[run_index + number_of_runs - 1]
+            first_block = first_run.first_block
+            end_block = last_run.first_block + last_run.number_of_blocks
+            counts = channel.blocks["number_of_samples"][first_block:end_block]
+            self._first_blocks.append(first_block)
+            self._block_ends.append(np.cumsum(counts))
+
+    def _read_channel(self, position: int, start_frame: int, end_frame: int) -> np.ndarray:
+        """Samples ``start_frame`` to ``end_frame`` of one channel, decoding only the blocks they fall in."""
+        block_ends = self._block_ends[position]
+        first = int(np.searchsorted(block_ends, start_frame, side="right"))
+        last = int(np.searchsorted(block_ends, end_frame - 1, side="right"))
+        samples = self._channels[position].read_blocks(self._first_blocks[position] + first, last - first + 1)
+        first_sample_of_blocks = int(block_ends[first]) - int(
+            self._channels[position].blocks["number_of_samples"][self._first_blocks[position] + first]
+        )
+        offset = start_frame - first_sample_of_blocks
+        return samples[offset : offset + (end_frame - start_frame)]
+
+
+@dataclass(frozen=True)
+class FilledChannel:
+    """
+    Where a channel of a merged group sits among the group's samples (its runs back to back): built once per
+    group by :func:`filled_channels` and shared by every segment over it.
+    """
+
+    starts: np.ndarray  # the index among the group's samples at which each of the channel's runs starts
+    lengths: np.ndarray  # each run's number of samples
+    own_starts: np.ndarray  # the index among the channel's own samples at which each run starts
+    block_ends: np.ndarray  # the own sample each of the channel's blocks ends at
+
+
+def filled_channels(group) -> list[FilledChannel]:
+    """One :class:`FilledChannel` per channel of a merged group (see ``MEF3ChannelGroup.channel_run_positions``)."""
+    pieces = []
+    for channel, positions in zip(group.channels, group.channel_run_positions):
+        lengths = np.array([run.number_of_samples for run in channel.runs], dtype=np.int64)
+        pieces.append(
+            FilledChannel(
+                starts=np.asarray(positions, dtype=np.int64),
+                lengths=lengths,
+                own_starts=np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int64),
+                block_ends=np.cumsum(channel.blocks["number_of_samples"].astype(np.int64)),
+            )
+        )
+    return pieces
+
+
+class MEF3FilledRecordingSegment(_MEF3Segment):
+    """
+    Runs of a channel group merged from groups whose runs differ (see
+    :func:`._mef3_reader.merge_channel_groups`): ``number_of_samples`` of the group's samples from
+    ``first_sample``, its runs back to back. Each channel's samples are placed where its own runs sit among the
+    group's, and a channel with no sample at a time the group has is read there as 0. ``pieces`` is
+    :func:`filled_channels` of the group, shared by all its segments.
+    """
+
+    def __init__(
+        self,
+        *,
+        channels: list[MEF3Channel],
+        pieces: list[FilledChannel],
+        first_sample: int,
+        number_of_samples: int,
+        sampling_frequency: float,
+        t_start: float | None = None,
+        time_vector: np.ndarray | None = None,
+    ):
+        super().__init__(
+            channels=channels,
+            number_of_samples=number_of_samples,
+            sampling_frequency=sampling_frequency,
+            t_start=t_start,
+            time_vector=time_vector,
+        )
+        self._pieces = pieces
+        self._first_sample = first_sample
+
+    def _decode(self, position: int, start: int, end: int) -> np.ndarray:
+        """The channel's own samples ``start`` to ``end``, decoding only the blocks they fall in."""
+        channel, block_ends = self._channels[position], self._pieces[position].block_ends
+        first = int(np.searchsorted(block_ends, start, side="right"))
+        last = int(np.searchsorted(block_ends, end - 1, side="right"))
+        samples = channel.read_blocks(first, last - first + 1)
+        offset = start - (int(block_ends[first]) - int(channel.blocks["number_of_samples"][first]))
+        return samples[offset : offset + (end - start)]
+
+    def _read_channel(self, position: int, start_frame: int, end_frame: int) -> np.ndarray:
+        piece = self._pieces[position]
+        starts, lengths = piece.starts, piece.lengths
+        low, high = self._first_sample + start_frame, self._first_sample + end_frame
+        column = np.zeros(end_frame - start_frame, dtype=np.int32)
+        # The channel's runs that overlap the window: from the first ending after its start to the last starting
+        # before its end. The channel's own samples over them are consecutive.
+        first = int(np.searchsorted(starts + lengths, low, side="right"))
+        stop = int(np.searchsorted(starts, high, side="left"))
+        if first >= stop:
+            return column
+        lows = np.maximum(starts[first:stop], low)
+        counts = np.minimum(starts[first:stop] + lengths[first:stop], high) - lows
+        own_first = int(piece.own_starts[first] + (lows[0] - starts[first]))
+        samples = self._decode(position, own_first, own_first + int(counts.sum()))
+        within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+        column[np.repeat(lows - low, counts) + within] = samples
+        return column
 
 
 def runs_ascend(runs, sampling_frequency: float) -> bool:
@@ -219,6 +333,10 @@ class MEF3RecordingExtractor(BaseRecording):
         one segment per run. A recording with thousands of short runs (a recorder that drops a few samples
         every so often) is then written as one series with timestamps, rather than as thousands of series.
         Refused when a run starts before the previous one ends, since the times would go back.
+    merge_groups_max_fill : float, optional
+        Merge channel groups at one rate that share one sample clock into one, where no channel then has no
+        sample for more than this fraction of its samples; a channel's missing samples are read as 0 (see
+        :func:`._mef3_reader.merge_channel_groups`). The session must still come to one group.
 
     The passwords are only needed while the session is read here, and are left out of the extractor's kwargs,
     so ``to_dict()`` and anything that serialises the extractor never carry them. An encrypted session's
@@ -241,12 +359,18 @@ class MEF3RecordingExtractor(BaseRecording):
         level_1_password: str | None = None,
         level_2_password: str | None = None,
         concatenate_runs: bool = False,
+        merge_groups_max_fill: float | None = None,
         *,
         _session: MEF3Session | None = None,
     ):
         if _session is None:
             passwords = MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
-            session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
+            session = read_mef3_session(
+                folder_path,
+                channels_to_skip=channels_to_skip,
+                passwords=passwords,
+                merge_groups_max_fill=merge_groups_max_fill,
+            )
         else:
             session = _session
         # Raises, describing the groups, when the session has several.
@@ -264,28 +388,42 @@ class MEF3RecordingExtractor(BaseRecording):
                 "the previous one ends, so their samples back to back would go back in time. Read them as one "
                 "segment per run (concatenate_runs=False)."
             )
-        if concatenate_runs and len(runs) > 1:
-            self.add_recording_segment(
-                MEF3RecordingSegment(
+        lengths = [run.number_of_samples for run in runs]
+        first_samples = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int64)
+        group = session._only_group()
+        if group.channel_run_positions is not None:
+            # A merged group: its channels' pieces are built once, here, and shared by every segment.
+            pieces = filled_channels(group)
+
+            def segment(run_index: int, number_of_runs: int, **timing):
+                return MEF3FilledRecordingSegment(
                     channels=session.channels,
-                    run_index=0,
-                    number_of_runs=len(runs),
-                    number_of_samples=sum(run.number_of_samples for run in runs),
+                    pieces=pieces,
+                    first_sample=int(first_samples[run_index]),
+                    number_of_samples=int(sum(lengths[run_index : run_index + number_of_runs])),
                     sampling_frequency=session.sampling_frequency,
-                    time_vector=_runs_time_vector(runs, session.sampling_frequency, session.start_time),
+                    **timing,
                 )
-            )
+
+        else:
+
+            def segment(run_index: int, number_of_runs: int, **timing):
+                return MEF3RecordingSegment(
+                    channels=session.channels,
+                    run_index=run_index,
+                    number_of_runs=number_of_runs,
+                    number_of_samples=int(sum(lengths[run_index : run_index + number_of_runs])),
+                    sampling_frequency=session.sampling_frequency,
+                    **timing,
+                )
+
+        if concatenate_runs and len(runs) > 1:
+            time_vector = _runs_time_vector(runs, session.sampling_frequency, session.start_time)
+            self.add_recording_segment(segment(0, len(runs), time_vector=time_vector))
         else:
             for run_index, run in enumerate(runs):
-                self.add_recording_segment(
-                    MEF3RecordingSegment(
-                        channels=session.channels,
-                        run_index=run_index,
-                        number_of_samples=run.number_of_samples,
-                        sampling_frequency=session.sampling_frequency,
-                        t_start=(run.start_time - session.start_time) / 1e6,
-                    )
-                )
+                t_start = (run.start_time - session.start_time) / 1e6
+                self.add_recording_segment(segment(run_index, 1, t_start=t_start))
 
         # Gains take the stored counts to microvolts; the ecephys writer then scales microvolts to the volts
         # NWB's ElectricalSeries expects. MEF has no offset.
@@ -308,5 +446,8 @@ class MEF3RecordingExtractor(BaseRecording):
 
         self.mef3_session = session
         self._kwargs = dict(
-            folder_path=str(folder_path), channels_to_skip=channels_to_skip, concatenate_runs=concatenate_runs
+            folder_path=str(folder_path),
+            channels_to_skip=channels_to_skip,
+            concatenate_runs=concatenate_runs,
+            merge_groups_max_fill=merge_groups_max_fill,
         )

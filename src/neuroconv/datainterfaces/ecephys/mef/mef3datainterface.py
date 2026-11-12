@@ -187,12 +187,18 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         folder_path = interface_kwargs["folder_path"]
         channels_to_skip = interface_kwargs.get("channels_to_skip")
         concatenate_runs_above = interface_kwargs.get("concatenate_runs_above")
+        merge_groups_max_fill = interface_kwargs.get("merge_groups_max_fill")
         self.extractor_kwargs = dict(folder_path=folder_path, channels_to_skip=channels_to_skip)
         # The passwords go to the reader but not into extractor_kwargs, which describe the extractor to others.
         passwords = MEF3Passwords.from_arguments(
             *(interface_kwargs.get(key) for key in ("password", "level_1_password", "level_2_password"))
         )
-        session = read_mef3_session(folder_path, channels_to_skip=channels_to_skip, passwords=passwords)
+        session = read_mef3_session(
+            folder_path,
+            channels_to_skip=channels_to_skip,
+            passwords=passwords,
+            merge_groups_max_fill=merge_groups_max_fill,
+        )
 
         extractor_class = self.get_extractor_class()
         extractors = []
@@ -220,6 +226,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
                     folder_path=folder_path,
                     channels_to_skip=group_channels_to_skip or None,
                     concatenate_runs=concatenate_runs,
+                    merge_groups_max_fill=merge_groups_max_fill,
                     _session=group_session,
                 )
             )
@@ -240,6 +247,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         level_1_password: str | None = None,
         level_2_password: str | None = None,
         concatenate_runs_above: int | None = None,
+        merge_groups_max_fill: float | None = None,
     ):
         """
         Load and prepare data for MEF 3.
@@ -271,6 +279,14 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             samples every so often) takes far longer as thousands of series than as one, which the timestamps
             make about twice the size of the samples for a single channel. The ``"runs"`` table lists the runs
             either way.
+        merge_groups_max_fill : float, optional
+            Write channel groups at one rate that share one sample clock as one series, where no channel then has
+            no sample for more than this fraction of the series' samples. A recorder that drops a few samples on
+            each channel independently leaves channels that share nearly every sample time but not their runs,
+            each read as a group of its own; merged, they are one series over every time any of them has a
+            sample, a channel with no sample at a time written there as 0, and each such stretch listed, with
+            its channel, in the file's ``invalid_times`` table. A continuous channel beside channels with long
+            gaps stays apart. The default, None, merges nothing. ``0.01`` allows 1 %.
         """
         super().__init__(
             folder_path=folder_path,
@@ -281,6 +297,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             level_1_password=level_1_password,
             level_2_password=level_2_password,
             concatenate_runs_above=concatenate_runs_above,
+            merge_groups_max_fill=merge_groups_max_fill,
         )
         if metadata_key is None:
             self.metadata_key = "mef3_recording"
@@ -531,6 +548,85 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             self._add_records_to_nwbfile(nwbfile=nwbfile, run_start_times=run_start_times)
         if write_runs:
             self._add_runs_to_nwbfile(nwbfile=nwbfile, run_start_times=run_start_times)
+        if self.mef3_session.channel_groups[0].channel_run_positions is not None and write_electrical_series:
+            self._add_missing_samples_to_nwbfile(nwbfile=nwbfile)
+
+    def _group_sample_times(self, indices: np.ndarray) -> np.ndarray:
+        """
+        The times, on the session timeline as written, of samples of this interface's group by their index among its
+        samples (its runs back to back), read from the recording so any alignment moves them too.
+
+        A run per segment is placed from the segments' start times; only runs concatenated into one segment read
+        its time vector, which then exists already.
+        """
+        recording = self.recording_extractor
+        indices = np.asarray(indices, dtype=np.int64)
+        lengths = [run.number_of_samples for run in self.mef3_session.runs]
+        if recording.get_num_segments() == len(lengths):
+            first_samples = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+            segments = np.searchsorted(first_samples, indices, side="right") - 1
+            starts = np.array([recording.get_start_time(segment_index=index) for index in range(len(lengths))])
+            return starts[segments] + (indices - first_samples[segments]) / recording.get_sampling_frequency()
+        return np.asarray(recording.get_times(segment_index=0)[indices], dtype=float)
+
+    def _add_missing_samples_to_nwbfile(self, nwbfile: NWBFile):
+        """
+        List, in ``invalid_times``, each stretch where a channel of a merged group has no sample and is written as 0.
+
+        One row per channel and uninterrupted stretch: a stretch that runs across a gap of the group's ends at it.
+        The rows are written once per group into a file; they carry no ``source_file`` column, since
+        their channel and times place them, and every text column of an intervals table is text a reader of the file
+        (a PHI scan, say) goes through.
+        """
+        session = self.mef3_session
+        group = session.channel_groups[0]
+        lengths = np.array([run.number_of_samples for run in group.runs], dtype=np.int64)
+        run_firsts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+        total = int(lengths.sum())
+        stretches = []
+        for channel, positions in zip(group.channels, group.channel_run_positions):
+            own_lengths = np.array([run.number_of_samples for run in channel.runs], dtype=np.int64)
+            starts = np.concatenate([[0], positions + own_lengths])
+            ends = np.concatenate([positions, [total]])
+            for start, end in zip(starts[ends > starts], ends[ends > starts]):
+                # Cut at the group's own run boundaries, so each row is one interval of time.
+                cuts = run_firsts[(run_firsts > start) & (run_firsts < end)]
+                for piece_start, piece_end in zip(np.concatenate([[start], cuts]), np.concatenate([cuts, [end]])):
+                    stretches.append((channel.name, int(piece_start), int(piece_end)))
+        if not stretches:
+            return
+        firsts = self._group_sample_times(np.array([stretch[1] for stretch in stretches]))
+        lasts = self._group_sample_times(np.array([stretch[2] - 1 for stretch in stretches]))
+        period = 1.0 / session.sampling_frequency
+        rows = [
+            dict(start_time=float(first), stop_time=float(last) + period, channel=name, number_of_samples=end - start)
+            for (name, start, end), first, last in zip(stretches, firsts, lasts)
+        ]
+        rows.sort(key=lambda row: (row["start_time"], row["channel"]))
+        # Written once per group into a file, whichever interfaces over the session write it, and once for each
+        # group: the key names the group's rate and channels, so two readers of one session with complementary
+        # channels_to_skip (one per rate, say), each with a merged group of its own, both write their rows. It is
+        # only a key, since the rows carry no source_file column.
+        channels = ", ".join(channel.name for channel in group.channels)
+        key = f"{session.path.name} ({session.sampling_frequency!r} Hz: {channels})"
+        add_rows_to_intervals_table(
+            nwbfile=nwbfile,
+            file_path=session.path,
+            name="invalid_times",
+            description="Time intervals that should be removed from analysis.",
+            columns={
+                "channel": (
+                    "The channel that has no sample over the interval. Its series has samples there for other "
+                    "channels, so this channel's samples over the interval were written as 0 and are not recorded data."
+                ),
+                "number_of_samples": "How many of the channel's samples over the interval were written as 0.",
+            },
+            rows=rows,
+            kind="MEF 3",
+            source_file_description=_SOURCE_FILE_DESCRIPTION,
+            source_file=key,
+            source_file_column=False,
+        )
 
     def _run_start_times(self) -> np.ndarray:
         """
