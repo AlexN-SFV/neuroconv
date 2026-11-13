@@ -74,7 +74,10 @@ A segment directory that holds data but is missing its metadata (``.tmet``), ind
 ``MEF3RecordingInterface.get_incomplete_segments`` lists such segments and the files they lack. A channel none of
 whose samples can then be read is refused like an empty one: ``MEF3RecordingInterface.get_unreadable_channel_ids``
 lists them, reading directories and block indices only, to pass to ``channels_to_skip``. A skipped channel with no
-metadata file has no rate, so pass the same list to ``get_channel_sampling_frequencies``.
+metadata file has no rate, so pass the same list to ``get_channel_sampling_frequencies``. A segment directory with two
+or more files of one kind is ambiguous rather than incomplete, and is refused whatever else it lacks.
+``MEF3RecordingInterface.get_channel_survey`` gives the empty channels, the unreadable channels and the incomplete
+segments together, listing each segment directory once.
 
 Gaps and timing
 ^^^^^^^^^^^^^^^
@@ -106,8 +109,9 @@ samples, in the file's ``invalid_times`` table. A continuous channel beside chan
 since those channels would be missing too much of its time, and so do channels whose runs do not start a whole
 number of samples apart.
 
-A segment with no data file and no block in its index, one a writer opened and never wrote to, is left out
-with a warning. A segment whose index lists blocks but which has no data file is refused.
+A segment that holds no block, one a writer opened and never wrote to (no data file, or one with only its
+header, and no block in its index), is left out with a warning. A segment that holds a block but is missing a
+file is left out as incomplete (see above).
 
 Block timestamps are not otherwise compared with sample counts: writers cut blocks on a fixed grid of times
 while the samples in them drift, so a continuous recording's timestamps disagree with its sample counts by a

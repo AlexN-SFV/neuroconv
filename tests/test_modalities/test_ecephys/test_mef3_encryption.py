@@ -18,6 +18,8 @@ import pytest
 
 pytest.importorskip("cryptography")
 
+from test_mef3_interface import read_quietly, remove_segment_file  # noqa: E402
+
 from neuroconv.datainterfaces import MEF3RecordingInterface  # noqa: E402
 from neuroconv.datainterfaces.ecephys.mef._mef3_crypto import (  # noqa: E402
     MEF3Passwords,
@@ -130,12 +132,6 @@ def summary(session) -> dict:
             for channel in session.channels
         ],
     )
-
-
-def read_quietly(path, **kwargs):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return read_mef3_session(path, **kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -410,10 +406,6 @@ class TestSubjectFieldsStayOut:
             "Fp1": 1000.0,
             "EKG": 1000.0,
         }
-
-
-def remove_segment_file(session_path: Path, channel: str, segment: int, suffix: str):
-    (session_path / f"{channel}.timd" / f"{channel}-{segment:06d}.segd" / f"{channel}-{segment:06d}{suffix}").unlink()
 
 
 class TestIncompleteSegmentsOfAnEncryptedSession:

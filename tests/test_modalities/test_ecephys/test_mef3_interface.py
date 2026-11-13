@@ -865,7 +865,9 @@ class TestEmptySegments:
         # An index of its universal header alone: no blocks.
         index = (gapped_copy / "Cz.timd" / "Cz-000001.segd" / "Cz-000001.tidx").read_bytes()[:1024]
         (empty / "Cz-000002.tidx").write_bytes(index)
-        with pytest.warns(UserWarning, match=r"1 segments of the MEF 3 channel 'Cz.timd' hold no data file"):
+        with pytest.warns(
+            UserWarning, match=r"1 segments of the MEF 3 channel 'Cz.timd' hold no block, and are left out"
+        ):
             session = read_mef3_session(gapped_copy)
         assert len(session.channel_groups) == 1
         assert [run.number_of_samples for run in session.runs] == [run.number_of_samples for run in whole.runs]
@@ -1136,6 +1138,151 @@ class TestIncompleteSegments:
         assert MEF3RecordingInterface.get_incomplete_segments(gapped_copy) == {}
         with pytest.raises(ValueError, match=r"holds 2 \.tmet files, not one"):
             read_mef3_session(gapped_copy)
+
+    @pytest.mark.parametrize("suffix", [".tmet", ".tidx", ".tdat"])
+    def test_the_first_segment_is_left_out(self, gapped_copy, suffix):
+        """The second segment's blocks are renumbered, and its metadata file describes the channel."""
+        whole = read_mef3_session(GAPPED)
+        remove_segment_file(gapped_copy, "Cz", 0, suffix)
+        with pytest.warns(UserWarning, match=re.escape("Cz-000000.segd (no " + suffix + " file)")):
+            session = read_mef3_session(gapped_copy)
+        cz, whole_cz = channel_named(session, "Cz"), channel_named(whole, "Cz")
+        second_segment = whole_cz.blocks["segment"] == 1
+        expected = whole_cz.blocks[second_segment].copy()
+        expected["segment"] = 0
+        np.testing.assert_array_equal(cz.blocks, expected)
+        assert [path.name for path in cz.data_paths] == [path.name for path in whole_cz.data_paths[1:]]
+        np.testing.assert_array_equal(
+            read_all_blocks(cz), whole_cz.read_blocks(int((~second_segment).sum()), int(second_segment.sum()))
+        )
+        assert cz.sampling_frequency == whole_cz.sampling_frequency
+        assert session.start_time == whole.start_time
+        assert session.records == whole.records
+
+    @pytest.mark.parametrize(
+        "copied, removed",
+        [
+            pytest.param(".tidx", ".tdat", id="two-indices-no-data-file"),
+            pytest.param(".tmet", ".tidx", id="two-metadata-files-no-index"),
+        ],
+    )
+    def test_two_files_of_one_kind_are_refused_when_another_is_missing(self, gapped_copy, copied, removed):
+        """Ambiguous, not incomplete: refused as before, never left out as a segment that is missing a file."""
+        segment = gapped_copy / "Cz.timd" / "Cz-000001.segd"
+        shutil.copy(segment / f"Cz-000001{copied}", segment / f"Cz-000001-copy{copied}")
+        remove_segment_file(gapped_copy, "Cz", 1, removed)
+        assert MEF3RecordingInterface.get_incomplete_segments(gapped_copy) == {}
+        with pytest.raises(ValueError, match=re.escape(f"holds 2 {copied} files, not one")):
+            read_mef3_session(gapped_copy)
+
+    def test_a_never_written_segment_without_its_metadata_file_is_empty(self, gapped_copy):
+        """A data file with only its header and an index listing no block hold no block, whatever else is missing:
+        the channel is empty, not unreadable."""
+        for segment in (0, 1):
+            segment_directory = gapped_copy / "Fp1.timd" / f"Fp1-{segment:06d}.segd"
+            for suffix in (".tdat", ".tidx"):
+                path = segment_directory / f"Fp1-{segment:06d}{suffix}"
+                path.write_bytes(path.read_bytes()[:1024])
+            remove_segment_file(gapped_copy, "Fp1", segment, ".tmet")
+        assert MEF3RecordingInterface.get_empty_channel_ids(gapped_copy) == ["Fp1"]
+        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == []
+        assert MEF3RecordingInterface.get_incomplete_segments(gapped_copy) == {}
+
+    def test_the_survey_gives_the_three_lookups_at_once(self, gapped_copy):
+        remove_segment_file(gapped_copy, "Cz", 1, ".tidx")
+        remove_segment_file(gapped_copy, "Fp1", 0, ".tmet")
+        remove_segment_file(gapped_copy, "Fp1", 1, ".tdat")
+        assert MEF3RecordingInterface.get_channel_survey(gapped_copy) == {
+            "empty": MEF3RecordingInterface.get_empty_channel_ids(gapped_copy),
+            "unreadable": MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy),
+            "incomplete_segments": MEF3RecordingInterface.get_incomplete_segments(gapped_copy),
+        }
+        assert MEF3RecordingInterface.get_channel_survey(gapped_copy)["unreadable"] == ["Fp1"]
+
+    def test_each_segment_directory_is_listed_once(self, monkeypatch):
+        """One listing answers whether a segment is empty, incomplete or ambiguous, and where its files are. Reading
+        a session lists each segment once more, for its record files."""
+        from neuroconv.datainterfaces.ecephys.mef import _mef3_reader
+
+        listed = []
+        scandir = _mef3_reader.os.scandir
+
+        def counting_scandir(path):
+            listed.append(Path(path).name)
+            return scandir(path)
+
+        # os itself, so the globs that list a directory are counted too.
+        monkeypatch.setattr(_mef3_reader.os, "scandir", counting_scandir)
+        segment_directories = sorted(path.name for path in GAPPED.glob("*.timd/*.segd"))
+        for lookup, times in (
+            (lambda: MEF3RecordingInterface.get_channel_survey(GAPPED), 1),
+            (lambda: MEF3RecordingInterface.get_channel_sampling_frequencies(GAPPED), 1),
+            (lambda: MEF3RecordingInterface.get_available_channel_ids(GAPPED), 1),
+            (lambda: read_quietly(GAPPED), 2),
+        ):
+            listed.clear()
+            lookup()
+            assert sorted(name for name in listed if name.endswith(".segd")) == sorted(segment_directories * times)
+
+    @pytest.mark.parametrize("channel", ["Cz", "Fp1"])
+    def test_a_channel_with_no_metadata_file_is_still_available(self, gapped_copy, channel):
+        """Listed after the others, which are in the order the reader gives them once it is skipped."""
+        remove_segment_file(gapped_copy, channel, 0, ".tmet")
+        remove_segment_file(gapped_copy, channel, 1, ".tmet")
+        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == [channel]
+        read = read_quietly(gapped_copy, channels_to_skip=[channel])
+        assert MEF3RecordingInterface.get_available_channel_ids(gapped_copy) == [
+            *(c.name for c in read.channels),
+            channel,
+        ]
+        # Unchanged on the intact session.
+        assert MEF3RecordingInterface.get_available_channel_ids(GAPPED) == [
+            c.name for c in read_quietly(GAPPED).channels
+        ]
+
+    def test_the_incomplete_segments_are_listed_from_the_directories_alone(self, gapped_copy):
+        """No index is read for them, so an index that cannot be read does not stop the listing."""
+        index_path = gapped_copy / "EKG.timd" / "EKG-000000.segd" / "EKG-000000.tidx"
+        index_path.write_bytes(index_path.read_bytes()[: 1024 + 56 + 20])  # cut mid-entry
+        remove_segment_file(gapped_copy, "Cz", 1, ".tidx")
+        assert MEF3RecordingInterface.get_incomplete_segments(gapped_copy) == {"Cz": {"Cz-000001.segd": [".tidx"]}}
+        # Only the indices of the channels with an incomplete segment are read for the unreadable ones.
+        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == []
+        with pytest.raises(ValueError, match="truncated"):
+            MEF3RecordingInterface.get_empty_channel_ids(gapped_copy)
+        with pytest.raises(ValueError, match="truncated"):
+            MEF3RecordingInterface.get_channel_survey(gapped_copy)
+
+    def test_a_never_written_last_segment_is_left_out_as_holding_no_block(self, gapped_copy):
+        """A writer that stops right after opening a segment leaves headers alone: no samples are lost."""
+        whole = read_mef3_session(GAPPED)
+        segment_directory = gapped_copy / "Cz.timd" / "Cz-000001.segd"
+        for suffix in (".tdat", ".tidx"):
+            path = segment_directory / f"Cz-000001{suffix}"
+            path.write_bytes(path.read_bytes()[:1024])
+        with pytest.warns(
+            UserWarning,
+            match=re.escape(
+                "1 segments of the MEF 3 channel 'Cz.timd' hold no block, and are left out: Cz-000001.segd."
+            ),
+        ):
+            session = read_mef3_session(gapped_copy)
+        cz, whole_cz = channel_named(session, "Cz"), channel_named(whole, "Cz")
+        first_segment = whole_cz.blocks["segment"] == 0
+        np.testing.assert_array_equal(cz.blocks, whole_cz.blocks[first_segment])
+        assert MEF3RecordingInterface.get_channel_survey(gapped_copy) == {
+            "empty": [],
+            "unreadable": [],
+            "incomplete_segments": {},
+        }
+
+    def test_the_rates_refuse_a_channel_to_skip_that_is_not_in_the_session(self, gapped_copy):
+        remove_segment_file(gapped_copy, "Fp1", 0, ".tmet")
+        remove_segment_file(gapped_copy, "Fp1", 1, ".tmet")
+        with pytest.raises(
+            ValueError, match=re.escape("channels_to_skip names channels that are not in the session: ['Fp']")
+        ):
+            MEF3RecordingInterface.get_channel_sampling_frequencies(gapped_copy, channels_to_skip=["Fp"])
 
     def test_none_in_the_fixtures(self):
         for session_path in (GAPPED, LOSSY, CONTIGUOUS, TRUNCATED, ENCRYPTED):

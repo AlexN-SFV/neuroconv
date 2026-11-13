@@ -26,8 +26,8 @@ block are dropped at once; the rest of section 3 stays encrypted. Encrypted RED 
 
 A session's channels may be sampled at different rates, or recorded over different stretches of time (a
 continuous telemetry channel beside channels with gaps). They are grouped by rate and runs, each group being
-what one ElectricalSeries can hold; see :class:`MEF3ChannelGroup`. A segment that holds no data file and no
-index entry is left out, as is, with a warning, one that holds data but is missing its metadata, index or data
+what one ElectricalSeries can hold; see :class:`MEF3ChannelGroup`. A segment that holds no block (no data
+after its data file's header, and no index entry) is left out, as is, with a warning, one that holds data but is missing its metadata, index or data
 file: its samples cannot be read (see :func:`incomplete_segments`). A channel left with no samples is refused,
 to be left out with ``channels_to_skip`` (see :func:`unreadable_channel_names`).
 
@@ -37,6 +37,7 @@ input (``remove_recording_time_offset``). A record file whose writer offset its 
 instead is read from that start (see ``_records_clock``).
 """
 
+import os
 import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -365,34 +366,37 @@ def _segment_directories(channel_directory: Path) -> list[Path]:
     return sorted((path for path in channel_directory.glob("*.segd") if path.is_dir()), key=segment_number)
 
 
-def _only_file(directory: Path, suffix: str) -> Path:
-    matches = sorted(directory.glob(f"*{suffix}"))
-    if len(matches) != 1:
-        raise ValueError(f"The MEF 3 segment directory '{directory}' holds {len(matches)} {suffix} files, not one.")
-    return matches[0]
-
-
-def _is_empty_segment(segment_directory: Path) -> bool:
-    """
-    Whether a segment holds no data file and no index entry: one a writer opened and never wrote a block to.
-
-    A segment with no data file whose index lists blocks is not empty but incomplete (see
-    :func:`_missing_segment_files`).
-    """
-    if any(segment_directory.glob("*.tdat")):
-        return False
-    indices = sorted(segment_directory.glob("*.tidx"))
-    if len(indices) > 1:
-        return False
-    return not indices or indices[0].stat().st_size < UNIVERSAL_HEADER_BYTES + TIME_SERIES_INDEX_BYTES
-
-
 _SEGMENT_FILE_SUFFIXES = (".tmet", ".tidx", ".tdat")
 
 
-def _missing_segment_files(segment_directory: Path) -> list[str]:
-    """The suffixes, of a segment's metadata, index and data file, of those it holds none of."""
-    return [suffix for suffix in _SEGMENT_FILE_SUFFIXES if not any(segment_directory.glob(f"*{suffix}"))]
+def _scan_segment(segment_directory: Path) -> dict[str, list[Path]]:
+    """
+    A segment directory's metadata, index and data files (``.tmet``, ``.tidx``, ``.tdat``), by suffix, in name
+    order: one listing of the directory, which every question about the segment is then answered from.
+    """
+    found = {suffix: [] for suffix in _SEGMENT_FILE_SUFFIXES}
+    with os.scandir(segment_directory) as entries:
+        for entry in entries:
+            for suffix in _SEGMENT_FILE_SUFFIXES:
+                # Any entry, as a glob would: one that is not a file is refused when it is read, not overlooked.
+                if entry.name.endswith(suffix):
+                    found[suffix].append(Path(entry.path))
+    for files in found.values():
+        files.sort()
+    return found
+
+
+def _holds_no_block(files: dict[str, list[Path]]) -> bool:
+    """
+    Whether a segment's files hold no block: no data file, or one with nothing after its universal header, and
+    no index file, or one that lists no block. A segment a writer opened and never wrote a block to.
+    """
+    data, index = files[".tdat"], files[".tidx"]
+    no_data = not data or (len(data) == 1 and data[0].stat().st_size <= UNIVERSAL_HEADER_BYTES)
+    no_index_entry = not index or (
+        len(index) == 1 and index[0].stat().st_size < UNIVERSAL_HEADER_BYTES + TIME_SERIES_INDEX_BYTES
+    )
+    return no_data and no_index_entry
 
 
 _LEAVE_EMPTY_CHANNELS_OUT = (
@@ -407,14 +411,34 @@ _LEAVE_UNREADABLE_CHANNELS_OUT = (
 
 @dataclass
 class _ChannelSegments:
-    """A channel's segment directories, in segment order, by what they hold."""
+    """A channel's segment directories, in segment order, by what they hold, with the files each holds."""
 
     every: list[Path]  # every segment directory
-    data: list[Path]  # holds its metadata, index and data file
-    empty: list[Path]  # holds no data file and no index entry (_is_empty_segment)
-    # Holds data, an index entry or a data file, but is missing one of its three files: by directory, the
-    # suffixes it holds none of. Its samples cannot be read, and it is left out.
+    # Holds one metadata, index and data file, or two or more of one kind, which reading refuses (see only()).
+    data: list[Path]
+    empty: list[Path]  # holds no block (_holds_no_block)
+    # Holds a block, but none of one of its three files: by directory, the suffixes it holds none of. Its samples
+    # cannot be read, and it is left out. A segment with two files of one kind is never here, whatever else it
+    # lacks: it is ambiguous rather than incomplete, and refused.
     incomplete: dict[Path, list[str]]
+    files: dict[Path, dict[str, list[Path]]]  # by directory, its files by suffix (_scan_segment)
+
+    def only(self, segment_directory: Path, suffix: str) -> Path:
+        """
+        The one file of a kind a segment holds; none, or two or more, is refused. Two or more of any kind are
+        refused first, whichever file is asked for: the segment is ambiguous, whatever else it lacks.
+        """
+        for kind, kind_matches in self.files[segment_directory].items():
+            if len(kind_matches) > 1:
+                raise ValueError(
+                    f"The MEF 3 segment directory '{segment_directory}' holds {len(kind_matches)} {kind} files, not one."
+                )
+        matches = self.files[segment_directory][suffix]
+        if len(matches) != 1:
+            raise ValueError(
+                f"The MEF 3 segment directory '{segment_directory}' holds {len(matches)} {suffix} files, not one."
+            )
+        return matches[0]
 
     def describe_incomplete(self, limit: int = 5) -> str:
         described = [
@@ -444,20 +468,29 @@ def _metadata_segment_directory(segments: _ChannelSegments) -> Path | None:
     """
     if segments.data:
         return segments.data[0]
-    return next((directory for directory in segments.every if any(directory.glob("*.tmet"))), None)
+    return next((directory for directory in segments.every if segments.files[directory][".tmet"]), None)
 
 
 def _channel_segments(channel_directory: Path) -> _ChannelSegments:
-    """A channel's segment directories in segment order, as those that hold data, are empty, or are incomplete."""
-    every, data, empty, incomplete = _segment_directories(channel_directory), [], [], {}
+    """
+    A channel's segment directories in segment order, as those that hold data, are empty, or are incomplete,
+    from one listing of each.
+
+    Two or more files of one kind make a segment ambiguous, not incomplete or empty, whatever else it lacks: it
+    is counted with those that hold data, and reading it is refused (:meth:`_ChannelSegments.only`).
+    """
+    every, data, empty, incomplete, files = _segment_directories(channel_directory), [], [], {}, {}
     for segment_directory in every:
-        if _is_empty_segment(segment_directory):
+        found = files[segment_directory] = _scan_segment(segment_directory)
+        if any(len(matches) > 1 for matches in found.values()):
+            data.append(segment_directory)
+        elif _holds_no_block(found):
             empty.append(segment_directory)
-        elif missing := _missing_segment_files(segment_directory):
+        elif missing := [suffix for suffix in _SEGMENT_FILE_SUFFIXES if not found[suffix]]:
             incomplete[segment_directory] = missing
         else:
             data.append(segment_directory)
-    return _ChannelSegments(every=every, data=data, empty=empty, incomplete=incomplete)
+    return _ChannelSegments(every=every, data=data, empty=empty, incomplete=incomplete, files=files)
 
 
 def _no_metadata_file(channel_directory: Path) -> str:
@@ -594,9 +627,9 @@ def _read_channel(
     """
     A channel, its recording time offset and its GMT offset.
 
-    Empty segments, with no data file and no index entry, are left out with a warning, as are incomplete
+    Empty segments, which hold no block (see :func:`_holds_no_block`), are left out with a warning, as are incomplete
     segments, which hold data but are missing their metadata, index or data file, so their samples cannot be
-    read. A channel left with no segment that holds data is refused.
+    read. A channel left with no segment that holds data, or none with a block of samples, is refused.
     """
     segments = _channel_segments(channel_directory)
     segment_directories, empty_segments = segments.data, segments.empty
@@ -609,8 +642,8 @@ def _read_channel(
         )
     if not segment_directories:
         raise ValueError(
-            f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, with no data file and no "
-            f"block in its index, so the channel holds no samples. {_LEAVE_EMPTY_CHANNELS_OUT}"
+            f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, holding no block, so the "
+            f"channel holds no samples. {_LEAVE_EMPTY_CHANNELS_OUT}"
         )
     if segments.incomplete:
         warnings.warn(
@@ -621,8 +654,8 @@ def _read_channel(
         )
     if empty_segments:
         warnings.warn(
-            f"{len(empty_segments)} segments of the MEF 3 channel '{channel_directory.name}' hold no data file and "
-            f"no block in their index, and are left out: {', '.join(path.name for path in empty_segments[:5])}.",
+            f"{len(empty_segments)} segments of the MEF 3 channel '{channel_directory.name}' hold no block, and "
+            f"are left out: {', '.join(path.name for path in empty_segments[:5])}.",
             UserWarning,
             stacklevel=_stacklevel_outside_neuroconv(),
         )
@@ -630,7 +663,7 @@ def _read_channel(
     channel_metadata = None
     data_paths, all_blocks = [], []
     for segment, segment_directory in enumerate(segment_directories):
-        metadata = _read_segment_metadata(_only_file(segment_directory, ".tmet"), passwords)
+        metadata = _read_segment_metadata(segments.only(segment_directory, ".tmet"), passwords)
         if channel_metadata is None:
             channel_metadata = metadata
         elif metadata["sampling_frequency"] != channel_metadata["sampling_frequency"]:
@@ -643,14 +676,24 @@ def _read_channel(
                 f"The segments of the MEF 3 channel '{channel_directory.name}' have different units conversion "
                 f"factors ({channel_metadata['units_conversion_factor']} and {metadata['units_conversion_factor']})."
             )
-        data_path = _only_file(segment_directory, ".tdat")
-        blocks = _read_block_index(_only_file(segment_directory, ".tidx"), data_path, metadata["recording_time_offset"])
+        data_path = segments.only(segment_directory, ".tdat")
+        blocks = _read_block_index(
+            segments.only(segment_directory, ".tidx"), data_path, metadata["recording_time_offset"]
+        )
         blocks["segment"] = segment
         data_paths.append(data_path)
         all_blocks.append(blocks)
 
     blocks = np.concatenate(all_blocks)
     blocks = blocks[blocks["number_of_samples"] > 0]
+    if not len(blocks):
+        # Listed by unreadable_channel_names when a segment of it was left out for missing a file, which may be
+        # where its samples were; by empty_channel_names otherwise.
+        hint = _LEAVE_UNREADABLE_CHANNELS_OUT if segments.incomplete else _LEAVE_EMPTY_CHANNELS_OUT
+        raise ValueError(
+            f"The MEF 3 channel '{channel_directory.name[: -len('.timd')]}' of '{channel_directory.parent.name}' "
+            f"holds no samples. {hint}"
+        )
     sampling_frequency = channel_metadata["sampling_frequency"]
     if not (np.isfinite(sampling_frequency) and sampling_frequency > 0):
         raise ValueError(
@@ -1136,13 +1179,13 @@ def _skipped_channel(directory: Path, passwords: MEF3Passwords | None, session_n
             raise ValueError(
                 "it holds no .segd segment directory" if not segments.every else "no segment of it holds a .tmet file"
             )
-        metadata = _read_segment_metadata(_only_file(metadata_directory, ".tmet"), passwords)
+        metadata = _read_segment_metadata(segments.only(metadata_directory, ".tmet"), passwords)
         # As _read_channel checks it: meflib's "no entry" is -1.0, and a dead channel is one a user skips.
         if not (np.isfinite(metadata["sampling_frequency"]) and metadata["sampling_frequency"] > 0):
             raise ValueError(f"it gives a sampling frequency of {metadata['sampling_frequency']}")
         first_block_start = last_block_end = None
         for segment_directory in segments.data:
-            index = _read_time_series_index(_only_file(segment_directory, ".tidx"))
+            index = _read_time_series_index(segments.only(segment_directory, ".tidx"))
             with_samples = index[index["number_of_samples"] > 0]
             if not len(with_samples):
                 continue
@@ -1208,10 +1251,7 @@ def read_mef3_session(
     path = Path(folder_path)
     channel_directories = _channel_directories(path)
     names = [directory.name[: -len(".timd")] for directory in channel_directories]
-    to_skip = set(channels_to_skip or [])
-    unknown = sorted(to_skip - set(names))
-    if unknown:
-        raise ValueError(f"channels_to_skip names channels that are not in the session: {unknown}. Available: {names}.")
+    to_skip = _checked_channels_to_skip(channels_to_skip, names)
     skipped_directories = [directory for directory, name in zip(channel_directories, names) if name in to_skip]
     channel_directories = [directory for directory, name in zip(channel_directories, names) if name not in to_skip]
     if not channel_directories:
@@ -1220,13 +1260,6 @@ def read_mef3_session(
     channels, recording_time_offsets, gmt_offsets = [], [], []
     for directory in channel_directories:
         channel, recording_time_offset, gmt_offset = _read_channel(directory, passwords)
-        if channel.number_of_samples == 0:
-            # Listed by unreadable_channel_names when a segment of it was left out for missing a file, which may
-            # be where its samples were; by empty_channel_names otherwise.
-            hint = (
-                _LEAVE_UNREADABLE_CHANNELS_OUT if _channel_segments(directory).incomplete else _LEAVE_EMPTY_CHANNELS_OUT
-            )
-            raise ValueError(f"The MEF 3 channel '{channel.name}' of '{path.name}' holds no samples. {hint}")
         channels.append(channel)
         recording_time_offsets.append(recording_time_offset)
         gmt_offsets.append(gmt_offset)
@@ -1332,6 +1365,15 @@ def read_mef3_session(
     )
 
 
+def _checked_channels_to_skip(channels_to_skip: list | None, names: list[str]) -> set:
+    """``channels_to_skip`` as a set; a name that is not one of the session's channels is refused, typo or not."""
+    to_skip = set(channels_to_skip or [])
+    unknown = sorted(to_skip - set(names))
+    if unknown:
+        raise ValueError(f"channels_to_skip names channels that are not in the session: {unknown}. Available: {names}.")
+    return to_skip
+
+
 def _channel_order(names: list[str], acquisition_channel_numbers: list[int]) -> list[int]:
     """Positions in acquisition channel order when every channel gives a distinct number, else in name order."""
     numbers = list(acquisition_channel_numbers)
@@ -1350,12 +1392,15 @@ def channel_sampling_frequencies(
     (else of its first segment that holds a metadata file); ``passwords`` as for :func:`read_mef3_session`.
     This says which channels are sampled at which rate without reading any index, to choose channels to leave
     out with ``channels_to_skip``. Channels named in ``channels_to_skip`` are left out here too and not read: a
-    channel with no metadata file at all (see :func:`unreadable_channel_names`) has no rate to give.
+    channel with no metadata file at all (see :func:`unreadable_channel_names`) has no rate to give. A name in
+    ``channels_to_skip`` that is not one of the session's channels is refused, as by :func:`read_mef3_session`.
     """
-    path = Path(folder_path)
-    to_skip = set(channels_to_skip or [])
+    channel_directories = _channel_directories(Path(folder_path))
+    to_skip = _checked_channels_to_skip(
+        channels_to_skip, [directory.name[: -len(".timd")] for directory in channel_directories]
+    )
     names, numbers, rates = [], [], []
-    for directory in _channel_directories(path):
+    for directory in channel_directories:
         if directory.name[: -len(".timd")] in to_skip:
             continue
         segments = _channel_segments(directory)
@@ -1364,7 +1409,7 @@ def channel_sampling_frequencies(
         metadata_directory = _metadata_segment_directory(segments)
         if metadata_directory is None:
             raise ValueError(_no_metadata_file(directory))
-        metadata = _read_segment_metadata(_only_file(metadata_directory, ".tmet"), passwords)
+        metadata = _read_segment_metadata(segments.only(metadata_directory, ".tmet"), passwords)
         names.append(directory.name[: -len(".timd")])
         numbers.append(metadata["acquisition_channel_number"])
         rates.append(metadata["sampling_frequency"])
@@ -1377,42 +1422,56 @@ def _lists_samples(segments: _ChannelSegments) -> bool:
     that does; an index that cannot be read raises.
     """
     return any(
-        (_read_time_series_index(_only_file(segment_directory, ".tidx"))["number_of_samples"] > 0).any()
+        (_read_time_series_index(segments.only(segment_directory, ".tidx"))["number_of_samples"] > 0).any()
         for segment_directory in segments.data
     )
 
 
-def _holds_no_samples(channel_directory: Path) -> bool:
+def channel_survey(folder_path, lists=("empty", "unreadable", "incomplete_segments")) -> dict:
     """
-    Whether a channel has segments but none of them holds a sample: each is empty (see :func:`_is_empty_segment`),
-    or its index lists no block with samples.
+    What keeps a session's channels from being read, from one listing of each segment directory: ``empty`` and
+    ``unreadable``, the channels :func:`empty_channel_names` and :func:`unreadable_channel_names` list, and
+    ``incomplete_segments``, as :func:`incomplete_segments` gives them. Pass ``empty`` and ``unreadable`` to
+    ``channels_to_skip`` to read the rest.
 
-    Read from the indices alone, up to the first that lists a block with samples. A channel with no segment
-    directory is not said to be empty, and an index read on the way that cannot be read raises: neither is a
-    channel that holds no samples, and the reader refuses both as they are. Nor is a channel with an incomplete
-    segment, which may hold its samples: :func:`unreadable_channel_names` lists it instead.
+    ``lists`` names the ones wanted; only those are given, and only the indices they need are read: ``empty``
+    reads the indices of the channels with no incomplete segment, ``unreadable`` those of the channels with one,
+    each up to the first that lists a block with samples, and ``incomplete_segments`` none, the directories
+    alone. MEF 3 never encrypts an index, so no password is needed. An index that is read and cannot be read
+    raises, and so does a segment with two or more files of one kind. A path that is not a session is refused,
+    as by :func:`read_mef3_session`.
     """
-    segments = _channel_segments(channel_directory)
-    if not segments.every or segments.incomplete:
-        return False
-    return not _lists_samples(segments)
+    unknown = sorted(set(lists) - {"empty", "unreadable", "incomplete_segments"})
+    if unknown:
+        raise ValueError(f"channel_survey lists empty, unreadable and incomplete_segments, not {unknown}.")
+    empty, unreadable, incomplete = [], [], {}
+    for directory in _channel_directories(Path(folder_path)):
+        name = directory.name[: -len(".timd")]
+        segments = _channel_segments(directory)
+        if segments.incomplete:
+            incomplete[name] = {segment.name: list(missing) for segment, missing in segments.incomplete.items()}
+        # A channel with no segment directory is in neither list: the reader refuses it as it is. One with an
+        # incomplete segment may have held its samples there, so it is unreadable rather than empty.
+        found = unreadable if segments.incomplete else empty
+        wanted = "unreadable" if segments.incomplete else "empty"
+        if wanted in lists and segments.every and not _lists_samples(segments):
+            found.append(name)
+    survey = {"empty": empty, "unreadable": unreadable, "incomplete_segments": incomplete}
+    return {key: value for key, value in survey.items() if key in lists}
 
 
 def empty_channel_names(folder_path) -> list[str]:
     """
-    The names of a session's time series channels that hold no samples, in name order.
+    The names of a session's time series channels that hold no samples, in name order: each has segments, none
+    of them incomplete, and none of whose indices lists a block with samples.
 
     A writer may create a channel and never write a block with samples to it. :func:`read_mef3_session` refuses
     such a channel unless it is in ``channels_to_skip``; this lists them, to leave them out. Only the block
     indices are read, which MEF 3 never encrypts, so no password is needed. A channel whose index cannot be read
     is not listed: reading its index raises. A path that is not a session is refused, as by
-    :func:`read_mef3_session`.
+    :func:`read_mef3_session`. See :func:`channel_survey` for this and the channels that cannot be read at once.
     """
-    return [
-        directory.name[: -len(".timd")]
-        for directory in _channel_directories(Path(folder_path))
-        if _holds_no_samples(directory)
-    ]
+    return channel_survey(folder_path, lists=("empty",))["empty"]
 
 
 def incomplete_segments(folder_path) -> dict[str, dict[str, list[str]]]:
@@ -1423,17 +1482,11 @@ def incomplete_segments(folder_path) -> dict[str, dict[str, list[str]]]:
 
     :func:`read_mef3_session` leaves such a segment out, with a warning, since its samples cannot be read
     without its metadata, index and data file. A channel left with no samples is refused; see
-    :func:`unreadable_channel_names`. Only the directories are listed, so no password is needed. A path that is
-    not a session is refused, as by :func:`read_mef3_session`.
+    :func:`unreadable_channel_names`. A segment with two or more files of one kind is not incomplete but
+    ambiguous, and refused. Only the directories are listed, so no password is needed and no index is read. A
+    path that is not a session is refused, as by :func:`read_mef3_session`.
     """
-    found = {}
-    for directory in _channel_directories(Path(folder_path)):
-        segments = _channel_segments(directory)
-        if segments.incomplete:
-            found[directory.name[: -len(".timd")]] = {
-                segment.name: list(missing) for segment, missing in segments.incomplete.items()
-            }
-    return found
+    return channel_survey(folder_path, lists=("incomplete_segments",))["incomplete_segments"]
 
 
 def unreadable_channel_names(folder_path) -> list[str]:
@@ -1444,21 +1497,33 @@ def unreadable_channel_names(folder_path) -> list[str]:
 
     :func:`read_mef3_session` refuses such a channel unless it is in ``channels_to_skip``; this lists them, to
     leave them out. It is disjoint from :func:`empty_channel_names`, which lists the channels that hold no
-    samples with every segment complete or empty. Only the directories and the complete segments' block indices
-    are read, which MEF 3 never encrypts, so no password is needed. An index that cannot be read raises.
+    samples with every segment complete or empty. Only the directories, and the block indices of the complete
+    segments of channels with an incomplete one, are read, which MEF 3 never encrypts, so no password is
+    needed. An index that cannot be read raises.
     """
-    names = []
-    for directory in _channel_directories(Path(folder_path)):
-        segments = _channel_segments(directory)
-        if segments.incomplete and not _lists_samples(segments):
-            names.append(directory.name[: -len(".timd")])
-    return names
+    return channel_survey(folder_path, lists=("unreadable",))["unreadable"]
 
 
 def available_channel_names(folder_path, passwords: MEF3Passwords | None = None) -> list[str]:
     """
     The names of a session's time series channels, in the order :func:`read_mef3_session` gives them.
 
-    Only the first segment's metadata file of each channel is read; ``passwords`` as for :func:`read_mef3_session`.
+    One metadata file of each channel is read, for its acquisition channel number: that of its first segment that
+    holds data and every file, else of its first segment that holds a metadata file. ``passwords`` as for
+    :func:`read_mef3_session`. A channel with no metadata file at all (see :func:`unreadable_channel_names`), or
+    no segment, is still listed, after the others, in name order: the reader cannot read it, so it is read with
+    those channels skipped, and gives the others in the order that leaves them (acquisition channel order when
+    each gives a distinct number, else name order).
     """
-    return list(channel_sampling_frequencies(folder_path, passwords))
+    names, numbers, unnumbered = [], [], []
+    for directory in _channel_directories(Path(folder_path)):
+        name = directory.name[: -len(".timd")]
+        segments = _channel_segments(directory)
+        metadata_directory = _metadata_segment_directory(segments)
+        if metadata_directory is None:
+            unnumbered.append(name)
+            continue
+        metadata = _read_segment_metadata(segments.only(metadata_directory, ".tmet"), passwords)
+        names.append(name)
+        numbers.append(metadata["acquisition_channel_number"])
+    return [names[index] for index in _channel_order(names, numbers)] + unnumbered
