@@ -865,7 +865,9 @@ class TestEmptySegments:
         # An index of its universal header alone: no blocks.
         index = (gapped_copy / "Cz.timd" / "Cz-000001.segd" / "Cz-000001.tidx").read_bytes()[:1024]
         (empty / "Cz-000002.tidx").write_bytes(index)
-        with pytest.warns(UserWarning, match=r"1 segments of the MEF 3 channel 'Cz.timd' hold no data file"):
+        with pytest.warns(
+            UserWarning, match=r"1 segments of the MEF 3 channel 'Cz.timd' hold no block, and are left out"
+        ):
             session = read_mef3_session(gapped_copy)
         assert len(session.channel_groups) == 1
         assert [run.number_of_samples for run in session.runs] == [run.number_of_samples for run in whole.runs]
@@ -1222,12 +1224,57 @@ class TestIncompleteSegments:
             lookup()
             assert sorted(name for name in listed if name.endswith(".segd")) == sorted(segment_directories * times)
 
-    def test_a_channel_with_no_metadata_file_is_still_available(self, gapped_copy):
-        remove_segment_file(gapped_copy, "Fp1", 0, ".tmet")
-        remove_segment_file(gapped_copy, "Fp1", 1, ".tmet")
-        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == ["Fp1"]
-        # Fp1 gives no acquisition channel number, so the channels are in name order, as the reader orders them.
-        assert MEF3RecordingInterface.get_available_channel_ids(gapped_copy) == ["Cz", "EKG", "Fp1"]
+    @pytest.mark.parametrize("channel", ["Cz", "Fp1"])
+    def test_a_channel_with_no_metadata_file_is_still_available(self, gapped_copy, channel):
+        """Listed after the others, which are in the order the reader gives them once it is skipped."""
+        remove_segment_file(gapped_copy, channel, 0, ".tmet")
+        remove_segment_file(gapped_copy, channel, 1, ".tmet")
+        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == [channel]
+        read = read_quietly(gapped_copy, channels_to_skip=[channel])
+        assert MEF3RecordingInterface.get_available_channel_ids(gapped_copy) == [
+            *(c.name for c in read.channels),
+            channel,
+        ]
+        # Unchanged on the intact session.
+        assert MEF3RecordingInterface.get_available_channel_ids(GAPPED) == [
+            c.name for c in read_quietly(GAPPED).channels
+        ]
+
+    def test_the_incomplete_segments_are_listed_from_the_directories_alone(self, gapped_copy):
+        """No index is read for them, so an index that cannot be read does not stop the listing."""
+        index_path = gapped_copy / "EKG.timd" / "EKG-000000.segd" / "EKG-000000.tidx"
+        index_path.write_bytes(index_path.read_bytes()[: 1024 + 56 + 20])  # cut mid-entry
+        remove_segment_file(gapped_copy, "Cz", 1, ".tidx")
+        assert MEF3RecordingInterface.get_incomplete_segments(gapped_copy) == {"Cz": {"Cz-000001.segd": [".tidx"]}}
+        # Only the indices of the channels with an incomplete segment are read for the unreadable ones.
+        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == []
+        with pytest.raises(ValueError, match="truncated"):
+            MEF3RecordingInterface.get_empty_channel_ids(gapped_copy)
+        with pytest.raises(ValueError, match="truncated"):
+            MEF3RecordingInterface.get_channel_survey(gapped_copy)
+
+    def test_a_never_written_last_segment_is_left_out_as_holding_no_block(self, gapped_copy):
+        """A writer that stops right after opening a segment leaves headers alone: no samples are lost."""
+        whole = read_mef3_session(GAPPED)
+        segment_directory = gapped_copy / "Cz.timd" / "Cz-000001.segd"
+        for suffix in (".tdat", ".tidx"):
+            path = segment_directory / f"Cz-000001{suffix}"
+            path.write_bytes(path.read_bytes()[:1024])
+        with pytest.warns(
+            UserWarning,
+            match=re.escape(
+                "1 segments of the MEF 3 channel 'Cz.timd' hold no block, and are left out: Cz-000001.segd."
+            ),
+        ):
+            session = read_mef3_session(gapped_copy)
+        cz, whole_cz = channel_named(session, "Cz"), channel_named(whole, "Cz")
+        first_segment = whole_cz.blocks["segment"] == 0
+        np.testing.assert_array_equal(cz.blocks, whole_cz.blocks[first_segment])
+        assert MEF3RecordingInterface.get_channel_survey(gapped_copy) == {
+            "empty": [],
+            "unreadable": [],
+            "incomplete_segments": {},
+        }
 
     def test_the_rates_refuse_a_channel_to_skip_that_is_not_in_the_session(self, gapped_copy):
         remove_segment_file(gapped_copy, "Fp1", 0, ".tmet")

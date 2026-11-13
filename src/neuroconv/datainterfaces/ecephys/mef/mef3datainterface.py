@@ -101,9 +101,10 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         Returns
         -------
         list
-            The channel names, in acquisition channel order. A channel with no metadata file at all (see
-            :meth:`get_unreadable_channel_ids`) is listed too; it gives no acquisition channel number, so the
-            channels are then in name order, as the interface orders them.
+            The channel names, in acquisition channel order (name order when they do not each give a distinct
+            number), as the interface orders them. A channel with no metadata file at all (see
+            :meth:`get_unreadable_channel_ids`) gives no number and cannot be read: it is listed after the others,
+            in name order.
         """
         from ._mef3_crypto import MEF3Passwords
         from ._mef3_reader import available_channel_names
@@ -157,7 +158,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         and :meth:`get_incomplete_segments` each give.
 
         Each segment directory is listed once, and each index read only up to the first that lists a block with
-        samples. The indices are never encrypted, so no password is needed.
+        samples. The indices are never encrypted, so no password is needed. An index that cannot be read raises,
+        as in :meth:`get_empty_channel_ids` and :meth:`get_unreadable_channel_ids`; :meth:`get_incomplete_segments`
+        lists the directories alone.
 
         Parameters
         ----------

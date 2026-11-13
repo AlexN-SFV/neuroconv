@@ -26,8 +26,8 @@ block are dropped at once; the rest of section 3 stays encrypted. Encrypted RED 
 
 A session's channels may be sampled at different rates, or recorded over different stretches of time (a
 continuous telemetry channel beside channels with gaps). They are grouped by rate and runs, each group being
-what one ElectricalSeries can hold; see :class:`MEF3ChannelGroup`. A segment that holds no data file and no
-index entry is left out, as is, with a warning, one that holds data but is missing its metadata, index or data
+what one ElectricalSeries can hold; see :class:`MEF3ChannelGroup`. A segment that holds no block (no data
+after its data file's header, and no index entry) is left out, as is, with a warning, one that holds data but is missing its metadata, index or data
 file: its samples cannot be read (see :func:`incomplete_segments`). A channel left with no samples is refused,
 to be left out with ``channels_to_skip`` (see :func:`unreadable_channel_names`).
 
@@ -627,7 +627,7 @@ def _read_channel(
     """
     A channel, its recording time offset and its GMT offset.
 
-    Empty segments, with no data file and no index entry, are left out with a warning, as are incomplete
+    Empty segments, which hold no block (see :func:`_holds_no_block`), are left out with a warning, as are incomplete
     segments, which hold data but are missing their metadata, index or data file, so their samples cannot be
     read. A channel left with no segment that holds data, or none with a block of samples, is refused.
     """
@@ -642,8 +642,8 @@ def _read_channel(
         )
     if not segment_directories:
         raise ValueError(
-            f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, with no data file and no "
-            f"block in its index, so the channel holds no samples. {_LEAVE_EMPTY_CHANNELS_OUT}"
+            f"Every segment of the MEF 3 channel '{channel_directory.name}' is empty, holding no block, so the "
+            f"channel holds no samples. {_LEAVE_EMPTY_CHANNELS_OUT}"
         )
     if segments.incomplete:
         warnings.warn(
@@ -654,8 +654,8 @@ def _read_channel(
         )
     if empty_segments:
         warnings.warn(
-            f"{len(empty_segments)} segments of the MEF 3 channel '{channel_directory.name}' hold no data file and "
-            f"no block in their index, and are left out: {', '.join(path.name for path in empty_segments[:5])}.",
+            f"{len(empty_segments)} segments of the MEF 3 channel '{channel_directory.name}' hold no block, and "
+            f"are left out: {', '.join(path.name for path in empty_segments[:5])}.",
             UserWarning,
             stacklevel=_stacklevel_outside_neuroconv(),
         )
@@ -1427,18 +1427,23 @@ def _lists_samples(segments: _ChannelSegments) -> bool:
     )
 
 
-def channel_survey(folder_path) -> dict:
+def channel_survey(folder_path, lists=("empty", "unreadable", "incomplete_segments")) -> dict:
     """
     What keeps a session's channels from being read, from one listing of each segment directory: ``empty`` and
     ``unreadable``, the channels :func:`empty_channel_names` and :func:`unreadable_channel_names` list, and
     ``incomplete_segments``, as :func:`incomplete_segments` gives them. Pass ``empty`` and ``unreadable`` to
     ``channels_to_skip`` to read the rest.
 
-    Only the directories and the complete segments' block indices are read, which MEF 3 never encrypts, so no
-    password is needed; each index only up to the first that lists a block with samples. An index that cannot be
-    read raises, and so does a segment with two or more files of one kind. A path that is not a session is
-    refused, as by :func:`read_mef3_session`.
+    ``lists`` names the ones wanted; only those are given, and only the indices they need are read: ``empty``
+    reads the indices of the channels with no incomplete segment, ``unreadable`` those of the channels with one,
+    each up to the first that lists a block with samples, and ``incomplete_segments`` none, the directories
+    alone. MEF 3 never encrypts an index, so no password is needed. An index that is read and cannot be read
+    raises, and so does a segment with two or more files of one kind. A path that is not a session is refused,
+    as by :func:`read_mef3_session`.
     """
+    unknown = sorted(set(lists) - {"empty", "unreadable", "incomplete_segments"})
+    if unknown:
+        raise ValueError(f"channel_survey lists empty, unreadable and incomplete_segments, not {unknown}.")
     empty, unreadable, incomplete = [], [], {}
     for directory in _channel_directories(Path(folder_path)):
         name = directory.name[: -len(".timd")]
@@ -1447,9 +1452,12 @@ def channel_survey(folder_path) -> dict:
             incomplete[name] = {segment.name: list(missing) for segment, missing in segments.incomplete.items()}
         # A channel with no segment directory is in neither list: the reader refuses it as it is. One with an
         # incomplete segment may have held its samples there, so it is unreadable rather than empty.
-        if segments.every and not _lists_samples(segments):
-            (unreadable if segments.incomplete else empty).append(name)
-    return {"empty": empty, "unreadable": unreadable, "incomplete_segments": incomplete}
+        found = unreadable if segments.incomplete else empty
+        wanted = "unreadable" if segments.incomplete else "empty"
+        if wanted in lists and segments.every and not _lists_samples(segments):
+            found.append(name)
+    survey = {"empty": empty, "unreadable": unreadable, "incomplete_segments": incomplete}
+    return {key: value for key, value in survey.items() if key in lists}
 
 
 def empty_channel_names(folder_path) -> list[str]:
@@ -1463,7 +1471,7 @@ def empty_channel_names(folder_path) -> list[str]:
     is not listed: reading its index raises. A path that is not a session is refused, as by
     :func:`read_mef3_session`. See :func:`channel_survey` for this and the channels that cannot be read at once.
     """
-    return channel_survey(folder_path)["empty"]
+    return channel_survey(folder_path, lists=("empty",))["empty"]
 
 
 def incomplete_segments(folder_path) -> dict[str, dict[str, list[str]]]:
@@ -1475,10 +1483,10 @@ def incomplete_segments(folder_path) -> dict[str, dict[str, list[str]]]:
     :func:`read_mef3_session` leaves such a segment out, with a warning, since its samples cannot be read
     without its metadata, index and data file. A channel left with no samples is refused; see
     :func:`unreadable_channel_names`. A segment with two or more files of one kind is not incomplete but
-    ambiguous, and refused. No password is needed. A path that is not a session is refused, as by
-    :func:`read_mef3_session`.
+    ambiguous, and refused. Only the directories are listed, so no password is needed and no index is read. A
+    path that is not a session is refused, as by :func:`read_mef3_session`.
     """
-    return channel_survey(folder_path)["incomplete_segments"]
+    return channel_survey(folder_path, lists=("incomplete_segments",))["incomplete_segments"]
 
 
 def unreadable_channel_names(folder_path) -> list[str]:
@@ -1489,10 +1497,11 @@ def unreadable_channel_names(folder_path) -> list[str]:
 
     :func:`read_mef3_session` refuses such a channel unless it is in ``channels_to_skip``; this lists them, to
     leave them out. It is disjoint from :func:`empty_channel_names`, which lists the channels that hold no
-    samples with every segment complete or empty. Only the directories and the complete segments' block indices
-    are read, which MEF 3 never encrypts, so no password is needed. An index that cannot be read raises.
+    samples with every segment complete or empty. Only the directories, and the block indices of the complete
+    segments of channels with an incomplete one, are read, which MEF 3 never encrypts, so no password is
+    needed. An index that cannot be read raises.
     """
-    return channel_survey(folder_path)["unreadable"]
+    return channel_survey(folder_path, lists=("unreadable",))["unreadable"]
 
 
 def available_channel_names(folder_path, passwords: MEF3Passwords | None = None) -> list[str]:
@@ -1502,18 +1511,19 @@ def available_channel_names(folder_path, passwords: MEF3Passwords | None = None)
     One metadata file of each channel is read, for its acquisition channel number: that of its first segment that
     holds data and every file, else of its first segment that holds a metadata file. ``passwords`` as for
     :func:`read_mef3_session`. A channel with no metadata file at all (see :func:`unreadable_channel_names`), or
-    no segment, is still listed; it has no acquisition channel number, so every channel is then listed by name,
-    as :func:`read_mef3_session` orders channels that do not all give a distinct one.
+    no segment, is still listed, after the others, in name order: the reader cannot read it, so it is read with
+    those channels skipped, and gives the others in the order that leaves them (acquisition channel order when
+    each gives a distinct number, else name order).
     """
-    names, numbers = [], []
+    names, numbers, unnumbered = [], [], []
     for directory in _channel_directories(Path(folder_path)):
+        name = directory.name[: -len(".timd")]
         segments = _channel_segments(directory)
         metadata_directory = _metadata_segment_directory(segments)
-        number = -1
-        if metadata_directory is not None:
-            number = _read_segment_metadata(segments.only(metadata_directory, ".tmet"), passwords)[
-                "acquisition_channel_number"
-            ]
-        names.append(directory.name[: -len(".timd")])
-        numbers.append(number)
-    return [names[index] for index in _channel_order(names, numbers)]
+        if metadata_directory is None:
+            unnumbered.append(name)
+            continue
+        metadata = _read_segment_metadata(segments.only(metadata_directory, ".tmet"), passwords)
+        names.append(name)
+        numbers.append(metadata["acquisition_channel_number"])
+    return [names[index] for index in _channel_order(names, numbers)] + unnumbered
