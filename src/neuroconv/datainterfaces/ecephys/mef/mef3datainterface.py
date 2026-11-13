@@ -116,6 +116,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         password: str | None = None,
         level_1_password: str | None = None,
         level_2_password: str | None = None,
+        channels_to_skip: list | None = None,
     ) -> dict:
         """
         Get each channel's sampling frequency, reading one metadata file per channel.
@@ -129,6 +130,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             Path to the session's ``.mefd`` directory.
         password, level_1_password, level_2_password : str, optional
             As for the interface, when the session's metadata is encrypted.
+        channels_to_skip : list, optional
+            Channels to leave out, whose metadata is not read: a channel listed by
+            :meth:`get_unreadable_channel_ids` may have no metadata file to give its rate.
 
         Returns
         -------
@@ -139,7 +143,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         from ._mef3_reader import channel_sampling_frequencies
 
         return channel_sampling_frequencies(
-            folder_path, MEF3Passwords.from_arguments(password, level_1_password, level_2_password)
+            folder_path,
+            MEF3Passwords.from_arguments(password, level_1_password, level_2_password),
+            channels_to_skip=channels_to_skip,
         )
 
     @staticmethod
@@ -165,6 +171,57 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         from ._mef3_reader import empty_channel_names
 
         return empty_channel_names(folder_path)
+
+    @staticmethod
+    def get_unreadable_channel_ids(folder_path: DirectoryPath) -> list:
+        """
+        Get the names of the channels of a MEF 3 session whose samples cannot be read: every segment of each that
+        holds data is missing its metadata, index or data file.
+
+        The interface leaves a segment that is missing a file out, with a warning (see
+        :meth:`get_incomplete_segments`), and refuses a channel left with no samples unless it is left out; pass
+        these to ``channels_to_skip`` (and to :meth:`get_channel_sampling_frequencies`) to convert the rest.
+        Disjoint from :meth:`get_empty_channel_ids`. Only the directories and block indices are read, which are
+        never encrypted, so no password is needed.
+
+        Parameters
+        ----------
+        folder_path : DirectoryPath
+            Path to the session's ``.mefd`` directory.
+
+        Returns
+        -------
+        list
+            The names of the channels whose samples cannot be read, in name order; empty when there are none.
+        """
+        from ._mef3_reader import unreadable_channel_names
+
+        return unreadable_channel_names(folder_path)
+
+    @staticmethod
+    def get_incomplete_segments(folder_path: DirectoryPath) -> dict:
+        """
+        Get the segments of a MEF 3 session that hold data but are missing a file, which the interface leaves out.
+
+        A segment directory holds a metadata (``.tmet``), index (``.tidx``) and data (``.tdat``) file; without any
+        one of them its samples cannot be read. The interface leaves such a segment out with a warning, and keeps
+        the rest of its channel; a channel with no other samples is listed by :meth:`get_unreadable_channel_ids`.
+        Only the directories are listed, so no password is needed.
+
+        Parameters
+        ----------
+        folder_path : DirectoryPath
+            Path to the session's ``.mefd`` directory.
+
+        Returns
+        -------
+        dict
+            Channel name to ``{segment directory name: [missing suffixes]}``, for the channels with such a segment,
+            in name order; empty when every segment is complete.
+        """
+        from ._mef3_reader import incomplete_segments
+
+        return incomplete_segments(folder_path)
 
     @classmethod
     def get_extractor_class(cls):
