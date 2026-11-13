@@ -410,3 +410,51 @@ class TestSubjectFieldsStayOut:
             "Fp1": 1000.0,
             "EKG": 1000.0,
         }
+
+
+def remove_segment_file(session_path: Path, channel: str, segment: int, suffix: str):
+    (session_path / f"{channel}.timd" / f"{channel}-{segment:06d}.segd" / f"{channel}-{segment:06d}{suffix}").unlink()
+
+
+class TestIncompleteSegmentsOfAnEncryptedSession:
+    """Incomplete segments are found from the directories alone, and an encrypted session reads around them as a
+    plaintext one does, the password never in what is raised or warned."""
+
+    @staticmethod
+    def _incomplete(session_path: Path):
+        remove_segment_file(session_path, "Cz", 1, ".tidx")  # a segment of a channel otherwise kept
+        remove_segment_file(session_path, "Fp1", 0, ".tmet")  # every segment of a channel
+        remove_segment_file(session_path, "Fp1", 1, ".tmet")
+
+    def test_reads_as_the_plaintext_session(self, gapped_copy, tmp_path):
+        plaintext_copy = tmp_path / "plaintext.mefd"
+        shutil.copytree(GAPPED, plaintext_copy)
+        self._incomplete(plaintext_copy)
+        encrypt_session(gapped_copy, level_1_password=LEVEL_1, level_2_password=LEVEL_2)
+        self._incomplete(gapped_copy)
+
+        # No password needed to find them.
+        assert MEF3RecordingInterface.get_unreadable_channel_ids(gapped_copy) == ["Fp1"]
+        assert MEF3RecordingInterface.get_incomplete_segments(gapped_copy) == {
+            "Cz": {"Cz-000001.segd": [".tidx"]},
+            "Fp1": {"Fp1-000000.segd": [".tmet"], "Fp1-000001.segd": [".tmet"]},
+        }
+        assert MEF3RecordingInterface.get_channel_sampling_frequencies(
+            gapped_copy, password=LEVEL_2, channels_to_skip=["Fp1"]
+        ) == {"Cz": 1000.0, "EKG": 1000.0}
+
+        passwords = MEF3Passwords(level_1_password=LEVEL_1, level_2_password=LEVEL_2)
+        with pytest.raises(ValueError, match="get_unreadable_channel_ids") as error:
+            read_quietly(gapped_copy, passwords=passwords)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            session = read_mef3_session(gapped_copy, passwords=passwords, channels_to_skip=["Fp1"])
+        expected = read_quietly(plaintext_copy, channels_to_skip=["Fp1"])
+        assert [summary(session.select_group(index)) for index in range(len(session.channel_groups))] == [
+            summary(expected.select_group(index)) for index in range(len(expected.channel_groups))
+        ]
+        messages = [str(error.value)] + [str(warning.message) for warning in caught]
+        assert any("Cz-000001.segd (no .tidx file)" in message for message in messages)
+        for message in messages:
+            for secret in (LEVEL_1, LEVEL_2):
+                assert secret not in message
