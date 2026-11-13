@@ -89,7 +89,7 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         level_2_password: str | None = None,
     ) -> list:
         """
-        Get the names of all time series channels in a MEF 3 session, reading one metadata file per channel.
+        Get the names of all time series channels in a MEF 3 session, reading at most one metadata file per channel.
 
         Parameters
         ----------
@@ -101,7 +101,9 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
         Returns
         -------
         list
-            The channel names, in acquisition channel order.
+            The channel names, in acquisition channel order. A channel with no metadata file at all (see
+            :meth:`get_unreadable_channel_ids`) is listed too; it gives no acquisition channel number, so the
+            channels are then in name order, as the interface orders them.
         """
         from ._mef3_crypto import MEF3Passwords
         from ._mef3_reader import available_channel_names
@@ -147,6 +149,30 @@ class MEF3RecordingInterface(BaseRecordingExtractorInterface):
             MEF3Passwords.from_arguments(password, level_1_password, level_2_password),
             channels_to_skip=channels_to_skip,
         )
+
+    @staticmethod
+    def get_channel_survey(folder_path: DirectoryPath) -> dict:
+        """
+        Get, from one pass over a MEF 3 session, what :meth:`get_empty_channel_ids`, :meth:`get_unreadable_channel_ids`
+        and :meth:`get_incomplete_segments` each give.
+
+        Each segment directory is listed once, and each index read only up to the first that lists a block with
+        samples. The indices are never encrypted, so no password is needed.
+
+        Parameters
+        ----------
+        folder_path : DirectoryPath
+            Path to the session's ``.mefd`` directory.
+
+        Returns
+        -------
+        dict
+            ``{"empty": [...], "unreadable": [...], "incomplete_segments": {...}}``. Pass ``empty`` and
+            ``unreadable`` to ``channels_to_skip`` to convert the rest.
+        """
+        from ._mef3_reader import channel_survey
+
+        return channel_survey(folder_path)
 
     @staticmethod
     def get_empty_channel_ids(folder_path: DirectoryPath) -> list:

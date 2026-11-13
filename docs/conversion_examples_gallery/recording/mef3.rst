@@ -74,7 +74,10 @@ A segment directory that holds data but is missing its metadata (``.tmet``), ind
 ``MEF3RecordingInterface.get_incomplete_segments`` lists such segments and the files they lack. A channel none of
 whose samples can then be read is refused like an empty one: ``MEF3RecordingInterface.get_unreadable_channel_ids``
 lists them, reading directories and block indices only, to pass to ``channels_to_skip``. A skipped channel with no
-metadata file has no rate, so pass the same list to ``get_channel_sampling_frequencies``.
+metadata file has no rate, so pass the same list to ``get_channel_sampling_frequencies``. A segment directory with two
+or more files of one kind is ambiguous rather than incomplete, and is refused whatever else it lacks.
+``MEF3RecordingInterface.get_channel_survey`` gives the empty channels, the unreadable channels and the incomplete
+segments together, listing each segment directory once.
 
 Gaps and timing
 ^^^^^^^^^^^^^^^
