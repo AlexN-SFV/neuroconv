@@ -1,3 +1,5 @@
+import copy
+import math
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +42,13 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
     The runs, when there is more than one, are written to a ``TimeIntervals`` table named ``"runs"``, and the
     annotations of an IEEG.org ``annotations.xml`` to one named ``"annotations"``. Channels sampled at
     different rates are read one rate, or stream, at a time. Encrypted files are refused.
+
+    A long recording can be written to several NWB files, each holding some of its runs: give ``run_indices``,
+    or call :meth:`select_runs` on an interface over the whole recording, which reads the headers only once.
+    :meth:`get_runs` lists the runs from the headers alone. Each run keeps the series name, starting time and
+    samples it would have in a file of the whole recording, every file has the recording's
+    ``session_start_time``, and the ``runs`` table always lists the file's runs by their index in the
+    recording, so the files line up on one timeline.
     """
 
     display_name = "MEF 2 Recording"
@@ -100,6 +109,34 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
 
         return stream_names(folder_path)
 
+    @staticmethod
+    def get_runs(
+        folder_path: DirectoryPath, *, stream_name: str | None = None, channels_to_skip: list | None = None
+    ) -> list:
+        """
+        List the uninterrupted runs of a MEF 2 recording from its headers and block indices, decoding no samples.
+
+        Parameters
+        ----------
+        folder_path : DirectoryPath
+            Path to the directory of the recording's ``.mef`` files.
+        stream_name : str, optional
+            The sampling rate, as ``get_stream_names`` names it; required when the files have more than one.
+        channels_to_skip : list, optional
+            Channels to leave out of the byte counts, as for the interface.
+
+        Returns
+        -------
+        list of MEF2RunSummary
+            One per run, in time order: ``index``, ``start_offset`` (seconds from the recording's start, where
+            the run's series starts), ``number_of_samples`` and ``number_of_bytes`` (the compressed blocks of
+            every kept channel, a measure of the work and output the run makes).
+        """
+        from ._mef2_reader import read_mef2_recording, run_summaries
+
+        recording = read_mef2_recording(folder_path, channels_to_skip=channels_to_skip, stream_name=stream_name)
+        return run_summaries(recording)
+
     @classmethod
     def get_extractor_class(cls):
         from ._mef2_extractor import MEF2RecordingExtractor
@@ -112,6 +149,7 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
             channels_to_skip=interface_kwargs.get("channels_to_skip"),
             stream_name=interface_kwargs.get("stream_name"),
             validate_crc=interface_kwargs.get("validate_crc", False),
+            run_indices=interface_kwargs.get("run_indices"),
         )
         return self.get_extractor_class()(**self.extractor_kwargs)
 
@@ -125,6 +163,7 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         stream_name: str | None = None,
         annotations_file_path: FilePath | None = None,
         validate_crc: bool = False,
+        run_indices: list[int] | None = None,
     ):
         """
         Load and prepare data for MEF 2.
@@ -153,6 +192,11 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
             If True, check each block's CRC as it is decoded and raise on a block or MEF 2.1 header that fails
             it, at a cost of a few percent of decoding time. Otherwise a failing header CRC only warns and block
             CRCs are not computed.
+        run_indices : list of int, optional
+            Write only these runs, by their 0-based index in the whole recording (see ``get_runs``), contiguous or
+            not. Each keeps the series name and starting time it has in a file of the whole recording, the runs
+            table lists them, even a single one, by that index, and only the annotations that overlap their span
+            are written. Defaults to every run.
         """
         super().__init__(
             folder_path=folder_path,
@@ -161,11 +205,15 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
             channels_to_skip=channels_to_skip,
             stream_name=stream_name,
             validate_crc=validate_crc,
+            run_indices=run_indices,
         )
         if metadata_key is None:
             self.metadata_key = "mef2_recording"
 
         self.mef2_recording = self.recording_extractor.mef2_recording
+        # The index in the whole recording of each segment's run, and whether a selection was asked for.
+        self.run_indices = list(self.recording_extractor.run_indices)
+        self.runs_selected = run_indices is not None
         if annotations_file_path is None:
             default = Path(folder_path) / "annotations.xml"
             annotations_file_path = default if default.is_file() else None
@@ -177,6 +225,51 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
             self._annotations = read_ieeg_annotations(
                 self.annotations_file_path, recording_start_time=self.mef2_recording.recording_start_time
             )
+
+    def describe_runs(self) -> list:
+        """
+        The runs of the whole recording, as ``get_runs`` lists them, from the headers this interface has read.
+
+        Returns
+        -------
+        list of MEF2RunSummary
+        """
+        from ._mef2_reader import run_summaries
+
+        return run_summaries(self.mef2_recording)
+
+    def select_runs(self, run_indices: list[int]) -> "MEF2RecordingInterface":
+        """
+        An interface over some of this interface's runs, sharing its headers, channel properties and annotations.
+
+        For writing a long recording to several files without reading its headers again for each. Channel
+        properties set on this interface's extractor, and its aligned starting times, carry over.
+
+        Parameters
+        ----------
+        run_indices : list of int
+            Runs by their 0-based index in the whole recording; each must be one of this interface's runs.
+
+        Returns
+        -------
+        MEF2RecordingInterface
+        """
+        from ._mef2_extractor import check_run_indices
+
+        indices = check_run_indices(
+            run_indices, number_of_runs=len(self.mef2_recording.runs), name=self.mef2_recording.path.name
+        )
+        positions = {run_index: position for position, run_index in enumerate(self.run_indices)}
+        missing = [index for index in indices if index not in positions]
+        if missing:
+            raise ValueError(f"Runs {missing[:5]} are not among this interface's runs.")
+        selected = copy.copy(self)
+        selected.recording_extractor = self.recording_extractor.select_segments([positions[i] for i in indices])
+        selected.run_indices = indices
+        selected._number_of_segments = len(indices)
+        selected.runs_selected = True
+        selected.source_data = dict(self.source_data, run_indices=indices)
+        return selected
 
     def get_metadata(self, *, use_new_metadata_format: bool = True) -> DeepDict:
         metadata = super().get_metadata(use_new_metadata_format=use_new_metadata_format)
@@ -260,51 +353,120 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         if write_as is not None:
             conversion_options["write_as"] = write_as
             conversion_options.pop("parent_container")
-        super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
+        if self.runs_selected and write_electrical_series:
+            self._add_selected_runs_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
+        else:
+            super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, **conversion_options)
 
         if write_annotations and self._annotations:
             self._add_annotations_to_nwbfile(nwbfile=nwbfile)
-        # A single run is indistinguishable from an uninterrupted recording, so there is nothing to record.
-        if write_runs and len(self.mef2_recording.runs) > 1:
+        # A single run is indistinguishable from an uninterrupted recording, so there is nothing to record,
+        # unless it was selected from several: its index then says where it is in the recording.
+        if write_runs and (self.runs_selected or len(self.mef2_recording.runs) > 1):
             self._add_runs_to_nwbfile(nwbfile=nwbfile)
+
+    def _series_name_suffix(self, run_index: int) -> str:
+        """The digits the writer appends to a run's series name in a file of the whole recording."""
+        number_of_runs = len(self.mef2_recording.runs)
+        if number_of_runs == 1:
+            return ""
+        return f"{run_index:0{int(math.ceil(math.log10(number_of_runs)))}}"
+
+    def _add_selected_runs_to_nwbfile(self, *, nwbfile: NWBFile, metadata: dict | None, **conversion_options):
+        """
+        Write each selected run as its own series, named as in a file of the whole recording.
+
+        The writer numbers the series of a recording by segment, which for a selection would be the run's
+        place in the selection; each run is therefore written as a recording of one segment, under the name
+        the whole recording gives it.
+        """
+        metadata = metadata or self._get_metadata_for_writing()
+        selection = self.recording_extractor
+        try:
+            for position, run_index in enumerate(self.run_indices):
+                self.recording_extractor = selection.select_segments([position])
+                run_metadata = copy.deepcopy(metadata)
+                entry = self._series_metadata_entry(run_metadata)
+                entry["name"] = entry.get("name", "ElectricalSeries") + self._series_name_suffix(run_index)
+                super().add_to_nwbfile(nwbfile=nwbfile, metadata=run_metadata, **conversion_options)
+        finally:
+            self.recording_extractor = selection
+
+    def _series_metadata_entry(self, metadata: dict) -> dict:
+        """The metadata entry ``add_to_nwbfile`` takes this interface's series name from, created if absent."""
+        ecephys = metadata.setdefault("Ecephys", {})
+        series = ecephys.get("ElectricalSeries")
+        if isinstance(series, dict) and self.metadata_key in series:
+            return series[self.metadata_key]
+        return ecephys.setdefault(self.es_key, {})
+
+    def _run_start_time(self, run_index: int) -> float:
+        """Where run ``run_index`` of the recording starts on the NWB timeline, any alignment included."""
+        if run_index in self.run_indices:
+            return float(self.recording_extractor.get_start_time(segment_index=self.run_indices.index(run_index)))
+        # A run left out of the selection, which an annotation can still fall in.
+        recording = self.mef2_recording
+        return (recording.runs[run_index].start_time - recording.start_time) / 1e6
 
     def _session_time(self, time: int) -> float:
         """A µUTC time on the NWB timeline, from the start of its run as written, so any alignment moves it too."""
         run_index, seconds_into_run = self.mef2_recording.locate(time)
-        return float(self.recording_extractor.get_start_time(segment_index=run_index)) + seconds_into_run
+        return self._run_start_time(run_index) + seconds_into_run
+
+    def _selected_span(self) -> tuple[float, float]:
+        """The NWB times the selected runs span, from the first one's start to the last one's end."""
+        first, last = self.run_indices[0], self.run_indices[-1]
+        rate = self.mef2_recording.sampling_frequency
+        return (
+            self._run_start_time(first),
+            self._run_start_time(last) + self.mef2_recording.runs[last].number_of_samples / rate,
+        )
 
     def _add_annotations_to_nwbfile(self, nwbfile: NWBFile):
         sample_period = 1.0 / self.mef2_recording.sampling_frequency
+        span = self._selected_span() if self.runs_selected else None
         rows = []
         for annotation in self._annotations:
             start_time = self._session_time(annotation.start_time)
-            stop_time = self._session_time(annotation.end_time)
-            rows.append(
-                dict(
-                    start_time=start_time,
-                    # An annotation of an instant spans one sample, because NWB Inspector flags an interval that
-                    # stops where it starts.
-                    stop_time=max(stop_time, start_time + sample_period),
-                    label=annotation.annotation_type,
-                    annotation_description=annotation.description,
-                    layer=annotation.layer,
-                    annotator=annotation.annotator,
-                    channels=", ".join(annotation.channels),
-                )
+            # An annotation of an instant spans one sample, because NWB Inspector flags an interval that stops
+            # where it starts.
+            stop_time = max(self._session_time(annotation.end_time), start_time + sample_period)
+            row = dict(
+                start_time=start_time,
+                stop_time=stop_time,
+                label=annotation.annotation_type,
+                annotation_description=annotation.description,
+                layer=annotation.layer,
+                annotator=annotation.annotator,
+                channels=", ".join(annotation.channels),
+            )
+            if span is not None:
+                # Only what overlaps the selected runs; an annotation that reaches past them keeps its own times.
+                if stop_time <= span[0] or start_time >= span[1]:
+                    continue
+                row["spans_parts"] = bool(start_time < span[0] or stop_time > span[1])
+            rows.append(row)
+        if not rows:
+            return
+        columns = {
+            # "label" rather than "description", which TimeIntervals reserves for the table's own description.
+            "label": "The annotation's type, such as 'Seizure'.",
+            "annotation_description": "The annotation's free-text description, empty if it has none.",
+            "layer": "The IEEG.org annotation layer the annotation belongs to.",
+            "annotator": "Who or what made the annotation.",
+            "channels": "The channels the annotation applies to, by .mef file name, separated by ', '.",
+        }
+        if span is not None:
+            columns["spans_parts"] = (
+                "Whether the annotation reaches past the runs this file holds, into runs of the recording written "
+                "elsewhere; its start and stop times are its own, not cut to this file's."
             )
         add_rows_to_intervals_table(
             nwbfile=nwbfile,
             file_path=self.annotations_file_path,
             name="annotations",
             description="Annotations imported from an IEEG.org annotations.xml, placed on the samples they mark.",
-            columns={
-                # "label" rather than "description", which TimeIntervals reserves for the table's own description.
-                "label": "The annotation's type, such as 'Seizure'.",
-                "annotation_description": "The annotation's free-text description, empty if it has none.",
-                "layer": "The IEEG.org annotation layer the annotation belongs to.",
-                "annotator": "Who or what made the annotation.",
-                "channels": "The channels the annotation applies to, by .mef file name, separated by ', '.",
-            },
+            columns=columns,
             rows=rows,
             kind="MEF 2",
             source_file_description=_ANNOTATIONS_SOURCE_FILE_DESCRIPTION,
@@ -318,9 +480,11 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         add_runs_to_nwbfile(
             nwbfile,
             run_start_times=[
-                self.recording_extractor.get_start_time(segment_index=index) for index in range(len(recording.runs))
+                self.recording_extractor.get_start_time(segment_index=position)
+                for position in range(len(self.run_indices))
             ],
-            run_samples=[run.number_of_samples for run in recording.runs],
+            run_samples=[recording.runs[index].number_of_samples for index in self.run_indices],
+            run_indices=self.run_indices,
             sampling_frequency=recording.sampling_frequency,
             file_path=recording.path,
             kind="MEF 2",

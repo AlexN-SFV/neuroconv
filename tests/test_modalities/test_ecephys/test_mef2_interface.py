@@ -876,3 +876,183 @@ class TestMEF2_0RecordingInterfaceContract(RecordingExtractorInterfaceTestMixin)
 
     def check_extracted_metadata(self, metadata: dict):
         assert metadata["NWBFile"]["session_start_time"] == datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+class TestRunSelection:
+    """Writing some of a recording's runs, to split a long recording over several files."""
+
+    @staticmethod
+    def two_channels(tmp_path) -> Path:
+        folder = tmp_path / "recording"
+        channel_copy(PENN, folder / "LI07.mef")
+        channel_copy(PENN, folder / "LI08.mef", channel_name="LI08", physical_channel_number=99)
+        return folder
+
+    @staticmethod
+    def write(interface, path: Path) -> Path:
+        interface.run_conversion(nwbfile_path=path, metadata=quiet(interface.get_metadata), overwrite=True)
+        return path
+
+    def test_get_runs_reads_only_headers_and_indices(self, tmp_path):
+        folder = self.two_channels(tmp_path)
+        runs = quiet(MEF2RecordingInterface.get_runs, folder)
+        recording = quiet(read_mef2_recording, folder)
+        extractor = quiet(MEF2RecordingExtractor, folder)
+        assert [run.index for run in runs] == list(range(8))
+        assert [run.number_of_samples for run in runs] == [run.number_of_samples for run in recording.runs]
+        assert [run.start_offset for run in runs] == pytest.approx(
+            [extractor.get_start_time(segment_index=index) for index in range(8)]
+        )
+        # Every block of every channel belongs to exactly one run.
+        assert sum(run.number_of_bytes for run in runs) == sum(
+            int(channel.blocks["span"].sum()) for channel in recording.channels
+        )
+        assert all(run.number_of_bytes > 0 for run in runs)
+        interface = quiet(MEF2RecordingInterface, folder)
+        assert interface.describe_runs() == runs
+        assert quiet(MEF2RecordingInterface.get_runs, folder, channels_to_skip=["LI08"])[0].number_of_bytes * 2 == (
+            runs[0].number_of_bytes
+        )
+
+    @pytest.mark.parametrize("selections", [[[0, 1, 2], [3, 4], [5, 6, 7]], [[0], [2, 5], [1, 3, 4, 6, 7]]])
+    def test_parts_hold_the_whole_recordings_series(self, tmp_path, selections):
+        """Each run's series is the one a file of the whole recording has: name, starting time and samples."""
+        folder = self.two_channels(tmp_path)
+        whole = self.write(quiet(MEF2RecordingInterface, folder), tmp_path / "whole.nwb")
+        full_interface = quiet(MEF2RecordingInterface, folder)
+        parts = []
+        for number, selection in enumerate(selections):
+            # Both ways of selecting: from the folder, and from an interface over the whole recording.
+            interface = (
+                quiet(MEF2RecordingInterface, folder, run_indices=selection)
+                if number % 2
+                else full_interface.select_runs(selection)
+            )
+            parts.append(self.write(interface, tmp_path / f"part{number}.nwb"))
+
+        with NWBHDF5IO(whole, "r") as io:
+            nwbfile = io.read()
+            expected = {
+                name: (series.starting_time, series.rate, series.conversion, series.data[:])
+                for name, series in nwbfile.acquisition.items()
+            }
+            session_start_time = nwbfile.session_start_time
+            electrodes = list(nwbfile.electrodes["channel_name"][:])
+        seen = {}
+        for selection, part in zip(selections, parts):
+            with NWBHDF5IO(part, "r") as io:
+                nwbfile = io.read()
+                assert nwbfile.session_start_time == session_start_time
+                assert list(nwbfile.electrodes["channel_name"][:]) == electrodes
+                assert len(nwbfile.acquisition) == len(selection)
+                for name, series in nwbfile.acquisition.items():
+                    seen[name] = (series.starting_time, series.rate, series.conversion, series.data[:])
+                    assert len(series.electrodes) == len(electrodes)
+                runs = nwbfile.intervals["runs"].to_dataframe()
+                assert list(runs["run_index"]) == selection
+                np.testing.assert_allclose(
+                    runs["start_time"], sorted(series.starting_time for series in nwbfile.acquisition.values())
+                )
+        assert sorted(seen) == sorted(expected)
+        for name, (starting_time, rate, conversion, data) in expected.items():
+            assert seen[name][:3] == (starting_time, rate, conversion)
+            np.testing.assert_array_equal(seen[name][3], data)
+
+    def test_a_single_selected_run_is_listed_with_its_index(self, tmp_path):
+        interface = quiet(MEF2RecordingInterface, PENN, run_indices=[6])
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(interface.get_metadata))
+        (name,) = nwbfile.acquisition
+        assert name == "ElectricalSeries6"
+        runs = nwbfile.intervals["runs"].to_dataframe()
+        assert list(runs["run_index"]) == [6]
+        assert runs["start_time"].iloc[0] == pytest.approx(nwbfile.acquisition[name].starting_time)
+
+    def test_one_run_recording_selected_keeps_its_plain_name(self):
+        interface = quiet(MEF2RecordingInterface, AD3_STEP, run_indices=[0])
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(interface.get_metadata))
+        assert list(nwbfile.acquisition) == ["ElectricalSeries"]
+        assert list(nwbfile.intervals["runs"]["run_index"][:]) == [0]
+
+    def test_metadata_key_series_name_is_kept(self, tmp_path):
+        interface = quiet(MEF2RecordingInterface, PENN, run_indices=[1, 4], metadata_key="ieeg")
+        metadata = quiet(interface.get_metadata)
+        metadata["Ecephys"]["ElectricalSeries"]["ieeg"]["name"] = "Seeg"
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
+        assert sorted(nwbfile.acquisition) == ["Seeg1", "Seeg4"]
+
+    def test_selection_keeps_channel_properties_and_alignment(self):
+        interface = quiet(MEF2RecordingInterface, PENN)
+        interface.recording_extractor.set_property(key="brain_area", values=np.array(["hippocampus"]))
+        original = [interface.recording_extractor.get_start_time(segment_index=index) for index in range(8)]
+        # Alignment moves each run by the value given.
+        interface.set_aligned_segment_starting_times([100.0 * index for index in range(8)])
+        selected = interface.select_runs([3, 5])
+        assert list(selected.recording_extractor.get_property("brain_area")) == ["hippocampus"]
+        assert [selected.recording_extractor.get_start_time(segment_index=i) for i in range(2)] == pytest.approx(
+            [original[3] + 300.0, original[5] + 500.0]
+        )
+        # The interface it came from is unchanged.
+        assert interface.recording_extractor.get_num_segments() == 8
+        assert interface.run_indices == list(range(8)) and not interface.runs_selected
+        with pytest.raises(ValueError, match="not among this interface's runs"):
+            selected.select_runs([4])
+
+    @pytest.mark.parametrize(
+        "run_indices, message",
+        [
+            ([], "selects no runs"),
+            ([8], "are not runs of"),
+            ([-1], "are not runs of"),
+            ([2, 2], "repeats a run"),
+            ([True], "must be integers"),
+            (["1"], "must be integers"),
+        ],
+    )
+    def test_bad_selections_are_refused(self, run_indices, message):
+        with pytest.raises(ValueError, match=message):
+            quiet(MEF2RecordingInterface, PENN, run_indices=run_indices)
+
+    def test_unordered_selection_is_written_in_time_order(self):
+        interface = quiet(MEF2RecordingInterface, PENN, run_indices=[5, 2])
+        assert interface.run_indices == [2, 5]
+
+    def test_annotations_are_those_overlapping_the_selection(self, tmp_path):
+        folder = copy_recording(AD3, tmp_path / "ad3")
+        recording = read_mef2_recording(folder)
+        second_run = recording.runs[1].start_time - recording.recording_start_time
+        first_run_end = recording.runs[0].number_of_samples * 2000
+        (folder / "annotations.xml").write_text(
+            annotations_xml(
+                ("First", 1_000_000, 2_000_000, []),
+                ("Across", first_run_end - 1_000_000, second_run + 1_000_000, []),
+                ("Second", second_run + 3_000_000, second_run + 4_000_000, []),
+            ),
+            encoding="utf-8",
+        )
+        whole = MEF2RecordingInterface(folder)
+        nwbfile = mock_NWBFile()
+        whole.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(whole.get_metadata))
+        whole_table = nwbfile.intervals["annotations"].to_dataframe().set_index("label")
+        assert "spans_parts" not in whole_table.columns
+
+        for selection, expected in (([0], {"First": False, "Across": True}), ([1], {"Across": True, "Second": False})):
+            part = MEF2RecordingInterface(folder, run_indices=selection)
+            nwbfile = mock_NWBFile()
+            part.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(part.get_metadata))
+            table = nwbfile.intervals["annotations"].to_dataframe().set_index("label")
+            assert {label: bool(value) for label, value in table["spans_parts"].items()} == expected
+            # The annotation keeps its own times on the shared timeline.
+            for label in expected:
+                assert table.loc[label, "start_time"] == pytest.approx(whole_table.loc[label, "start_time"])
+                assert table.loc[label, "stop_time"] == pytest.approx(whole_table.loc[label, "stop_time"])
+
+    def test_no_overlapping_annotation_writes_no_table(self, tmp_path):
+        folder = copy_recording(AD3, tmp_path / "ad3")
+        (folder / "annotations.xml").write_text(annotations_xml(("First", 1_000_000, 2_000_000, [])), encoding="utf-8")
+        part = MEF2RecordingInterface(folder, run_indices=[1])
+        nwbfile = mock_NWBFile()
+        part.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(part.get_metadata))
+        assert "annotations" not in nwbfile.intervals

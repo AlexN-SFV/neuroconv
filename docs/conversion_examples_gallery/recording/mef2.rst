@@ -100,6 +100,30 @@ the NWB times of the series equal IEEG.org's offsets. The one-sample block of va
 puts before the first real block of every MEF 2.1 file is left out, so in those files the first series
 starts a couple of seconds into the session.
 
+Writing a long recording to several files
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A recording of weeks can make an NWB file of hundreds of GB. It can be written instead as several files, each
+holding some of its runs. ``MEF2RecordingInterface.get_runs`` lists the runs from the headers and block indices
+alone, with each run's start, number of samples and size in the files, to plan which runs go together; then
+pass ``run_indices`` to the interface, or call ``select_runs`` on an interface over the whole recording, which
+reads the headers only once:
+
+.. code-block:: python
+
+    interface = MEF2RecordingInterface(folder_path)
+    runs = interface.describe_runs()
+    # The runs that start in the first day, in one file
+    first_day = interface.select_runs([run.index for run in runs if run.start_offset < 86400])
+    first_day.run_conversion(nwbfile_path="recording-part1.nwb", metadata=interface.get_metadata())
+
+Each file has the recording's ``session_start_time``, and each run keeps the series name, starting time and
+samples it has in a file of the whole recording, so the files line up on one timeline: to put the recording
+back together, read the files' series in order of ``starting_time``. The ``runs`` table is always written for a
+selection, even of one run, and its ``run_index`` column gives each run's index in the whole recording. Only
+the annotations that overlap the selected runs are written, with their own times, and a ``spans_parts`` column
+says which of them reach into runs written elsewhere.
+
 Annotations, CRCs and encryption
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

@@ -232,6 +232,34 @@ class MEF2Recording:
         return run_index, (time - self.runs[run_index].start_time) / 1e6
 
 
+@dataclass(frozen=True)
+class MEF2RunSummary:
+    """One uninterrupted run of a MEF 2 recording, as its headers and block indices describe it."""
+
+    index: int  # 0-based, in time order
+    start_offset: float  # seconds from MEF2Recording.start_time, where the run's series starts
+    number_of_samples: int
+    number_of_bytes: int  # the run's compressed blocks, summed over the channels
+
+
+def run_summaries(recording: MEF2Recording) -> list[MEF2RunSummary]:
+    """The runs of ``recording``, with each one's size in the files, from the block indices alone."""
+    sizes = np.zeros(len(recording.runs), dtype=np.int64)
+    for channel in recording.channels:
+        spans = channel.blocks["span"]
+        for index, run in enumerate(channel.runs):
+            sizes[index] += int(spans[run.first_block : run.first_block + run.number_of_blocks].sum())
+    return [
+        MEF2RunSummary(
+            index=index,
+            start_offset=(run.start_time - recording.start_time) / 1e6,
+            number_of_samples=int(run.number_of_samples),
+            number_of_bytes=int(sizes[index]),
+        )
+        for index, run in enumerate(recording.runs)
+    ]
+
+
 def _text(raw: bytes) -> str:
     """A NUL-terminated field. MEF 2 predates any declared encoding, so Latin-1, which cannot fail."""
     return raw.split(b"\0", 1)[0].decode("latin-1").strip()
