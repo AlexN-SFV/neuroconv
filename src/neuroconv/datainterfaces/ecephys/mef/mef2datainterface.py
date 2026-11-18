@@ -25,6 +25,24 @@ _DEIDENTIFIED_BEFORE = datetime(1980, 1, 1, tzinfo=timezone.utc)
 _DEIDENTIFIED_DAY = datetime(2000, 1, 1, tzinfo=timezone.utc).date()
 
 
+def _independent_selection(recording, positions: list[int]):
+    """
+    ``recording.select_segments(positions)``, with copies of the segments rather than the source's own.
+
+    SpikeInterface's selection shares, and re-parents, the source's segment objects, and alignment sets the time
+    of a segment object in place, so aligning one selection would move the source's runs and every other
+    selection's. Each copy shares the decoding state, which is only read.
+    """
+    originals = [recording.segments[position] for position in positions]
+    selection = recording.select_segments(positions)
+    for segment in originals:
+        segment.set_parent_extractor(recording)
+    selection._segments = []
+    for segment in originals:
+        selection.add_recording_segment(copy.copy(segment))
+    return selection
+
+
 class MEF2RecordingInterface(BaseRecordingExtractorInterface):
     """
     Data interface class for converting MEF 2.0 and 2.1 recordings (Multiscale Electrophysiology Format, ``.mef``).
@@ -195,8 +213,8 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         run_indices : list of int, optional
             Write only these runs, by their 0-based index in the whole recording (see ``get_runs``), contiguous or
             not. Each keeps the series name and starting time it has in a file of the whole recording, the runs
-            table lists them, even a single one, by that index, and only the annotations that overlap their span
-            are written. Defaults to every run.
+            table lists them, even a single one, by that index, and only the annotations that overlap them are
+            written, each run taking the gap after it. Defaults to every run.
         """
         super().__init__(
             folder_path=folder_path,
@@ -243,7 +261,8 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         An interface over some of this interface's runs, sharing its headers, channel properties and annotations.
 
         For writing a long recording to several files without reading its headers again for each. Channel
-        properties set on this interface's extractor, and its aligned starting times, carry over.
+        properties set on this interface's extractor, and its aligned starting times, carry over. The selection
+        has segments of its own: aligning it later leaves this interface's runs where they are.
 
         Parameters
         ----------
@@ -264,7 +283,7 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         if missing:
             raise ValueError(f"Runs {missing[:5]} are not among this interface's runs.")
         selected = copy.copy(self)
-        selected.recording_extractor = self.recording_extractor.select_segments([positions[i] for i in indices])
+        selected.recording_extractor = _independent_selection(self.recording_extractor, [positions[i] for i in indices])
         selected.run_indices = indices
         selected._number_of_segments = len(indices)
         selected.runs_selected = True
@@ -404,7 +423,14 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         """Where run ``run_index`` of the recording starts on the NWB timeline, any alignment included."""
         if run_index in self.run_indices:
             return float(self.recording_extractor.get_start_time(segment_index=self.run_indices.index(run_index)))
-        # A run left out of the selection, which an annotation can still fall in.
+        # A run left out of the selection, which an annotation can still fall in: its own start, moved as the
+        # nearest selected run was moved by any alignment (the earlier one on a tie).
+        nearest = min(self.run_indices, key=lambda index: (abs(index - run_index), index))
+        shift = self._run_start_time(nearest) - self._raw_run_start_time(nearest)
+        return self._raw_run_start_time(run_index) + shift
+
+    def _raw_run_start_time(self, run_index: int) -> float:
+        """Where run ``run_index`` starts on the recording's own timeline, before any alignment."""
         recording = self.mef2_recording
         return (recording.runs[run_index].start_time - recording.start_time) / 1e6
 
@@ -413,18 +439,25 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         run_index, seconds_into_run = self.mef2_recording.locate(time)
         return self._run_start_time(run_index) + seconds_into_run
 
-    def _selected_span(self) -> tuple[float, float]:
-        """The NWB times the selected runs span, from the first one's start to the last one's end."""
-        first, last = self.run_indices[0], self.run_indices[-1]
-        rate = self.mef2_recording.sampling_frequency
-        return (
-            self._run_start_time(first),
-            self._run_start_time(last) + self.mef2_recording.runs[last].number_of_samples / rate,
-        )
+    def _run_territories(self) -> list[tuple[float, float]]:
+        """
+        The stretch of the NWB timeline each run of the recording owns: from its start to the next run's,
+        the first from the beginning of time and the last to its end.
+
+        A gap belongs to the run before it, as :meth:`MEF2Recording.locate` places a time in a gap, and the
+        stretches cover the timeline without overlap, so an annotation lands in at least one file of a
+        recording split by runs, whatever gap it falls in.
+        """
+        starts = [self._run_start_time(index) for index in range(len(self.mef2_recording.runs))]
+        return [
+            (-math.inf if index == 0 else start, starts[index + 1] if index + 1 < len(starts) else math.inf)
+            for index, start in enumerate(starts)
+        ]
 
     def _add_annotations_to_nwbfile(self, nwbfile: NWBFile):
         sample_period = 1.0 / self.mef2_recording.sampling_frequency
-        span = self._selected_span() if self.runs_selected else None
+        territories = self._run_territories() if self.runs_selected else None
+        selected = set(self.run_indices)
         rows = []
         for annotation in self._annotations:
             start_time = self._session_time(annotation.start_time)
@@ -440,11 +473,15 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
                 annotator=annotation.annotator,
                 channels=", ".join(annotation.channels),
             )
-            if span is not None:
-                # Only what overlaps the selected runs; an annotation that reaches past them keeps its own times.
-                if stop_time <= span[0] or start_time >= span[1]:
+            if territories is not None:
+                # Only what overlaps the selected runs' stretches; an annotation that reaches into a run written
+                # elsewhere keeps its own times, and is flagged.
+                overlapped = {
+                    index for index, (low, high) in enumerate(territories) if start_time < high and stop_time > low
+                }
+                if not overlapped & selected:
                     continue
-                row["spans_parts"] = bool(start_time < span[0] or stop_time > span[1])
+                row["spans_parts"] = bool(overlapped - selected)
             rows.append(row)
         if not rows:
             return
@@ -456,7 +493,7 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
             "annotator": "Who or what made the annotation.",
             "channels": "The channels the annotation applies to, by .mef file name, separated by ', '.",
         }
-        if span is not None:
+        if territories is not None:
             columns["spans_parts"] = (
                 "Whether the annotation reaches past the runs this file holds, into runs of the recording written "
                 "elsewhere; its start and stop times are its own, not cut to this file's."

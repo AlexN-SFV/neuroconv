@@ -246,9 +246,11 @@ def run_summaries(recording: MEF2Recording) -> list[MEF2RunSummary]:
     """The runs of ``recording``, with each one's size in the files, from the block indices alone."""
     sizes = np.zeros(len(recording.runs), dtype=np.int64)
     for channel in recording.channels:
-        spans = channel.blocks["span"]
-        for index, run in enumerate(channel.runs):
-            sizes[index] += int(spans[run.first_block : run.first_block + run.number_of_blocks].sum())
+        # Each run's bytes from one cumulative sum of the channel's block sizes.
+        ends = np.concatenate([[0], np.cumsum(channel.blocks["span"], dtype=np.int64)])
+        firsts = np.array([run.first_block for run in channel.runs], dtype=np.int64)
+        counts = np.array([run.number_of_blocks for run in channel.runs], dtype=np.int64)
+        sizes += ends[firsts + counts] - ends[firsts]
     return [
         MEF2RunSummary(
             index=index,

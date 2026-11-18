@@ -121,8 +121,10 @@ Each file has the recording's ``session_start_time``, and each run keeps the ser
 samples it has in a file of the whole recording, so the files line up on one timeline: to put the recording
 back together, read the files' series in order of ``starting_time``. The ``runs`` table is always written for a
 selection, even of one run, and its ``run_index`` column gives each run's index in the whole recording. Only
-the annotations that overlap the selected runs are written, with their own times, and a ``spans_parts`` column
-says which of them reach into runs written elsewhere.
+the annotations that overlap the selected runs are written, each run taking the gap after it so that every
+annotation is in at least one file, with their own times; a ``spans_parts`` column says which of them reach
+into runs written elsewhere. Align the whole recording before selecting runs: a selection's runs are its own,
+so aligning it moves neither the whole recording's runs nor another selection's.
 
 Annotations, CRCs and encryption
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

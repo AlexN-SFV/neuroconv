@@ -1056,3 +1056,110 @@ class TestRunSelection:
         nwbfile = mock_NWBFile()
         part.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(part.get_metadata))
         assert "annotations" not in nwbfile.intervals
+
+
+class TestRunSelectionAnnotations:
+    """Annotations of a selection of runs: gapped selections, gaps between runs, and an aligned source."""
+
+    @staticmethod
+    def with_annotations(tmp_path, *annotations):
+        """A copy of the 8-run excerpt with annotations given as (type, (run, seconds in), (run, seconds in)),
+        where a run of None with seconds counts from the header start, and run k + 0.5 means k's gap."""
+        folder = copy_recording(PENN, tmp_path / "penn")
+        recording = quiet(read_mef2_recording, folder)
+        rate = recording.sampling_frequency
+
+        def offset(where):
+            run, seconds = where
+            if run is None:
+                return int(seconds * 1e6)
+            if isinstance(run, float):  # in the gap after run int(run), `seconds` past its end
+                base = recording.runs[int(run)]
+                end = base.start_time + base.number_of_samples * 1e6 / rate
+                return int(end - recording.recording_start_time + seconds * 1e6)
+            return int(recording.runs[run].start_time - recording.recording_start_time + seconds * 1e6)
+
+        (folder / "annotations.xml").write_text(
+            annotations_xml(*((label, offset(start), offset(stop), []) for label, start, stop in annotations)),
+            encoding="utf-8",
+        )
+        return folder, recording
+
+    @staticmethod
+    def table(interface):
+        nwbfile = mock_NWBFile()
+        interface.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(interface.get_metadata))
+        if nwbfile.intervals is None or "annotations" not in nwbfile.intervals:
+            return None
+        return nwbfile.intervals["annotations"].to_dataframe().set_index("label")
+
+    def test_gapped_selection_holds_only_its_runs_annotations(self, tmp_path):
+        recording = quiet(read_mef2_recording, PENN)
+        gap_after_0 = (recording.runs[1].start_time - recording.runs[0].start_time) / 1e6 - (
+            recording.runs[0].number_of_samples / recording.sampling_frequency
+        )
+        assert gap_after_0 > 0.01, "the excerpt's runs are split by real gaps"
+        folder, _ = self.with_annotations(
+            tmp_path,
+            ("InRun0", (0, 0.1), (0, 0.2)),
+            ("InGapAfter0", (0.5, gap_after_0 / 4), (0.5, gap_after_0 / 2)),
+            ("InRun1", (1, 0.1), (1, 0.2)),
+            ("Run0ToRun2", (0, 0.1), (2, 0.1)),
+            ("InRun2", (2, 0.1), (2, 0.2)),
+        )
+        table = self.table(quiet(MEF2RecordingInterface, folder, run_indices=[0, 2]))
+        assert {label: bool(v) for label, v in table["spans_parts"].items()} == {
+            "InRun0": False,
+            "InGapAfter0": False,  # the gap after run 0 belongs to run 0
+            "Run0ToRun2": True,  # it reaches through run 1, written elsewhere
+            "InRun2": False,
+        }
+        table = self.table(quiet(MEF2RecordingInterface, folder, run_indices=[1]))
+        assert {label: bool(v) for label, v in table["spans_parts"].items()} == {"InRun1": False, "Run0ToRun2": True}
+
+    def test_every_annotation_is_in_some_part_with_its_whole_file_times(self, tmp_path):
+        folder, _ = self.with_annotations(
+            tmp_path,
+            ("Before", (None, 0.0), (None, 0.0)),
+            ("GapAfter2", (2.5, 0.001), (2.5, 0.002)),
+            ("Run3To5", (3, 0.1), (5, 0.1)),
+            ("InRun7", (7, 0.1), (7, 0.2)),
+        )
+        whole = quiet(MEF2RecordingInterface, folder)
+        whole_table = self.table(whole)
+        seen = {}
+        for selection in ([0, 1, 2], [3, 4], [5, 6, 7]):
+            table = self.table(whole.select_runs(selection))
+            for label, row in table.iterrows():
+                seen.setdefault(label, []).append(bool(row["spans_parts"]))
+                assert row["start_time"] == pytest.approx(whole_table.loc[label, "start_time"])
+                assert row["stop_time"] == pytest.approx(whole_table.loc[label, "stop_time"])
+        assert seen == {"Before": [False], "GapAfter2": [False], "Run3To5": [True, True], "InRun7": [False]}
+
+    def test_aligned_source_keeps_annotations_on_its_timeline(self, tmp_path):
+        """An annotation from run 0 into run 1, in a part holding run 1 of a whole recording shifted by 10 s."""
+        folder, _ = self.with_annotations(tmp_path, ("Across", (0, 0.5), (1, 0.1)))
+        whole = quiet(MEF2RecordingInterface, folder)
+        whole.set_aligned_starting_time(10.0)
+        whole_row = self.table(whole).loc["Across"]
+        part = whole.select_runs([1])
+        row = self.table(part).loc["Across"]
+        assert bool(row["spans_parts"])
+        assert row["start_time"] == pytest.approx(whole_row["start_time"])
+        assert row["stop_time"] == pytest.approx(whole_row["stop_time"])
+        assert part.recording_extractor.get_start_time(segment_index=0) < whole_row["stop_time"]
+
+    def test_aligning_a_selection_leaves_the_source_alone(self):
+        whole = quiet(MEF2RecordingInterface, PENN)
+        before = [whole.recording_extractor.get_start_time(segment_index=index) for index in range(8)]
+        part = whole.select_runs([1, 2])
+        part.set_aligned_starting_time(5.0)
+        assert [whole.recording_extractor.get_start_time(segment_index=index) for index in range(8)] == before
+        assert part.recording_extractor.get_start_time(segment_index=0) == pytest.approx(before[1] + 5.0)
+        other = whole.select_runs([1, 3])
+        assert other.recording_extractor.get_start_time(segment_index=0) == pytest.approx(before[1])
+        # The selection still reads the source's samples.
+        np.testing.assert_array_equal(
+            part.recording_extractor.get_traces(segment_index=1, start_frame=0, end_frame=50),
+            whole.recording_extractor.get_traces(segment_index=2, start_frame=0, end_frame=50),
+        )
