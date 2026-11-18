@@ -1,3 +1,4 @@
+import bisect
 import copy
 import math
 import warnings
@@ -278,7 +279,7 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
         indices = check_run_indices(
             run_indices, number_of_runs=len(self.mef2_recording.runs), name=self.mef2_recording.path.name
         )
-        positions = {run_index: position for position, run_index in enumerate(self.run_indices)}
+        positions = self._run_positions
         missing = [index for index in indices if index not in positions]
         if missing:
             raise ValueError(f"Runs {missing[:5]} are not among this interface's runs.")
@@ -421,13 +422,27 @@ class MEF2RecordingInterface(BaseRecordingExtractorInterface):
 
     def _run_start_time(self, run_index: int) -> float:
         """Where run ``run_index`` of the recording starts on the NWB timeline, any alignment included."""
-        if run_index in self.run_indices:
-            return float(self.recording_extractor.get_start_time(segment_index=self.run_indices.index(run_index)))
+        position = self._run_positions.get(run_index)
+        if position is not None:
+            return float(self.recording_extractor.get_start_time(segment_index=position))
         # A run left out of the selection, which an annotation can still fall in: its own start, moved as the
         # nearest selected run was moved by any alignment (the earlier one on a tie).
-        nearest = min(self.run_indices, key=lambda index: (abs(index - run_index), index))
+        after = bisect.bisect_left(self.run_indices, run_index)
+        neighbours = self.run_indices[max(after - 1, 0) : after + 1]
+        nearest = min(neighbours, key=lambda index: (abs(index - run_index), index))
         shift = self._run_start_time(nearest) - self._raw_run_start_time(nearest)
         return self._raw_run_start_time(run_index) + shift
+
+    @property
+    def run_indices(self) -> list[int]:
+        """The index in the whole recording of each segment's run, in ascending order."""
+        return self._run_indices
+
+    @run_indices.setter
+    def run_indices(self, run_indices: list[int]) -> None:
+        self._run_indices = list(run_indices)
+        # Run index to segment position, so a run's start is found without scanning the selection.
+        self._run_positions = {run_index: position for position, run_index in enumerate(self._run_indices)}
 
     def _raw_run_start_time(self, run_index: int) -> float:
         """Where run ``run_index`` starts on the recording's own timeline, before any alignment."""
