@@ -43,6 +43,27 @@ def _gains_to_microvolts(recording: MEF2Recording) -> np.ndarray:
     return gains
 
 
+def check_run_indices(run_indices, *, number_of_runs: int, name: str) -> list[int] | None:
+    """``run_indices`` as a sorted list of distinct run indices of a recording of ``number_of_runs`` runs, or None."""
+    if run_indices is None:
+        return None
+    indices = list(run_indices)
+    if not indices:
+        raise ValueError(f"run_indices selects no runs of the MEF 2 recording '{name}'.")
+    if not all(isinstance(index, (int, np.integer)) and not isinstance(index, bool) for index in indices):
+        raise ValueError(f"run_indices must be integers, got {indices[:5]}.")
+    indices = [int(index) for index in indices]
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"run_indices repeats a run: {indices[:10]}.")
+    outside = [index for index in indices if not 0 <= index < number_of_runs]
+    if outside:
+        raise ValueError(
+            f"run_indices {outside[:5]} are not runs of the MEF 2 recording '{name}', which has {number_of_runs} "
+            f"runs (0 to {number_of_runs - 1})."
+        )
+    return sorted(indices)
+
+
 class MEF2RecordingExtractor(BaseRecording):
     """
     Lazy SpikeInterface recording for the channels of a MEF 2 recording directory sampled at one rate.
@@ -60,6 +81,9 @@ class MEF2RecordingExtractor(BaseRecording):
         The sampling rate to read, such as ``"500 Hz"``; required when the files have more than one.
     validate_crc : bool, default: False
         Check every block's CRC as it is decoded.
+    run_indices : list of int, optional
+        Only these runs, by their index in the whole recording, become segments, in ascending order. Each keeps
+        the start time it has in the whole recording, so a selection stays on the recording's timeline.
     """
 
     extractor_name = "MEF2Recording"
@@ -72,15 +96,19 @@ class MEF2RecordingExtractor(BaseRecording):
         channels_to_skip: list | None = None,
         stream_name: str | None = None,
         validate_crc: bool = False,
+        run_indices: list[int] | None = None,
     ):
         recording = read_mef2_recording(
             folder_path, channels_to_skip=channels_to_skip, stream_name=stream_name, validate_crc=validate_crc
         )
+        run_indices = check_run_indices(run_indices, number_of_runs=len(recording.runs), name=recording.path.name)
         channel_ids = recording.channel_ids
         super().__init__(
             sampling_frequency=recording.sampling_frequency, channel_ids=channel_ids, dtype=np.dtype("int32")
         )
-        for run_index, run in enumerate(recording.runs):
+        selected = range(len(recording.runs)) if run_indices is None else run_indices
+        for run_index in selected:
+            run = recording.runs[run_index]
             self.add_recording_segment(
                 MEF3RecordingSegment(
                     channels=recording.channels,
@@ -106,9 +134,12 @@ class MEF2RecordingExtractor(BaseRecording):
         report_renamed_channels(self, source=f"The MEF 2 recording '{recording.path.name}'")
 
         self.mef2_recording = recording
+        # The index in the whole recording of each segment's run.
+        self.run_indices = list(selected)
         self._kwargs = dict(
             folder_path=str(folder_path),
             channels_to_skip=channels_to_skip,
             stream_name=stream_name,
             validate_crc=validate_crc,
+            run_indices=run_indices,
         )

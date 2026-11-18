@@ -30,14 +30,19 @@ def add_runs_to_nwbfile(
     file_path: Path,
     kind: str,
     source_file: str | None = None,
+    run_indices: list[int] | None = None,
 ):
     """
     Add one row per run to the ``runs`` table, starting at ``run_start_times``.
 
     The caller reads the start times from its recording, so any alignment moves the rows with the series.
+    ``run_indices`` gives each run's index in its recording when only some of its runs are written; by
+    default the runs are numbered from 0.
     """
+    if run_indices is None:
+        run_indices = range(len(run_samples))
     rows = []
-    for run_index, (number_of_samples, start_time) in enumerate(zip(run_samples, run_start_times)):
+    for run_index, number_of_samples, start_time in zip(run_indices, run_samples, run_start_times):
         start_time = float(start_time)
         rows.append(
             dict(
