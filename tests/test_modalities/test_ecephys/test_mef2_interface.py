@@ -235,6 +235,20 @@ def _range_encode(symbols: list[int], counts: list[int]) -> bytes:
     return bytes(out) + b"\0\0\0"
 
 
+def scale_red_counts(counts: np.ndarray) -> np.ndarray:
+    """
+    The symbol counts a RED block header stores, from a block's 256 raw counts, as ``RED_compress_block`` scales them.
+
+    When a count exceeds 255, every count is multiplied by 254.999 / the largest and rounded up, so the largest
+    becomes exactly 255 and none that was nonzero becomes 0. Dividing by largest / 255 instead rounds the
+    largest up to 256 for many maxima, which a ``ui1`` stores as 0.
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    if counts.max() > 255:
+        counts = np.ceil(counts * (254.999 / counts.max())).astype(np.int64)
+    return counts
+
+
 def encode_red_block(samples, start_time: int, *, discontinuity: bool = False) -> bytes:
     """
     A MEF 2 RED block of ``samples``, as mef_lib 2.1's ``RED_compress_block`` writes one, CRC included.
@@ -254,10 +268,7 @@ def encode_red_block(samples, start_time: int, *, discontinuity: bool = False) -
         else:
             coded += [-128, *current.to_bytes(3, "little", signed=True)]
     symbols = [value & 0xFF for value in coded]
-    counts = np.bincount(symbols, minlength=256)
-    if counts.max() > 255:
-        scale = counts.max() / 255.0
-        counts = np.array([int(np.ceil(count / scale)) for count in counts])
+    counts = scale_red_counts(np.bincount(symbols, minlength=256))
     data = _range_encode(symbols, counts.tolist())
     data += b"\x55" * (-(BLOCK_HEADER_BYTES + len(data)) % 8)
 
@@ -377,6 +388,93 @@ class TestFixtures:
             )
             rewritten = encode_red_block(samples, start_time, discontinuity=bool(block[30] & 1))
             assert rewritten == block[: BLOCK_HEADER_BYTES + compressed_bytes]
+
+    def test_scaled_symbol_counts_fit_a_byte_for_every_maximum(self):
+        for maximum in range(256, 20_001):
+            raw = np.zeros(256, dtype=np.int64)
+            raw[[0, 1, 2]] = maximum, maximum // 2, 1
+            counts = scale_red_counts(raw)
+            assert counts[0] == 255 and counts[1] >= 1 and counts[2] == 1 and counts[3:].max() == 0, maximum
+
+    @pytest.mark.parametrize("number_of_samples", [259, 260, 261, 275])
+    def test_encoder_round_trips_a_block_whose_counts_are_scaled(self, number_of_samples):
+        """
+        n samples of 5 give symbol 0 a raw count of n + 1: n - 1 zero differences and two zero keysample bytes.
+
+        260, 261, 262 and 276 are the first maxima that dividing by largest / 255 would store as 0.
+        """
+        samples = np.full(number_of_samples, 5)
+        block = encode_red_block(samples, 946728000000000)
+        compressed_bytes, _, coded_bytes, _ = struct.unpack_from("<IQII", block, 4)
+        assert max(block[31:BLOCK_HEADER_BYTES]) == 255
+        decoded = decode_red_blocks(
+            np.frombuffer(block, dtype=np.uint8),
+            block_starts=np.array([0]),
+            block_bytes=np.array([BLOCK_HEADER_BYTES + compressed_bytes]),
+            difference_counts=np.array([coded_bytes + 1]),
+            sample_counts=np.array([number_of_samples]),
+            scale_factors=np.ones(1),
+            detrend_slopes=np.zeros(1),
+            detrend_intercepts=np.zeros(1),
+            layout=MEF2_RED_LAYOUT,
+        )
+        np.testing.assert_array_equal(decoded, samples)
+
+    def test_mef_2_1_layout_follows_mef_h(self):
+        """
+        The generated MEF 2.1 file, read at mef.h's offsets without the reader or ``write_mef2``'s own arithmetic.
+
+        Both lay out the header and the indices; this pins them to the spec rather than to each other. The
+        discontinuity index holds 1-based block numbers, as IEEG.org's MEF 2.1 files do.
+        """
+        raw = (DROPOUTS / "CH01.mef").read_bytes()
+        header = raw[:HEADER_BYTES]
+        # mef.h, mef_lib 2.1.
+        HEADER_LENGTH_OFFSET = 166
+        NUMBER_OF_SAMPLES_OFFSET = 368
+        RECORDING_START_TIME_OFFSET = 408
+        INDEX_DATA_OFFSET_OFFSET = 816
+        NUMBER_OF_INDEX_ENTRIES_OFFSET = 824
+        BLOCK_HEADER_LENGTH_OFFSET = 832
+        DISCONTINUITY_DATA_OFFSET_OFFSET = 840
+        NUMBER_OF_DISCONTINUITY_ENTRIES_OFFSET = 848
+        FILE_UNIQUE_ID_OFFSET = 948
+        HEADER_CRC_OFFSET = 1020
+
+        assert header[163:166] == bytes([1, 2, 1])
+        assert struct.unpack_from("<H", header, HEADER_LENGTH_OFFSET)[0] == HEADER_BYTES
+        assert struct.unpack_from("<H", header, BLOCK_HEADER_LENGTH_OFFSET)[0] == BLOCK_HEADER_BYTES
+        assert header[FILE_UNIQUE_ID_OFFSET : FILE_UNIQUE_ID_OFFSET + 8] != bytes(8)
+        assert struct.unpack_from("<I", header, HEADER_CRC_OFFSET)[0] == crc(header[:HEADER_CRC_OFFSET])
+
+        # Walk the blocks from the end of the header by their own lengths, independently of the index.
+        blocks, offset = [], HEADER_BYTES
+        index_offset = struct.unpack_from("<Q", header, INDEX_DATA_OFFSET_OFFSET)[0]
+        while offset < index_offset:
+            compressed_bytes, start_time, _, number_of_samples = struct.unpack_from("<IQII", raw, offset + 4)
+            blocks.append((offset, start_time, number_of_samples, bool(raw[offset + 30] & 1)))
+            offset += BLOCK_HEADER_BYTES + compressed_bytes
+        assert offset == index_offset
+        assert struct.unpack_from("<Q", header, NUMBER_OF_INDEX_ENTRIES_OFFSET)[0] == len(blocks) == 11
+        assert struct.unpack_from("<Q", header, NUMBER_OF_SAMPLES_OFFSET)[0] == sum(block[2] for block in blocks)
+        assert struct.unpack_from("<Q", header, RECORDING_START_TIME_OFFSET)[0] == blocks[0][1]
+
+        # The block index: (start time, file offset, sample number) per block.
+        entries = struct.unpack_from(f"<{3 * len(blocks)}Q", raw, index_offset)
+        sample_numbers = np.concatenate([[0], np.cumsum([block[2] for block in blocks])[:-1]]).tolist()
+        assert list(entries[0::3]) == [block[1] for block in blocks]
+        assert list(entries[1::3]) == [block[0] for block in blocks]
+        assert list(entries[2::3]) == sample_numbers
+
+        # The discontinuity index follows the block index and numbers the flagged blocks from 1.
+        discontinuity_offset = struct.unpack_from("<Q", header, DISCONTINUITY_DATA_OFFSET_OFFSET)[0]
+        number_of_entries = struct.unpack_from("<Q", header, NUMBER_OF_DISCONTINUITY_ENTRIES_OFFSET)[0]
+        assert discontinuity_offset == index_offset + 24 * len(blocks)
+        assert len(raw) == discontinuity_offset + 8 * number_of_entries
+        flagged = struct.unpack_from(f"<{number_of_entries}Q", raw, discontinuity_offset)
+        assert list(flagged) == [number + 1 for number, block in enumerate(blocks) if block[3]]
+        # The placeholder and the first real block, then the first block of each later run.
+        assert list(flagged[:2]) == [1, 2] and number_of_entries == 9
 
     def test_mef_2_1_header(self):
         header = read_mef2_header(DROPOUTS / "CH01.mef")
