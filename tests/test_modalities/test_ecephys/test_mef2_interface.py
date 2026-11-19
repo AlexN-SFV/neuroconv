@@ -1,12 +1,14 @@
 """Tests for the MEF2RecordingInterface and its reader.
 
-The recordings in ``mef2_fixtures/`` are excerpts of real MEF 2 files cut by ``build_mef2_fixtures.py``: their
-blocks are copied byte for byte, and only the header and the block index are rewritten for the shorter file.
-No Python MEF 2 reader exists to compare with, so the decoded samples are checked against what each block
-header stores: its maximum and minimum value and its CRC. ``expected.json`` holds what the full source files
-decode to over the same blocks.
+The recordings in ``mef2_fixtures/`` are made by ``build_mef2_fixtures.py``. The MEF 2.0 ones are excerpts of
+real files: their blocks are copied byte for byte, and only the header and the block index are rewritten for
+the shorter file. No Python MEF 2 reader exists to compare with, so the decoded samples are checked against
+what each block header stores: its maximum and minimum value and its CRC. ``expected.json`` holds what the full
+source files decode to over the same blocks. The MEF 2.1 one is generated, its blocks coded by
+:func:`encode_red_block`, which rewrites the real excerpts' blocks byte for byte; ``expected.json`` holds the
+samples it was generated from.
 
-Variations the excerpts do not have (gaps, clock steps, other channels and rates, encryption, ...) are made at
+Variations the fixtures do not have (gaps, clock steps, other channels and rates, encryption, ...) are made at
 test time by :func:`write_mef2`, which lays out a MEF 2 file from a header and block bytes as mef_lib's
 ``write_mef_ind`` does, after :func:`patch_block` or :func:`patch_header` changed what is needed and redid the
 CRCs.
@@ -47,8 +49,8 @@ from neuroconv.tools.testing.data_interface_mixins import (
 FIXTURES = Path(__file__).parent / "mef2_fixtures"
 # Absent only while build_mef2_fixtures.py, which imports this module, is writing it.
 EXPECTED = json.loads((FIXTURES / "expected.json").read_text()) if (FIXTURES / "expected.json").exists() else {}
-# MEF 2.1, PennEPI00082 (Pennsieve Discover 549, CC-BY): the placeholder block, then 8 runs split by real dropouts.
-PENN = FIXTURES / "PennEPI00082_LI07_excerpt"
+# MEF 2.1, generated: the placeholder block, then 8 runs split by dropouts of whole samples.
+DROPOUTS = FIXTURES / "mef21_dropout_runs"
 # MEF 2.0, Discover 13 (CC0): two runs, split by a flagged gap of 20 minutes.
 AD3 = FIXTURES / "Discover13_AD3_excerpt"
 # MEF 2.0, Discover 13: one run across an unflagged step of the clock back by 1.017 s.
@@ -76,7 +78,7 @@ def crc(raw: bytes) -> int:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Writing MEF 2 files from real blocks
+# Writing MEF 2 files
 # ---------------------------------------------------------------------------------------------------------------
 
 
@@ -184,6 +186,103 @@ def write_mef2(path: Path, header: bytes, blocks: list[bytes], *, discontinuity_
     path.write_bytes(bytes(header) + data + b"".join(entries) + discontinuities)
 
 
+def _range_encode(symbols: list[int], counts: list[int]) -> bytes:
+    """
+    The range coder of mef_lib 2.1's ``RED_compress_block`` (Schindler's), byte for byte.
+
+    The first byte out is the coder's start byte, the one byte a MEF 2 block holds between its header and the
+    coded data. After the last symbol come three zero bytes.
+    """
+    top, bottom, shift, carry_check = 1 << 31, 1 << 23, 23, 0x7F800000
+    cumulative = np.concatenate([[0], np.cumsum(counts)]).tolist()
+    total = cumulative[256]
+    out = bytearray()
+    low, range_, buffer, underflow = 0, top, 0, 0
+
+    def normalize():
+        nonlocal low, range_, buffer, underflow
+        while range_ <= bottom:
+            if low < carry_check:
+                out.append(buffer)
+                out.extend(b"\xff" * underflow)
+                underflow = 0
+                buffer = (low >> shift) & 0xFF
+            elif low & top:
+                out.append((buffer + 1) & 0xFF)
+                out.extend(b"\x00" * underflow)
+                underflow = 0
+                buffer = (low >> shift) & 0xFF
+            else:
+                underflow += 1
+            range_ <<= 8
+            low = (low << 8) & (top - 1)
+
+    for symbol in symbols:
+        normalize()
+        range_per_count = range_ // total
+        below = range_per_count * cumulative[symbol]
+        low += below
+        range_ = range_per_count * counts[symbol] if symbol < 255 else range_ - below
+    normalize()
+    last = (low >> shift) + 1
+    if last > 0xFF:
+        out.append((buffer + 1) & 0xFF)
+        out.extend(b"\x00" * underflow)
+    else:
+        out.append(buffer)
+        out.extend(b"\xff" * underflow)
+    out.append(last & 0xFF)
+    return bytes(out) + b"\0\0\0"
+
+
+def scale_red_counts(counts: np.ndarray) -> np.ndarray:
+    """
+    The symbol counts a RED block header stores, from a block's 256 raw counts, as ``RED_compress_block`` scales them.
+
+    When a count exceeds 255, every count is multiplied by 254.999 / the largest and rounded up, so the largest
+    becomes exactly 255 and none that was nonzero becomes 0. Dividing by largest / 255 instead rounds the
+    largest up to 256 for many maxima, which a ``ui1`` stores as 0.
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    if counts.max() > 255:
+        counts = np.ceil(counts * (254.999 / counts.max())).astype(np.int64)
+    return counts
+
+
+def encode_red_block(samples, start_time: int, *, discontinuity: bool = False) -> bytes:
+    """
+    A MEF 2 RED block of ``samples``, as mef_lib 2.1's ``RED_compress_block`` writes one, CRC included.
+
+    Each sample is coded as its difference from the one before, one byte each; the first sample, and any whose
+    difference does not fit in [-127, 127], as the reserved byte -128 and the sample's value in 3 bytes. The
+    symbol counts are those of the coded bytes, the first -128 left out since the decoder implies it, scaled to
+    at most 255 when one exceeds it. The block is filled with 0x55 to a multiple of 8 bytes.
+    """
+    samples = np.asarray(samples, dtype=np.int64)
+    keysample = [-128, *int(samples[0]).to_bytes(3, "little", signed=True)]
+    coded = keysample[1:]
+    for previous, current in zip(samples[:-1].tolist(), samples[1:].tolist()):
+        difference = current - previous
+        if -127 <= difference <= 127:
+            coded.append(difference)
+        else:
+            coded += [-128, *current.to_bytes(3, "little", signed=True)]
+    symbols = [value & 0xFF for value in coded]
+    counts = scale_red_counts(np.bincount(symbols, minlength=256))
+    data = _range_encode(symbols, counts.tolist())
+    data += b"\x55" * (-(BLOCK_HEADER_BYTES + len(data)) % 8)
+
+    block = bytearray(BLOCK_HEADER_BYTES)
+    struct.pack_into("<IQII", block, 4, len(data), start_time, len(symbols), samples.size)
+    block[24:27] = int(samples.max()).to_bytes(3, "little", signed=True)
+    block[27:30] = int(samples.min()).to_bytes(3, "little", signed=True)
+    block[30] = int(discontinuity)
+    block[31:BLOCK_HEADER_BYTES] = bytes(counts.astype(np.uint8))
+    block += data
+    struct.pack_into("<I", block, 0, crc(bytes(block[4:])))
+    return bytes(block)
+
+
 def copy_recording(source: Path, destination: Path) -> Path:
     shutil.copytree(source, destination)
     return destination
@@ -220,21 +319,21 @@ def quiet(function, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# The real excerpts
+# The fixtures
 # ---------------------------------------------------------------------------------------------------------------
 
 
-class TestRealExcerpts:
-    @pytest.mark.parametrize("folder", [PENN, AD3, AD3_STEP])
+class TestFixtures:
+    @pytest.mark.parametrize("folder", [DROPOUTS, AD3, AD3_STEP])
     def test_blocks_hold_what_their_headers_state(self, folder):
-        """The excerpts' blocks are the source files' bytes: their CRCs hold and their stored max and min are real."""
+        """The fixtures' blocks hold what their headers state: their CRCs hold and their stored max and min are real."""
         (path,) = folder.glob("*.mef")
         for maximum, minimum, stored_crc, computed_crc, samples in block_statistics(path):
             assert stored_crc == computed_crc
             assert samples > 0 and maximum >= minimum
 
     @pytest.mark.parametrize("use_numba", DECODERS)
-    @pytest.mark.parametrize("folder", [PENN, AD3, AD3_STEP])
+    @pytest.mark.parametrize("folder", [DROPOUTS, AD3, AD3_STEP])
     def test_decoded_blocks_match_stored_maximum_and_minimum(self, folder, use_numba):
         (path,) = folder.glob("*.mef")
         header, blocks = read_mef2_file(path)
@@ -258,8 +357,8 @@ class TestRealExcerpts:
         np.testing.assert_array_equal(np.maximum.reduceat(samples, edges), [row[0] for row in statistics])
         np.testing.assert_array_equal(np.minimum.reduceat(samples, edges), [row[1] for row in statistics])
 
-    @pytest.mark.parametrize("folder", [PENN, AD3, AD3_STEP])
-    def test_samples_match_the_full_source_file(self, folder):
+    @pytest.mark.parametrize("folder", [DROPOUTS, AD3, AD3_STEP])
+    def test_samples_match_expected(self, folder):
         recording = quiet(read_mef2_recording, folder, validate_crc=True)
         (channel,) = recording.channels
         expected = EXPECTED[folder.name]
@@ -269,14 +368,122 @@ class TestRealExcerpts:
         assert [run.number_of_samples for run in recording.runs] == expected["run_samples"]
         assert [run.start_time for run in recording.runs] == expected["run_start_times"]
 
+    @pytest.mark.parametrize("folder", [AD3, AD3_STEP])
+    def test_encoder_rewrites_real_blocks_byte_for_byte(self, folder):
+        """The coder of the generated MEF 2.1 fixture writes the real excerpts' blocks as their writer did."""
+        (path,) = folder.glob("*.mef")
+        _, blocks = read_mef2_file(path)
+        for block in blocks:
+            compressed_bytes, start_time, coded_bytes, number_of_samples = struct.unpack_from("<IQII", block, 4)
+            samples = decode_red_blocks(
+                np.frombuffer(block, dtype=np.uint8),
+                block_starts=np.array([0]),
+                block_bytes=np.array([BLOCK_HEADER_BYTES + compressed_bytes]),
+                difference_counts=np.array([coded_bytes + 1]),
+                sample_counts=np.array([number_of_samples]),
+                scale_factors=np.ones(1),
+                detrend_slopes=np.zeros(1),
+                detrend_intercepts=np.zeros(1),
+                layout=MEF2_RED_LAYOUT,
+            )
+            rewritten = encode_red_block(samples, start_time, discontinuity=bool(block[30] & 1))
+            assert rewritten == block[: BLOCK_HEADER_BYTES + compressed_bytes]
+
+    def test_scaled_symbol_counts_fit_a_byte_for_every_maximum(self):
+        for maximum in range(256, 20_001):
+            raw = np.zeros(256, dtype=np.int64)
+            raw[[0, 1, 2]] = maximum, maximum // 2, 1
+            counts = scale_red_counts(raw)
+            assert counts[0] == 255 and counts[1] >= 1 and counts[2] == 1 and counts[3:].max() == 0, maximum
+
+    @pytest.mark.parametrize("number_of_samples", [259, 260, 261, 275])
+    def test_encoder_round_trips_a_block_whose_counts_are_scaled(self, number_of_samples):
+        """
+        n samples of 5 give symbol 0 a raw count of n + 1: n - 1 zero differences and two zero keysample bytes.
+
+        260, 261, 262 and 276 are the first maxima that dividing by largest / 255 would store as 0.
+        """
+        samples = np.full(number_of_samples, 5)
+        block = encode_red_block(samples, 946728000000000)
+        compressed_bytes, _, coded_bytes, _ = struct.unpack_from("<IQII", block, 4)
+        assert max(block[31:BLOCK_HEADER_BYTES]) == 255
+        decoded = decode_red_blocks(
+            np.frombuffer(block, dtype=np.uint8),
+            block_starts=np.array([0]),
+            block_bytes=np.array([BLOCK_HEADER_BYTES + compressed_bytes]),
+            difference_counts=np.array([coded_bytes + 1]),
+            sample_counts=np.array([number_of_samples]),
+            scale_factors=np.ones(1),
+            detrend_slopes=np.zeros(1),
+            detrend_intercepts=np.zeros(1),
+            layout=MEF2_RED_LAYOUT,
+        )
+        np.testing.assert_array_equal(decoded, samples)
+
+    def test_mef_2_1_layout_follows_mef_h(self):
+        """
+        The generated MEF 2.1 file, read at mef.h's offsets without the reader or ``write_mef2``'s own arithmetic.
+
+        Both lay out the header and the indices; this pins them to the spec rather than to each other. The
+        discontinuity index holds 1-based block numbers, as IEEG.org's MEF 2.1 files do.
+        """
+        raw = (DROPOUTS / "CH01.mef").read_bytes()
+        header = raw[:HEADER_BYTES]
+        # mef.h, mef_lib 2.1.
+        HEADER_LENGTH_OFFSET = 166
+        NUMBER_OF_SAMPLES_OFFSET = 368
+        RECORDING_START_TIME_OFFSET = 408
+        INDEX_DATA_OFFSET_OFFSET = 816
+        NUMBER_OF_INDEX_ENTRIES_OFFSET = 824
+        BLOCK_HEADER_LENGTH_OFFSET = 832
+        DISCONTINUITY_DATA_OFFSET_OFFSET = 840
+        NUMBER_OF_DISCONTINUITY_ENTRIES_OFFSET = 848
+        FILE_UNIQUE_ID_OFFSET = 948
+        HEADER_CRC_OFFSET = 1020
+
+        assert header[163:166] == bytes([1, 2, 1])
+        assert struct.unpack_from("<H", header, HEADER_LENGTH_OFFSET)[0] == HEADER_BYTES
+        assert struct.unpack_from("<H", header, BLOCK_HEADER_LENGTH_OFFSET)[0] == BLOCK_HEADER_BYTES
+        assert header[FILE_UNIQUE_ID_OFFSET : FILE_UNIQUE_ID_OFFSET + 8] != bytes(8)
+        assert struct.unpack_from("<I", header, HEADER_CRC_OFFSET)[0] == crc(header[:HEADER_CRC_OFFSET])
+
+        # Walk the blocks from the end of the header by their own lengths, independently of the index.
+        blocks, offset = [], HEADER_BYTES
+        index_offset = struct.unpack_from("<Q", header, INDEX_DATA_OFFSET_OFFSET)[0]
+        while offset < index_offset:
+            compressed_bytes, start_time, _, number_of_samples = struct.unpack_from("<IQII", raw, offset + 4)
+            blocks.append((offset, start_time, number_of_samples, bool(raw[offset + 30] & 1)))
+            offset += BLOCK_HEADER_BYTES + compressed_bytes
+        assert offset == index_offset
+        assert struct.unpack_from("<Q", header, NUMBER_OF_INDEX_ENTRIES_OFFSET)[0] == len(blocks) == 11
+        assert struct.unpack_from("<Q", header, NUMBER_OF_SAMPLES_OFFSET)[0] == sum(block[2] for block in blocks)
+        assert struct.unpack_from("<Q", header, RECORDING_START_TIME_OFFSET)[0] == blocks[0][1]
+
+        # The block index: (start time, file offset, sample number) per block.
+        entries = struct.unpack_from(f"<{3 * len(blocks)}Q", raw, index_offset)
+        sample_numbers = np.concatenate([[0], np.cumsum([block[2] for block in blocks])[:-1]]).tolist()
+        assert list(entries[0::3]) == [block[1] for block in blocks]
+        assert list(entries[1::3]) == [block[0] for block in blocks]
+        assert list(entries[2::3]) == sample_numbers
+
+        # The discontinuity index follows the block index and numbers the flagged blocks from 1.
+        discontinuity_offset = struct.unpack_from("<Q", header, DISCONTINUITY_DATA_OFFSET_OFFSET)[0]
+        number_of_entries = struct.unpack_from("<Q", header, NUMBER_OF_DISCONTINUITY_ENTRIES_OFFSET)[0]
+        assert discontinuity_offset == index_offset + 24 * len(blocks)
+        assert len(raw) == discontinuity_offset + 8 * number_of_entries
+        flagged = struct.unpack_from(f"<{number_of_entries}Q", raw, discontinuity_offset)
+        assert list(flagged) == [number + 1 for number, block in enumerate(blocks) if block[3]]
+        # The placeholder and the first real block, then the first block of each later run.
+        assert list(flagged[:2]) == [1, 2] and number_of_entries == 9
+
     def test_mef_2_1_header(self):
-        header = read_mef2_header(PENN / "LI07.mef")
+        header = read_mef2_header(DROPOUTS / "CH01.mef")
         assert header["version"] == "2.1"
-        assert header["channel_name"] == "LI07"
+        assert header["channel_name"] == "CH01"
         assert header["sampling_frequency"] == 1024.0
-        # PennEPI stores the factor negated: the counts are inverted.
-        assert header["voltage_conversion_factor"] == pytest.approx(-0.004153729475433701)
-        assert header["gmt_offset"] == -6.0
+        # This recording stores the factor negated: the counts are inverted.
+        assert header["voltage_conversion_factor"] == pytest.approx(-0.005)
+        assert header["gmt_offset"] == -5.0
         assert header["number_of_discontinuity_entries"] == 9
 
     def test_mef_2_0_header(self):
@@ -289,9 +496,9 @@ class TestRealExcerpts:
         assert header["gmt_offset"] is None and header["number_of_discontinuity_entries"] == 0
 
     def test_placeholder_block_is_dropped(self):
-        recording = read_mef2_recording(PENN)
+        recording = read_mef2_recording(DROPOUTS)
         (channel,) = recording.channels
-        header, blocks = read_mef2_file(PENN / "LI07.mef")
+        header, blocks = read_mef2_file(DROPOUTS / "CH01.mef")
         assert channel.dropped_placeholder_block
         assert len(channel.blocks) == len(blocks) - 1
         assert struct.unpack_from("<I", blocks[0], 20)[0] == 1
@@ -303,11 +510,11 @@ class TestRealExcerpts:
             == struct.unpack_from("<Q", header, 408)[0]
             == struct.unpack_from("<Q", blocks[0], 8)[0]
         )
-        assert recording.runs[0].start_time - recording.start_time == 2_544_921
+        assert recording.runs[0].start_time - recording.start_time == 2_500_000
 
     def test_dropouts_split_runs(self):
-        """PennEPI's flagged blocks follow real dropouts of whole samples, each starting its own run."""
-        recording = read_mef2_recording(PENN)
+        """The MEF 2.1 fixture's flagged blocks follow dropouts of whole samples, each starting its own run."""
+        recording = read_mef2_recording(DROPOUTS)
         assert [run.number_of_blocks for run in recording.runs] == [2, 1, 1, 1, 1, 1, 1, 2]
         blocks = recording.channels[0].blocks
         gaps = [
@@ -315,14 +522,14 @@ class TestRealExcerpts:
             - blocks["number_of_samples"][run.first_block - 1] / 1024
             for run in recording.runs[2:]
         ]
-        np.testing.assert_allclose(gaps, [0.01172, 0.48242, 0.04395, 0.55762, 0.05762, 230.4834], atol=1e-4)
+        np.testing.assert_allclose(gaps, [0.015625, 0.46875, 0.046875, 0.546875, 0.0625, 240.0], atol=1e-5)
 
     def test_discontinuity_index_agrees_with_block_flags(self, tmp_path):
         """The 2.1 index counts blocks from 1; without it the block headers' flags give the same runs."""
-        with_index = read_mef2_recording(PENN)
-        copy = copy_recording(PENN, tmp_path / "no_index")
-        rewrite(copy / "LI07.mef", discontinuity_index=False)
-        assert read_mef2_header(copy / "LI07.mef")["number_of_discontinuity_entries"] == 0
+        with_index = read_mef2_recording(DROPOUTS)
+        copy = copy_recording(DROPOUTS, tmp_path / "no_index")
+        rewrite(copy / "CH01.mef", discontinuity_index=False)
+        assert read_mef2_header(copy / "CH01.mef")["number_of_discontinuity_entries"] == 0
         without_index = read_mef2_recording(copy)
         assert without_index.runs == with_index.runs
         np.testing.assert_array_equal(
@@ -422,7 +629,7 @@ class TestRuns:
 
 
 class TestHeaders:
-    def patched(self, tmp_path, folder=PENN, header_crc=True, **fields):
+    def patched(self, tmp_path, folder=DROPOUTS, header_crc=True, **fields):
         copy = copy_recording(folder, tmp_path / "copy")
         (path,) = copy.glob("*.mef")
         header, blocks = read_mef2_file(path)
@@ -550,17 +757,17 @@ class TestChannels:
 
     def test_streams(self, tmp_path):
         folder = tmp_path / "recording"
-        channel_copy(PENN, folder / "LI07.mef")
-        channel_copy(PENN, folder / "ECG.mef", channel_name="ECG", sampling_frequency=512.0)
+        channel_copy(DROPOUTS, folder / "CH01.mef")
+        channel_copy(DROPOUTS, folder / "ECG.mef", channel_name="ECG", sampling_frequency=512.0)
         assert MEF2RecordingInterface.get_stream_names(folder) == ["512 Hz", "1024 Hz"]
         with pytest.raises(
             ValueError, match=r"2 different rates .*choose one with stream_name, one of \['1024 Hz', '512 Hz'\]"
         ):
             read_mef2_recording(folder)
-        assert read_mef2_recording(folder, stream_name="1024 Hz").channel_ids == ["LI07"]
+        assert read_mef2_recording(folder, stream_name="1024 Hz").channel_ids == ["CH01"]
         # The 1024 Hz file relabelled 512 Hz: its block times no longer match its sample counts, which warns.
         assert quiet(read_mef2_recording, folder, stream_name="512 Hz").channel_ids == ["ECG"]
-        assert read_mef2_recording(folder, channels_to_skip=["ECG"]).channel_ids == ["LI07"]
+        assert read_mef2_recording(folder, channels_to_skip=["ECG"]).channel_ids == ["CH01"]
         with pytest.raises(ValueError, match="stream_name '256 Hz' is not a stream"):
             read_mef2_recording(folder, stream_name="256 Hz")
 
@@ -584,8 +791,8 @@ class TestChannels:
 class TestExtractor:
     def test_traces_across_blocks_and_runs(self, tmp_path):
         folder = tmp_path / "recording"
-        channel_copy(PENN, folder / "LI07.mef")
-        channel_copy(PENN, folder / "LI08.mef", channel_name="LI08", physical_channel_number=99)
+        channel_copy(DROPOUTS, folder / "CH01.mef")
+        channel_copy(DROPOUTS, folder / "CH02.mef", channel_name="CH02", physical_channel_number=99)
         recording = MEF2RecordingExtractor(folder)
         full = recording.mef2_recording.channels[0].read_blocks(0, len(recording.mef2_recording.channels[0].blocks))
         assert recording.get_num_segments() == 8
@@ -597,7 +804,7 @@ class TestExtractor:
             np.testing.assert_array_equal(traces[:, 1], traces[:, 0])
         # A window straddling the block boundary at sample 2500 of the first run.
         np.testing.assert_array_equal(
-            recording.get_traces(segment_index=0, start_frame=2490, end_frame=2510, channel_ids=["LI08"])[:, 0],
+            recording.get_traces(segment_index=0, start_frame=2490, end_frame=2510, channel_ids=["CH02"])[:, 0],
             full[2490:2510],
         )
         assert recording.get_start_time(segment_index=7) == pytest.approx(
@@ -605,12 +812,12 @@ class TestExtractor:
         )
 
     def test_gains_keep_their_sign(self):
-        recording = MEF2RecordingExtractor(PENN)
-        np.testing.assert_allclose(recording.get_channel_gains(), [-0.004153729475433701])
+        recording = MEF2RecordingExtractor(DROPOUTS)
+        np.testing.assert_allclose(recording.get_channel_gains(), [-0.005])
         assert list(recording.get_property("physical_unit")) == ["uV"]
         raw = recording.get_traces(segment_index=0, start_frame=0, end_frame=10)
         scaled = recording.get_traces(segment_index=0, start_frame=0, end_frame=10, return_in_uV=True)
-        np.testing.assert_allclose(scaled, raw * -0.004153729475433701)
+        np.testing.assert_allclose(scaled, raw * -0.005)
 
     def test_missing_conversion_factor(self, tmp_path):
         channel_copy(AD3, tmp_path / "recording" / "AD3.mef", voltage_conversion_factor=0.0)
@@ -657,21 +864,21 @@ class TestInterface:
             assert "runs" not in (nwbfile.intervals or {})
 
     def test_negative_gain_round_trips(self, tmp_path):
-        interface = MEF2RecordingInterface(PENN)
-        nwbfile_path = tmp_path / "penn.nwb"
+        interface = MEF2RecordingInterface(DROPOUTS)
+        nwbfile_path = tmp_path / "dropouts.nwb"
         interface.run_conversion(nwbfile_path=nwbfile_path, metadata=quiet(interface.get_metadata), overwrite=True)
         with NWBHDF5IO(nwbfile_path, "r") as io:
             nwbfile = io.read()
             series = sorted(nwbfile.acquisition.values(), key=lambda series: series.starting_time)
             assert len(series) == 8
-            assert series[0].conversion == pytest.approx(-0.004153729475433701e-6)
+            assert series[0].conversion == pytest.approx(-0.005e-6)
             counts = series[0].data[:10, 0]
-            np.testing.assert_allclose(series[0].get_data_in_units()[:10, 0], counts * -0.004153729475433701e-6)
+            np.testing.assert_allclose(series[0].get_data_in_units()[:10, 0], counts * -0.005e-6)
             runs = nwbfile.intervals["runs"].to_dataframe()
             np.testing.assert_allclose(runs["start_time"], [item.starting_time for item in series])
-            assert list(runs["source_file"].unique()) == [PENN.name]
+            assert list(runs["source_file"].unique()) == [DROPOUTS.name]
             # The time zone the header states.
-            assert nwbfile.session_start_time.utcoffset() == timedelta(hours=-6)
+            assert nwbfile.session_start_time.utcoffset() == timedelta(hours=-5)
 
     def test_annotations_are_placed_on_their_samples(self, tmp_path):
         """IEEG.org times are offsets from the header start; they are placed through the block index."""
@@ -732,26 +939,26 @@ class TestInterface:
 
     def test_session_starts_at_the_header_start(self, tmp_path):
         """With the placeholder dropped, the first series starts after the session, so IEEG.org offsets stay non-negative."""
-        folder = copy_recording(PENN, tmp_path / "penn")
+        folder = copy_recording(DROPOUTS, tmp_path / "dropouts")
         (folder / "annotations.xml").write_text(annotations_xml(("Start", 0, 0, [])), encoding="utf-8")
         interface = MEF2RecordingInterface(folder)
         metadata = quiet(interface.get_metadata)
-        header_start = struct.unpack_from("<Q", (folder / "LI07.mef").read_bytes(), 408)[0]
+        header_start = struct.unpack_from("<Q", (folder / "CH01.mef").read_bytes(), 408)[0]
         expected_start = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=header_start)
         assert metadata["NWBFile"]["session_start_time"] == expected_start
         nwbfile = mock_NWBFile()
         interface.add_to_nwbfile(nwbfile=nwbfile, metadata=metadata)
         first_series = min(series.starting_time for series in nwbfile.acquisition.values())
-        assert first_series == pytest.approx(2.544921)
+        assert first_series == pytest.approx(2.5)
         assert nwbfile.intervals["annotations"]["start_time"][0] == 0.0
-        assert nwbfile.intervals["runs"]["start_time"][0] == pytest.approx(2.544921)
+        assert nwbfile.intervals["runs"]["start_time"][0] == pytest.approx(2.5)
 
     def test_two_streams_in_one_nwb_file(self, tmp_path):
         """The recipe of the gallery page: each stream gets its own metadata key, series name and runs rows."""
         from neuroconv import ConverterPipe
 
         folder = tmp_path / "recording"
-        channel_copy(PENN, folder / "LI07.mef")
+        channel_copy(DROPOUTS, folder / "CH01.mef")
         header, blocks = read_mef2_file(AD3 / "AD3.mef")
         write_mef2(folder / "ECG.mef", patch_header(header, channel_name="ECG", physical_channel_number=200), blocks)
         interfaces = {}
@@ -799,7 +1006,7 @@ class TestInterface:
             anonymized_subject_name="PHI-ANONYMIZED",
         )
         folder = tmp_path / "recording"
-        channel_copy(PENN, folder / "LI07.mef", **sentinels)
+        channel_copy(DROPOUTS, folder / "CH01.mef", **sentinels)
         interface = MEF2RecordingInterface(folder)
         metadata = quiet(interface.get_metadata)
         assert "Subject" not in metadata and "PHI-" not in repr(metadata)
@@ -807,7 +1014,7 @@ class TestInterface:
         interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata, overwrite=True)
         written = nwbfile_path.read_bytes()
         assert b"PHI-" not in written
-        assert b"PHI-FIRST" in (folder / "LI07.mef").read_bytes()
+        assert b"PHI-FIRST" in (folder / "CH01.mef").read_bytes()
         with NWBHDF5IO(nwbfile_path, "r") as io:
             assert io.read().subject is None
 
@@ -826,7 +1033,7 @@ class TestInterface:
 class TestKoopmanCRC:
     @pytest.mark.parametrize("use_numba", DECODERS)
     def test_matches_stored_crcs(self, use_numba):
-        header, blocks = read_mef2_file(PENN / "LI07.mef")
+        header, blocks = read_mef2_file(DROPOUTS / "CH01.mef")
         buffer = np.frombuffer(b"".join(blocks), dtype=np.uint8)
         starts = np.cumsum([0] + [len(block) for block in blocks[:-1]])
         ends = starts + np.array([BLOCK_HEADER_BYTES + struct.unpack_from("<I", block, 4)[0] for block in blocks])
@@ -840,7 +1047,7 @@ class TestSharedRunsTable:
         from neuroconv.datainterfaces import MEF3RecordingInterface
 
         mef3 = MEF3RecordingInterface(Path(__file__).parent / "mef3_fixtures" / "gapped.mefd", metadata_key="mef3")
-        mef2 = MEF2RecordingInterface(PENN, metadata_key="mef2")
+        mef2 = MEF2RecordingInterface(DROPOUTS, metadata_key="mef2")
         nwbfile = mock_NWBFile()
         for interface in (mef3, mef2):
             metadata = quiet(interface.get_metadata)
@@ -848,8 +1055,8 @@ class TestSharedRunsTable:
             quiet(interface.add_to_nwbfile, nwbfile=nwbfile, metadata=metadata)
         runs = nwbfile.intervals["runs"].to_dataframe()
         assert list(runs["source_file"].value_counts().sort_index().items()) == [
-            ("PennEPI00082_LI07_excerpt", 8),
             ("gapped.mefd", 2),
+            ("mef21_dropout_runs", 8),
         ]
 
 
@@ -863,7 +1070,7 @@ def test_crc_with_numba_requested_but_missing(monkeypatch):
 
 class TestMEF2RecordingInterfaceContract(RecordingExtractorInterfaceTestMixin):
     data_interface_cls = MEF2RecordingInterface
-    interface_kwargs = dict(folder_path=str(PENN))
+    interface_kwargs = dict(folder_path=str(DROPOUTS))
 
     def check_extracted_metadata(self, metadata: dict):
         assert metadata["NWBFile"]["session_start_time"].date() == datetime(2000, 1, 1).date()
@@ -884,8 +1091,8 @@ class TestRunSelection:
     @staticmethod
     def two_channels(tmp_path) -> Path:
         folder = tmp_path / "recording"
-        channel_copy(PENN, folder / "LI07.mef")
-        channel_copy(PENN, folder / "LI08.mef", channel_name="LI08", physical_channel_number=99)
+        channel_copy(DROPOUTS, folder / "CH01.mef")
+        channel_copy(DROPOUTS, folder / "CH02.mef", channel_name="CH02", physical_channel_number=99)
         return folder
 
     @staticmethod
@@ -910,7 +1117,7 @@ class TestRunSelection:
         assert all(run.number_of_bytes > 0 for run in runs)
         interface = quiet(MEF2RecordingInterface, folder)
         assert interface.describe_runs() == runs
-        assert quiet(MEF2RecordingInterface.get_runs, folder, channels_to_skip=["LI08"])[0].number_of_bytes * 2 == (
+        assert quiet(MEF2RecordingInterface.get_runs, folder, channels_to_skip=["CH02"])[0].number_of_bytes * 2 == (
             runs[0].number_of_bytes
         )
 
@@ -959,7 +1166,7 @@ class TestRunSelection:
             np.testing.assert_array_equal(seen[name][3], data)
 
     def test_a_single_selected_run_is_listed_with_its_index(self, tmp_path):
-        interface = quiet(MEF2RecordingInterface, PENN, run_indices=[6])
+        interface = quiet(MEF2RecordingInterface, DROPOUTS, run_indices=[6])
         nwbfile = mock_NWBFile()
         interface.add_to_nwbfile(nwbfile=nwbfile, metadata=quiet(interface.get_metadata))
         (name,) = nwbfile.acquisition
@@ -976,7 +1183,7 @@ class TestRunSelection:
         assert list(nwbfile.intervals["runs"]["run_index"][:]) == [0]
 
     def test_metadata_key_series_name_is_kept(self, tmp_path):
-        interface = quiet(MEF2RecordingInterface, PENN, run_indices=[1, 4], metadata_key="ieeg")
+        interface = quiet(MEF2RecordingInterface, DROPOUTS, run_indices=[1, 4], metadata_key="ieeg")
         metadata = quiet(interface.get_metadata)
         metadata["Ecephys"]["ElectricalSeries"]["ieeg"]["name"] = "Seeg"
         nwbfile = mock_NWBFile()
@@ -984,7 +1191,7 @@ class TestRunSelection:
         assert sorted(nwbfile.acquisition) == ["Seeg1", "Seeg4"]
 
     def test_selection_keeps_channel_properties_and_alignment(self):
-        interface = quiet(MEF2RecordingInterface, PENN)
+        interface = quiet(MEF2RecordingInterface, DROPOUTS)
         interface.recording_extractor.set_property(key="brain_area", values=np.array(["hippocampus"]))
         original = [interface.recording_extractor.get_start_time(segment_index=index) for index in range(8)]
         # Alignment moves each run by the value given.
@@ -1013,10 +1220,10 @@ class TestRunSelection:
     )
     def test_bad_selections_are_refused(self, run_indices, message):
         with pytest.raises(ValueError, match=message):
-            quiet(MEF2RecordingInterface, PENN, run_indices=run_indices)
+            quiet(MEF2RecordingInterface, DROPOUTS, run_indices=run_indices)
 
     def test_unordered_selection_is_written_in_time_order(self):
-        interface = quiet(MEF2RecordingInterface, PENN, run_indices=[5, 2])
+        interface = quiet(MEF2RecordingInterface, DROPOUTS, run_indices=[5, 2])
         assert interface.run_indices == [2, 5]
 
     def test_annotations_are_those_overlapping_the_selection(self, tmp_path):
@@ -1063,9 +1270,9 @@ class TestRunSelectionAnnotations:
 
     @staticmethod
     def with_annotations(tmp_path, *annotations):
-        """A copy of the 8-run excerpt with annotations given as (type, (run, seconds in), (run, seconds in)),
+        """A copy of the 8-run MEF 2.1 fixture with annotations given as (type, (run, seconds in), (run, seconds in)),
         where a run of None with seconds counts from the header start, and run k + 0.5 means k's gap."""
-        folder = copy_recording(PENN, tmp_path / "penn")
+        folder = copy_recording(DROPOUTS, tmp_path / "dropouts")
         recording = quiet(read_mef2_recording, folder)
         rate = recording.sampling_frequency
 
@@ -1094,11 +1301,11 @@ class TestRunSelectionAnnotations:
         return nwbfile.intervals["annotations"].to_dataframe().set_index("label")
 
     def test_gapped_selection_holds_only_its_runs_annotations(self, tmp_path):
-        recording = quiet(read_mef2_recording, PENN)
+        recording = quiet(read_mef2_recording, DROPOUTS)
         gap_after_0 = (recording.runs[1].start_time - recording.runs[0].start_time) / 1e6 - (
             recording.runs[0].number_of_samples / recording.sampling_frequency
         )
-        assert gap_after_0 > 0.01, "the excerpt's runs are split by real gaps"
+        assert gap_after_0 > 0.01, "the fixture's runs are split by gaps"
         folder, _ = self.with_annotations(
             tmp_path,
             ("InRun0", (0, 0.1), (0, 0.2)),
@@ -1150,7 +1357,7 @@ class TestRunSelectionAnnotations:
         assert part.recording_extractor.get_start_time(segment_index=0) < whole_row["stop_time"]
 
     def test_aligning_a_selection_leaves_the_source_alone(self):
-        whole = quiet(MEF2RecordingInterface, PENN)
+        whole = quiet(MEF2RecordingInterface, DROPOUTS)
         before = [whole.recording_extractor.get_start_time(segment_index=index) for index in range(8)]
         part = whole.select_runs([1, 2])
         part.set_aligned_starting_time(5.0)
