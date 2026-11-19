@@ -191,7 +191,7 @@ class MEF2Recording:
         The origin of the recording's timeline, in µUTC: the header start time, or the first run's if earlier.
 
         Not the first run's start, so that every stream of the directory shares one origin, and NWB times
-        equal IEEG.org's offsets. In PennEPI's files the first run starts 2.5 s after it, the header start
+        equal IEEG.org's offsets. In some MEF 2.1 recordings the first run starts 2.5 s after it, the header start
         being the time of the placeholder block that is left out.
         """
         return min(self.recording_start_time, self.runs[0].start_time)
@@ -437,7 +437,7 @@ def _discontinuity_flags_from_index(file, header: dict) -> np.ndarray | None:
     """
     Each block's discontinuity flag from a MEF 2.1 discontinuity index, or None where there is none to use.
 
-    The index holds block numbers counted from 1: in PennEPI's files every entry less one is a block whose
+    The index holds block numbers counted from 1: in the MEF 2.1 files seen so far every entry less one is a block whose
     start time leaves a gap after the samples before it, and the first two entries are the first two blocks.
     """
     count = header["number_of_discontinuity_entries"]

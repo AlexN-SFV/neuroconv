@@ -43,7 +43,7 @@ pure-NumPy decoder is used, which gives the same samples much more slowly.
 
 The samples are stored as the integer counts the files hold, with each channel's voltage conversion factor,
 in microvolts per count, as the series' gain. The factor keeps its sign: MEF 2 marks inverted counts with a
-negative factor, and PennEPI's recordings have one, so every recording comes out in microvolts with the same
+negative factor, and some public recordings have one, so every recording comes out in microvolts with the same
 polarity. All channels of a stream must share the stretches of time they were recorded over; leave the others
 out with ``channels_to_skip`` and convert them separately.
 
@@ -88,7 +88,7 @@ exceptions:
 * an unflagged block whose start time is more than a second *before* the previous block ended continues the
   run, with a warning. MEF 2 writers set their clock back in such steps while the samples run on unbroken.
 
-Some recordings drop samples often: one PennEPI channel has 959 runs, most of a single block of a few hundred
+Some recordings drop samples often: one public recording's channel has 959 runs, most of a single block of a few hundred
 samples. Each is a series of its own, so that no sample is placed at a time it was not recorded at.
 
 Each series uses the channel's nominal sampling rate, while the block timestamps follow the acquisition
